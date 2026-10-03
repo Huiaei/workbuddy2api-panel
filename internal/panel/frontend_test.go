@@ -1423,8 +1423,8 @@ func TestRegionSchedulingFormRoundTrip(t *testing.T) {
    elements[name]={type:name.startsWith('strategy_')?'select-one':'text',value:''};
  }
  const cfg={pool:{strategy:{domestic:'round_robin',international:'sequential_exhaust'},account_order:{domestic:['c','a'],international:['y','x']}}};
- const nodes={cfgForm:{elements},cfgPath:{},cfgNote:{}};
- const ctx={cfgLoaded:null,api:async()=>({config:cfg}),$:id=>nodes[id],markDurationFields(){},toast(message){throw Error(message)}};
+ const nodes={cfgForm:{elements},cfgPath:{},cfgNote:{},cfgKey:{}};
+ const ctx={cfgLoaded:null,api:async()=>({config:cfg,environment_managed_fields:[],api_key_env_managed:false}),$:id=>nodes[id],markDurationFields(){},toast(message){throw Error(message)}};
  vm.createContext(ctx);
  vm.runInContext(src.slice(src.indexOf('const CFG_MAP ='),src.indexOf('/* Go 时长字段即时校验')),ctx);
  (async()=>{

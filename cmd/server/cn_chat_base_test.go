@@ -37,10 +37,24 @@ func TestCNChatBaseOverride(t *testing.T) {
 	}
 }
 
-// cn.chat_base 只在装配期生效，面板保存后须提示重启。
+// cn.chat_base 只在装配期生效，面板保存后若被改动须提示重启。
+//
+// 语义随 #104 改为「按与运行中配置的实际差异列出」：cn.chat_base 没变就不必
+// 提示重启，变了就必须提示。
 func TestCNChatBaseRequiresRestart(t *testing.T) {
-	cfg := Default()
-	if !slices.Contains(restartRequiredFields(cfg), "cn.chat_base") {
+	current, err := ParseConfig([]byte(`{}`))
+	if err != nil {
+		t.Fatalf("parse current: %v", err)
+	}
+	next, err := ParseConfig([]byte(`{"cn":{"chat_base":"https://www.workbuddy.cn"}}`))
+	if err != nil {
+		t.Fatalf("parse next: %v", err)
+	}
+	if !slices.Contains(restartRequiredFields(current, next), "cn.chat_base") {
 		t.Fatal("cn.chat_base missing from restart-required fields")
+	}
+	// 没改动时不应提示（装配期字段的提示只在真的变了时出现）。
+	if slices.Contains(restartRequiredFields(current, current), "cn.chat_base") {
+		t.Fatal("cn.chat_base reported although unchanged")
 	}
 }

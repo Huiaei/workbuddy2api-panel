@@ -130,6 +130,7 @@ func (p *Panel) importCockpit(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 
+		isNewAccount := p.cfg.Pool.AuthByUID(uid) == nil
 		p.cfg.Pool.Add(a)
 		p.cfg.Pool.Revive(uid)
 
@@ -154,6 +155,9 @@ func (p *Panel) importCockpit(w http.ResponseWriter, r *http.Request) {
 			p.cfg.Pool.ReenableIfCredits(uid, rm, tt)
 		}
 
+		if isNewAccount {
+			p.StartNewAccountTasks(uid)
+		}
 		imported++
 	}
 
