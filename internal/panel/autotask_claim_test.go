@@ -13,8 +13,11 @@ import (
 )
 
 // TestRunAutoAllClaimsDoneButUnclaimed issue #174 顺带项：runAutoAll 遇到
-// 「已达标但未领取」的任务时，必须先把奖补领掉再标记 skipped——真实对话等
-// 链路点亮的任务不经过任何自动动作，若只 skip 不领，积分永远卡在半路。
+// 「已达标但未领取」的任务时，必须先把奖领下来——真实对话等链路点亮的任务
+// 不经过任何自动动作，若只跳过不领，积分永远卡在半路。
+//
+// #104 之后领奖由 executeAutoTask/claimAutoTask 统一负责：达标未领 → 领奖 →
+// done + claimed=true；领奖失败报 claim_pending（不再静默 skipped）。
 func TestRunAutoAllClaimsDoneButUnclaimed(t *testing.T) {
 	old := reportGap
 	reportGap = 0 // 项间节流在测试里无意义，避免拖慢
@@ -68,12 +71,15 @@ func TestRunAutoAllClaimsDoneButUnclaimed(t *testing.T) {
 	if hit["credit"] != int64(100) || hit["energy"] != int64(5) {
 		t.Errorf("credit/energy = %v/%v, want 100/5", hit["credit"], hit["energy"])
 	}
-	// 仍是 skipped（进度早已达标），但文案要体现补领结果。
-	if hit["status"] != "skipped" {
-		t.Errorf("status = %v, want skipped", hit["status"])
+	// #104 起状态机统一：达标未领 → 先领奖 → done + claimed=true（不再是旧实现
+	// 的「skipped + 已补领」两段式——领奖失败要显式报 claim_pending，不能静默
+	// skipped）。issue #174 的核心诉求「达标未领必须领奖」由 claims==1 + claimed
+	// 保证，状态词本身随上游 #104 的状态机演进。
+	if hit["status"] != "done" {
+		t.Errorf("status = %v, want done", hit["status"])
 	}
-	if msg, _ := hit["message"].(string); !strings.Contains(msg, "已补领") {
-		t.Errorf("message = %q, 应含「已补领」", msg)
+	if msg, _ := hit["message"].(string); !strings.Contains(msg, "已自动领奖") {
+		t.Errorf("message = %q, 应含「已自动领奖」", msg)
 	}
 }
 

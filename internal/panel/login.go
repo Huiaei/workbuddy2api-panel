@@ -238,6 +238,7 @@ func (p *Panel) loginPoll(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, "save auth: "+err.Error())
 		return
 	}
+	isNewAccount := p.cfg.Pool.AuthByUID(acct.UID) == nil
 	p.cfg.Pool.Add(a)
 	p.cfg.Pool.Revive(acct.UID) // 全新登录 = 人工恢复口径：清掉旧号遗留的禁用/冷却/熔断
 
@@ -279,6 +280,9 @@ func (p *Panel) loginPoll(w http.ResponseWriter, r *http.Request) {
 	p.loginMu.Lock()
 	delete(p.logins, state)
 	p.loginMu.Unlock()
+	if isNewAccount {
+		p.StartNewAccountTasks(acct.UID)
+	}
 	log.Printf("panel: 新账号已热加载 uid=%s nickname=%q realm=%s（免重启生效）", acct.UID, acct.Nickname, sess.realm)
 	// 企业切换会话预警：该形态下 /v2/report 行为事件被上游静默丢弃（200 不计分），
 	// 成长任务全部无法点亮（签到/列表/额度/领养照常）。当场给出修复路径，

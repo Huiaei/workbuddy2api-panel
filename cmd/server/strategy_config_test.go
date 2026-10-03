@@ -50,7 +50,7 @@ func TestSaveRegionSchedulingHotAppliesAndRejectsInvalid(t *testing.T) {
 	up := upstream.New()
 	sch := scheduler.New(scheduler.Config{})
 	raw := []byte(`{"pool":{"strategy":{"domestic":"round_robin"},"account_order":{"domestic":["b","a"]}}}`)
-	restart, err := saveConfig(raw, fp, live, p, up, sch)
+	restart, err := saveConfig(raw, fp, live, p, up, sch, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -75,7 +75,7 @@ func TestSaveRegionSchedulingHotAppliesAndRejectsInvalid(t *testing.T) {
 	if cfg.Pool.Strategy.International != pool.SequentialExhaust || !strings.Contains(string(saved), "keep") {
 		t.Fatalf("merge lost config: %s", saved)
 	}
-	_, err = saveConfig([]byte(`{"pool":{"strategy":{"domestic":"bad"}}}`), fp, live, p, up, sch)
+	_, err = saveConfig([]byte(`{"pool":{"strategy":{"domestic":"bad"}}}`), fp, live, p, up, sch, nil)
 	if err == nil {
 		t.Fatal("invalid strategy accepted")
 	}

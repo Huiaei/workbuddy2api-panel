@@ -15,6 +15,7 @@ func (p *Pool) SetCredits(uid string, credits, total int64) {
 	defer p.mu.Unlock()
 	if e, ok := p.byUID[uid]; ok {
 		e.credits = credits
+		e.creditsRemainder = 0
 		e.creditsTotal = total
 		p.dirty.Store(true)
 	}
@@ -115,6 +116,9 @@ func (p *Pool) SetCreditsSnapshot(uid string, s CreditsSnapshot) {
 		earliestRemaining = 0
 	}
 	e.credits = credits
+	// 上游报的是权威整数余额：小数余量（creditsRemainder）随之失效，必须清零，
+	// 否则残留的分数会叠加到下一轮扣减上（#104 的计费修正）。
+	e.creditsRemainder = 0
 	e.creditsTotal = s.Total
 	e.creditsExpiring = expiring
 	e.creditsEarliestExpiry = earliestAt

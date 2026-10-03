@@ -58,7 +58,8 @@ type Config struct {
 	IncludeDisabledInTasks bool
 
 	// GrowthHook 成长任务队列执行回调（panel.RunGrowthQueueOnce：扫描全部账号
-	// 待办并执行，与面板「执行全部待办」按钮同管线）。调度器只管时点不管实现——
+	// 待办并执行，与面板「执行全部待办」按钮同管线；#104 改为启动持久化的后台任务）。
+	// 调度器只管时点不管实现——
 	// panel 在 scheduler 之后构造，用 SetGrowthHook 事后挂载；nil 时到点跳过。
 	GrowthHook func()
 
@@ -130,6 +131,13 @@ func (s *Scheduler) ExpiringSoonWindow() time.Duration {
 	s.schedMu.Lock()
 	defer s.schedMu.Unlock()
 	return s.cfg.ExpiringSoonWindow
+}
+
+// GrowthEnabled 返回当前成长任务自动执行开关（与面板热配置同步）。
+func (s *Scheduler) GrowthEnabled() bool {
+	s.schedMu.Lock()
+	defer s.schedMu.Unlock()
+	return !s.cfg.GrowthDisabled
 }
 
 // SetExpiringSoonWindow 热更新快过期路由窗口。窗口变化时清空池内旧快照，避免在下一轮
