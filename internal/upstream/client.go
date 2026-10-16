@@ -2224,9 +2224,10 @@ func (c *Client) UserResourceDetailedWithExpiry(a *auth.Auth, soon time.Duration
 // CycleEndTime，把「个人体验版」的月度周期重置日（如 2026-10-31）当成了到期日，而它
 // 真实的可抵扣窗口到 2034/2035 年——首页快照因此长期错报最近到期时间与数量。
 func (c *Client) UserResourceSnapshot(a *auth.Auth, soon time.Duration) (remain, total, expiring int64, earliestAt time.Time, earliestRemaining int64, buckets []ExpiryBucket, err error) {
-	// 企业版额度不在「个人资源包」体系内：get-user-resource* 对 enterpriseId 非空账号
-	// 恒返回空 Accounts（实测 code 0 且 Accounts null），故分流到企业口径端点。
-	if a.IsEnterprise() {
+	// 企业版与静态 API Key 额度都不在「个人资源包」体系内：get-user-resource* 对
+	// 二者恒返回空 Accounts（企业号有 enterpriseId；静态 Key 无个人账号身份），
+	// 故统一分流到企业口径端点（见 auth.UsesEnterpriseBilling）。
+	if a.UsesEnterpriseBilling() {
 		remain, total, expiring, earliestAt, earliestRemaining, err = c.enterpriseResource(a, soon)
 		if err == nil && earliestRemaining > 0 && !earliestAt.IsZero() && earliestAt.After(time.Now()) {
 			buckets = []ExpiryBucket{{
