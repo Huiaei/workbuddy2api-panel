@@ -21,6 +21,10 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
 )
 
+// searchToolLabel 搜索流量在请求日志「模型」列里的标识。
+// 搜索不是模型调用，但该列留空会让面板无法区分这类流量与异常请求。
+const searchToolLabel = "WorkBuddy搜索工具"
+
 // searchFailure 轮转全部失败后的出口状态（两个搜索端点共用，各自渲染成
 // OpenAI 错误或 Anthropic 错误形态）。
 type searchFailure struct {
@@ -100,6 +104,10 @@ func (h *Handler) runSearch(ctx context.Context, query string, maxResults int, m
 
 		// meta 在循环外构造（会话头透传 + 轮级聚合键），此处直接复用：
 		// 同一次搜索的换号重试属于同一请求，必须复用同一组会话 ID。
+		// 记账：搜索没有 chatStat，账号信息直接写进 trace，面板才能看出「这次搜索用了哪个号」。
+		if tr := requestTraceFromContext(ctx); tr != nil {
+			tr.account = logfmt.Label(acct.UID, acct.Nickname)
+		}
 		out, serr := h.cfg.Upstream.Search(ctx, acct, query, maxResults, meta)
 		h.cfg.Pool.Release(acct.UID)
 		if serr == nil {
