@@ -16,11 +16,15 @@
 package server
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"strings"
+	"sync/atomic"
+	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
 )
@@ -76,8 +80,12 @@ func declaresWebSearch(tools []messagesTool) bool {
 // 约定（DSH / 官方 CLI 相同）：请求里恰好一条 user 消息，文本为
 // `Perform a web search for the query: <query>`。前缀必须剥掉，否则会把指令本身
 // 当成搜索词送去上游。
+//
+// **只取最后一条带文本的消息**，不拼接整段历史。拼接会在客户端带多轮上下文时把
+// 历史问句一起当搜索词送上游（且前缀因不在开头而剥不掉，最终搜的是一段垃圾）；
+// 「最后一次提问」才是此处唯一正确的语义。
 func extractMessagesQuery(items []messagesTurnItem) string {
-	var parts []string
+	joined := ""
 	for _, m := range items {
 		if len(m.Content) == 0 {
 			continue
@@ -85,20 +93,26 @@ func extractMessagesQuery(items []messagesTurnItem) string {
 		// content 为纯字符串（Anthropic 允许的简写形态）。
 		var plain string
 		if err := json.Unmarshal(m.Content, &plain); err == nil {
-			parts = append(parts, plain)
+			if t := strings.TrimSpace(plain); t != "" {
+				joined = t
+			}
 			continue
 		}
 		var blocks []messagesContentBlock
 		if err := json.Unmarshal(m.Content, &blocks); err != nil {
 			continue
 		}
+		var text []string
 		for _, b := range blocks {
-			if b.Type == "text" && b.Text != "" {
-				parts = append(parts, b.Text)
+			if b.Type == "text" && strings.TrimSpace(b.Text) != "" {
+				text = append(text, b.Text)
 			}
 		}
+		// 同一条消息内的多个 text block 拼接（一条消息被拆块是合法的）。
+		if t := strings.TrimSpace(strings.Join(text, "\n")); t != "" {
+			joined = t
+		}
 	}
-	joined := strings.TrimSpace(strings.Join(parts, "\n"))
 	// 前缀大小写不敏感地剥离：不同客户端的模板大小写可能有差异。
 	if len(joined) >= len(messagesQueryPrefix) &&
 		strings.EqualFold(joined[:len(messagesQueryPrefix)], messagesQueryPrefix) {
@@ -186,16 +200,21 @@ func buildMessagesSearchResponse(query, model string, out *upstream.SearchOutcom
 	if model == "" {
 		model = "web-search"
 	}
+	// tool_use_id 与 msg id 每次调用都必须唯一：Anthropic 协议里它们标识的是
+	// 「一次工具调用」，不是「一次查询的内容」。用 query 哈希会让同一 query 的
+	// 重复搜索返回同一个 id（下游按 id 缓存/去重会互相覆盖），32 位哈希本身也可
+	// 能碰撞。随机 16 hex 兼顾唯一性与可读性。
+	callID := randomHex(16)
 	content := []any{messagesToolResultBlock{
 		Type:      "web_search_tool_result",
-		ToolUseID: "srvtoolu_" + queryID(query),
+		ToolUseID: "srvtoolu_" + callID,
 		Content:   items,
 	}}
 	if len(citations) > 0 {
 		content = append(content, messagesTextBlock{Type: "text", Text: "", Citations: citations})
 	}
 	return messagesResponse{
-		ID:           "msg_wb2api_" + queryID(query),
+		ID:           "msg_wb2api_" + callID,
 		Type:         "message",
 		Role:         "assistant",
 		Model:        model,
@@ -206,25 +225,18 @@ func buildMessagesSearchResponse(query, model string, out *upstream.SearchOutcom
 	}
 }
 
-// queryID 由 query 派生一个稳定的短 id（同一次搜索的 id 可复现，便于对账）。
-func queryID(query string) string {
-	sum := fnv32a(query)
-	return fmt.Sprintf("%08x", sum)
+// randomHex 返回 n 字节随机数的 hex 串。熵源失败时回落时间+计数派生值：
+// 仍保证非空且每次调用都不同（id 唯一性是这里的硬要求）。
+func randomHex(n int) string {
+	b := make([]byte, n)
+	if _, err := rand.Read(b); err != nil {
+		return fmt.Sprintf("%0*x", n*2, uint64(time.Now().UnixNano())^atomic.AddUint64(&idSeq, 1))
+	}
+	return hex.EncodeToString(b)
 }
 
-// fnv32a FNV-1a 32 位哈希（不引入额外依赖）。
-func fnv32a(s string) uint32 {
-	const (
-		offset32 = 2166136261
-		prime32  = 16777619
-	)
-	h := uint32(offset32)
-	for i := 0; i < len(s); i++ {
-		h ^= uint32(s[i])
-		h *= prime32
-	}
-	return h
-}
+// idSeq 熵源故障时的兜底计数器（正常路径不使用）。
+var idSeq uint64
 
 // writeMessagesError 按 Anthropic 错误形态写出（与 OpenAI 形态分开，客户端各自解析）。
 func writeMessagesError(w http.ResponseWriter, status int, errType, msg string) {

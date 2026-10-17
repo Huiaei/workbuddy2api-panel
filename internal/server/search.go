@@ -25,11 +25,9 @@ import (
 // 搜索不是模型调用，但该列留空会让面板无法区分这类流量与异常请求。
 const searchToolLabel = "WorkBuddy搜索工具"
 
-// searchFailure 轮转全部失败后的出口状态（两个搜索端点共用，各自渲染成
-// OpenAI 错误或 Anthropic 错误形态）。
+// searchFailure 轮转全部失败后的出口状态（由调用方渲染成对应协议的错误形态）。
 type searchFailure struct {
 	status int
-	code   string
 	msg    string
 	hint   string
 }
@@ -102,12 +100,12 @@ func (h *Handler) runSearch(ctx context.Context, query string, maxResults int, m
 			}
 		}
 
-		// meta 在循环外构造（会话头透传 + 轮级聚合键），此处直接复用：
-		// 同一次搜索的换号重试属于同一请求，必须复用同一组会话 ID。
 		// 记账：搜索没有 chatStat，账号信息直接写进 trace，面板才能看出「这次搜索用了哪个号」。
 		if tr := requestTraceFromContext(ctx); tr != nil {
 			tr.account = logfmt.Label(acct.UID, acct.Nickname)
 		}
+		// meta 在循环外构造（会话头透传 + 轮级聚合键），此处直接复用：
+		// 同一次搜索的换号重试属于同一请求，必须复用同一组会话 ID。
 		out, serr := h.cfg.Upstream.Search(ctx, acct, query, maxResults, meta)
 		h.cfg.Pool.Release(acct.UID)
 		if serr == nil {
@@ -139,7 +137,6 @@ func (h *Handler) runSearch(ctx context.Context, query string, maxResults int, m
 	if lastErr == nil {
 		return nil, &searchFailure{
 			status: http.StatusServiceUnavailable,
-			code:   "no_healthy_account",
 			msg:    "all accounts are temporarily unavailable, please retry later",
 			hint:   hint,
 		}
@@ -156,14 +153,12 @@ func (h *Handler) runSearch(ctx context.Context, query string, maxResults int, m
 		// 搜索无模型维度（bareModel 传空、无图片判定），其余判定口径与 chat 一致。
 		return nil, &searchFailure{
 			status: status,
-			code:   "upstream_error",
 			msg:    ue.Msg,
 			hint:   h.hintOf(ue.Kind, ue.Msg, "", false, ue),
 		}
 	}
 	return nil, &searchFailure{
 		status: status,
-		code:   "no_healthy_account",
 		msg:    lastErr.Error(),
 		hint:   hint,
 	}

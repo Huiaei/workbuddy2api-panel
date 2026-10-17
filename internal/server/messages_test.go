@@ -287,3 +287,55 @@ func TestMessagesRouteDoesNotShadowV1Messages(t *testing.T) {
 		t.Errorf("POST /v1/messages code=%d want 404（该路径留给模型对话）", rec.Code)
 	}
 }
+
+// TestMessagesQueryIgnoresHistory 回归：只取最后一条带文本的消息。
+//
+// 拼接整段历史会让客户端带多轮上下文时把历史问句一起当搜索词送上游，
+// 且固定前缀因不在开头而剥不掉（最终搜一段垃圾）。
+func TestMessagesQueryIgnoresHistory(t *testing.T) {
+	items := []messagesTurnItem{
+		{Content: json.RawMessage(`[{"type":"text","text":"帮我查下 Go 版本"}]`)},
+		{Content: json.RawMessage(`[{"type":"text","text":"Perform a web search for the query: golang"}]`)},
+	}
+	if got := extractMessagesQuery(items); got != "golang" {
+		t.Errorf("query=%q want golang（历史不得混入）", got)
+	}
+
+	// 反向：历史在前、最新一条是纯字符串形态时也要取到最后一条。
+	items2 := []messagesTurnItem{
+		{Content: json.RawMessage(`[{"type":"text","text":"Perform a web search for the query: old"}]`)},
+		{Content: json.RawMessage(`"Perform a web search for the query: newest"`)}, // content 为纯字符串形态（JSON 字符串字面量）
+	}
+	if got := extractMessagesQuery(items2); got != "newest" {
+		t.Errorf("query=%q want newest", got)
+	}
+}
+
+// TestMessagesResponseIDsAreUnique 回归：msg id 与 tool_use_id 必须逐次唯一。
+//
+// 用 query 哈希会让同一 query 的重复搜索返回同一个 id——违反 Anthropic 协议里
+// 「id 标识一次工具调用」的语义，下游按 id 缓存/去重会互相覆盖。
+func TestMessagesResponseIDsAreUnique(t *testing.T) {
+	mk := func(query string) messagesResponse {
+		return buildMessagesSearchResponse(query, "m", &upstream.SearchOutcome{
+			Query:   query,
+			Results: []upstream.SearchResult{{Title: "t", URL: "https://a.com", Snippet: "s"}},
+		})
+	}
+	a, b := mk("golang"), mk("golang")
+	if a.ID != "" && a.ID == b.ID {
+		t.Errorf("msg id 重复: %q（同 query 两次调用必须不同）", a.ID)
+	}
+	idOf := func(r messagesResponse) string {
+		if blk, ok := r.Content[0].(messagesToolResultBlock); ok {
+			return blk.ToolUseID
+		}
+		return ""
+	}
+	if x, y := idOf(a), idOf(b); x != "" && x == y {
+		t.Errorf("tool_use_id 重复: %q", x)
+	}
+	if !strings.HasPrefix(a.ID, "msg_wb2api_") {
+		t.Errorf("msg id=%q want msg_wb2api_ 前缀", a.ID)
+	}
+}
