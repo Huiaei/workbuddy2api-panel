@@ -212,6 +212,12 @@ type Config struct {
 		// tier 0（免费）/ tier 1（无观测）不受限；签到回血越过 floor 自动恢复。
 		// 默认 0 = 关闭；负值钳 0。
 		CreditFloor int64 `json:"credit_floor"`
+		// CrossDomainFallback 裸模型名跨域回退开关（issue #135），默认 false（零回归）。
+		// 开启后：请求模型名不带 realm 前缀时，首选域（cn）选不到可用账号（账号级冷却/
+		// 熔断/在途占满，或该域账号对这个模型 11102 后进入模型级负缓存）会自动改用
+		// 另一域再选一次；显式 cn:/global: 前缀不受影响，行为与引入前完全一致。
+		// 语义取舍：跨域会消耗另一个域的额度，属策略选择，故默认关闭、显式开启。
+		CrossDomainFallback bool `json:"cross_domain_fallback"`
 	} `json:"pool"`
 
 	SessionSticky struct {
