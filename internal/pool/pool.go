@@ -421,6 +421,9 @@ func (p *Pool) Remove(uid string) *auth.Auth {
 		return nil
 	}
 	delete(p.byUID, uid)
+	// 熔断状态也一并清：删号后重新导入同一账号时，不该还挂着旧熔断
+	//（否则「删了重加」仍选不出来，与面板「恢复账号」的运维直觉相反）。
+	delete(p.burnGuard, uid)
 	p.dirty.Store(true)
 	p.saveLocked()
 	return e.a
