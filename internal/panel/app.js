@@ -361,7 +361,9 @@ function go(v) {
   if (v === 'logs') loadLogs();
   if (v === 'usage') loadUsage();
   if (v === 'packages') loadPackages();
-  if (v === 'accounts') loadExpiry();
+  // 到期提醒卡片：默认可见，进页面即用 overview 快照渲染（零上游请求，随首页统计
+  // 每轮刷新）。不再「打开账号池就打上游」——逐账号实时查在账号多时会卡死面板。
+  // 完整逐包明细由卡片上的「检查」按钮显式触发（loadPackages/loadExpiry）。
   if (v === 'taskscenter') reattachQueueView();
 }
 document.querySelectorAll('.nav a').forEach(a => a.onclick = e => { e.preventDefault(); go(a.dataset.view); history.replaceState(null, '', '#' + a.dataset.view); });
@@ -3320,7 +3322,16 @@ if ($('pkSort')) {
   };
 }
 
-async function loadPackages() {
+// loadPackages 按需拉取：有缓存（上次任意入口拉到的 packages 数据）先直接渲染，
+// 不再「切进积分构成页就打一次上游」——逐账号实时查询在账号多时既慢又压上游。
+// 无缓存（首次进入）才自动查一次；显式刷新（force=true，点「刷新」按钮）始终实时查。
+async function loadPackages(force) {
+  if (!force && lastPackages) {
+    renderPackages(lastPackages, lastDetailLimit);
+    const ageMin = Math.floor((Date.now() - lastPackagesAt) / 60000);
+    if (ageMin > 0) $('pkNote').textContent = lastPackages.accounts.length + ' 个账号 · ' + ageMin + ' 分钟前的数据，点「刷新」更新';
+    return;
+  }
   $('pkSummary').innerHTML = '<div class="empty">查询中…（逐账号向上游实时查询）</div>';
   $('pkDetail').innerHTML = '';
   $('pkExpiry').innerHTML = '<div class="pk-expiry-empty">查询中…</div>';
@@ -3577,7 +3588,9 @@ async function loadExpiry(force) {
 
 if ($('btnExp')) $('btnExp').onclick = () => loadExpiry(true);
 
-if ($('btnPk')) $('btnPk').onclick = loadPackages;
+// 「刷新」始终实时查（显式 force，不依赖事件对象真值）
+if ($('btnPk')) $('btnPk').onclick = () => loadPackages(true);
+
 /* ══ 账号备注（只写本机 localStorage；账号池 / 用量两个视图共用同一份映射）══════
    键取 uid 前 8 位——与 renderUsageDim 账号维度的 key 和积分扣除表的 uid 前缀同源，
    三个表格因此都能直接 join。展示层只替换文本并挂 .rm-ghost 虚体，账号标识本身
