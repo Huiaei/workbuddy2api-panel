@@ -57,7 +57,12 @@ func (p *Panel) addAPIKey(w http.ResponseWriter, r *http.Request) {
 
 	// 探测 key 是否有效：静态 Key 的额度只能走企业口径端点（个人 get-user-resource
 	// 对它返回空 Accounts）。探测失败（无效 Key / 上游报错）即 400，不落盘。
-	probe := &auth.Auth{AccessToken: key}
+	//
+	// 探测必须带上 uid：余额观察者（credithist 积分历史）按 uid 建基线，uid 为空
+	// 的观测会被直接丢弃——那样静态 Key 账号**永远没有任何积分历史行**，面板的
+	// 「积分历史」对它是一片空白（看起来像额度从没变化过）。uid 在上面已解析好，
+	// 这里带上即可。
+	probe := &auth.Auth{AccessToken: key, UID: uid}
 	remain, total, expiring, earliestAt, earliestRemaining, err := p.cfg.Upstream.UserResourceDetailedWithExpiry(probe, p.expiringSoonWindow())
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, "API Key 无效或额度查询失败："+err.Error())
