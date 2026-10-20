@@ -97,7 +97,12 @@
     "expiring_soon": "168h",
     "cost_explore_interval": "30m",
     "credit_floor": 100,
-    "cross_domain_fallback": false
+    "cross_domain_fallback": false,
+    "_comment_burn_guard": "积分燃尽熔断（issue #229）：窗口内单账号累计烧掉的积分超过 burn_guard_limit → 该账号熔断冷却（避免把还在烧钱的号继续派单）。0 = 关闭。",
+    "burn_guard_limit": 0,
+    "burn_guard_window": "10m",
+    "burn_guard_cooldown": "10m",
+    "burn_guard_cooldown_max": "2h"
   },
   "session_sticky": {
     "enabled": true,

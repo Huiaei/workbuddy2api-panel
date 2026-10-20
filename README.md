@@ -391,6 +391,8 @@ curl -s http://localhost:7863/v1/search/messages \
 | `pool.account_order.domestic` / `international` | `[]` | 对应地区的 UID 优先顺序；未列出账号按 UID 排序追加；只用于轮询和顺序耗尽 |
 | `pool.prefer_expiring` | `true` | 快过期积分加权：窗口内仍有有效快过期批次的账号，选号权重 ×3（虚拟实例）；不按到期时间排序、与批次金额无关；是软偏好，弱于会话粘性与模型成本分层（#101） |
 | `pool.expiring_soon` | `168h` | 快过期加权窗口：仅窗口内仍有有效批次的账号命中上述 ×3；窗口开大 → 命中账号变多、偏好被稀释；留空或 `0` 关闭 |
+| `pool.burn_guard_limit` | `0` | **积分燃尽熔断**（issue #229）：计账窗口（`pool.burn_guard_window`，默认 `10m`）内单账号累计烧掉的积分超过该值 → 该账号熔断冷却（`pool.burn_guard_cooldown`，默认 `10m`，随连续触发递增，上限 `pool.burn_guard_cooldown_max` 默认 `2h`）。解决「只剩余额下限、没有消费速率闸」导致的疯狂烧号。**注意**：停摆（零 tool_calls）那一跳**不参与**熔断计账（那是上游行为缺陷，不是账号在烧钱）；`0` = 关闭 |
+| `upstream.tool_stall_retry` | `1` | **零 tool_calls 停摆重试**（issue #149）：请求声明了 tools 却收到 `finish_reason=stop` + 零 tool_calls（工具一次没跑，客户端却按「正常完成」收尾）时，**换号**再问一次（同一号大概率再次停摆）。**永不罚号**（不冷却/不熔断/不禁用），重试预算用尽则原样返回上游那一跳的响应。`0` = 只观测不重试；上限 3。改动需重启 |
 | `session_sticky.enabled` | `true` | 会话粘性路由开关 |
 | `session_sticky.ttl` | `30m` | 会话绑定 TTL（滚动续期） |
 | `session_sticky.gc_interval` | `5m` | 过期绑定 GC 周期 |
