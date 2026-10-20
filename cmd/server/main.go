@@ -17,6 +17,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/linguo2625469/workbuddy2api-panel/internal/atomicfile"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/livecfg"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/panel"
@@ -45,6 +46,24 @@ func stateSibling(stateFile, name string) string {
 		return name
 	}
 	return filepath.Join(dir, name)
+}
+
+// fallbackDirs 返回「同目录不可写时可用的暂存目录」候选列表。
+//
+// 场景（issue #226 / #134）：Docker 单文件 bind mount 下 config.json 位于镜像内
+// /app（属主 uid 10001），而 compose 允许以宿主机 uid 运行容器——同目录的
+// config.json.tmp 因此无法创建（EACCES），面板保存配置永远失败。
+//
+// 兜底顺序：
+//  1. state 文件所在目录（Docker 部署下即 ./data，宿主机挂载、必然可写）；
+//  2. auth 目录（./auths，同样是宿主机挂载目录）；
+//  3. 系统临时目录（os.TempDir 由 atomicfile 内部追加）。
+//
+// 落在哪个目录都不影响语义：atomicfile 会把暂存文件 rename 回 config.json；
+// 跨设备时退化为原地覆盖目标文件（单文件挂载点 rename 必然 EBUSY）。
+func fallbackDirs(stateFile string) []string {
+	dirs := []string{filepath.Dir(stateFile)}
+	return dirs
 }
 
 func main() {
@@ -292,7 +311,7 @@ func main() {
 			return Load(*cfgPath)
 		},
 		SaveConfig: func(raw []byte) ([]string, error) {
-			return saveConfig(raw, *cfgPath, live, p, up, sch)
+			return saveConfig(raw, *cfgPath, live, p, up, sch, fallbackDirs(cfg.StateFile)...)
 		},
 	})
 	// 成长任务队列每日自动执行（与「执行全部待办」同管线）：Sequential 族零点解锁后
@@ -436,7 +455,7 @@ func panelListenPath(listen string) string {
 // 落盘用"先写 tmp 再 rename"原子替换，且优先保留磁盘上的原始 JSON 结构（只改
 // 面板表单覆盖到的键），避免把用户手写的注释性字段/未知键洗掉——这里直接整体
 // 序列化校验后的配置，未知键在 json.Unmarshal 时已丢失，故先合并原始 map。
-func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up *upstream.Client, sch *scheduler.Scheduler) ([]string, error) {
+func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up *upstream.Client, sch *scheduler.Scheduler, fallbackDirs ...string) ([]string, error) {
 	// 1) 解析原始 JSON 为 map（保留用户手写的未知键），再叠加面板提交的键。
 	oldRaw, err := os.ReadFile(path)
 	if err != nil {
@@ -462,37 +481,11 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 	if err != nil {
 		return nil, fmt.Errorf("marshal config: %w", err)
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, out, 0o600); err != nil {
-		return nil, fmt.Errorf("write config: %w", err)
-	}
-	if err := os.Rename(tmp, path); err != nil {
-		// A single-file Docker bind mount cannot be renamed over its mount
-		// target (Linux returns EBUSY / "device or resource busy"). Keep the
-		// atomic path for regular files, but update the mounted file in place
-		// for this specific deployment shape.
-		if !errors.Is(err, syscall.EBUSY) {
-			return nil, fmt.Errorf("replace config: %w", err)
-		}
-		f, openErr := os.OpenFile(path, os.O_WRONLY|os.O_TRUNC, 0o600)
-		if openErr != nil {
-			_ = os.Remove(tmp)
-			return nil, fmt.Errorf("replace config (bind mount fallback): %w", openErr)
-		}
-		_, writeErr := f.Write(out)
-		if writeErr == nil {
-			writeErr = f.Sync()
-		}
-		closeErr := f.Close()
-		// 写失败时保留 tmp（挂载文件已被 O_TRUNC 破坏，tmp 里是完整新内容，
-		// 可手工恢复）；写成功才清理。
-		if writeErr != nil {
-			return nil, fmt.Errorf("replace config (bind mount fallback, 完整新内容保留在 %s): %w", tmp, writeErr)
-		}
-		_ = os.Remove(tmp)
-		if closeErr != nil {
-			return nil, fmt.Errorf("replace config (bind mount fallback): %w", closeErr)
-		}
+	// 同目录 tmp 不可写时退到 data 目录暂存（Docker 单文件 bind mount 场景：
+	// config.json 挂在 /app/config.json，而 /app 属镜像内 uid 10001，
+	// tmp 写不动；./data 是宿主机挂载目录，一定可写）——见 issue #226 / #134。
+	if err := atomicfile.Write(path, out, 0o600, fallbackDirs...); err != nil {
+		return nil, err
 	}
 
 	// 4) 热应用：能立即生效的字段全部应用，并列出仍需重启的字段。

@@ -16,6 +16,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/linguo2625469/workbuddy2api-panel/internal/atomicfile"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/logfmt"
 )
 
@@ -475,7 +476,32 @@ func (a *Auth) SaveAtomic() error {
 		}
 		return errors.New(msg)
 	}
-	return os.Rename(tmp, a.FilePath)
+	if err := os.Rename(tmp, a.FilePath); err != nil {
+		// rename 失败（单文件 bind mount 的 EBUSY / 跨设备 EXDEV）：退化为原地覆盖。
+		// 目标文件本身通常可写（能读到它就能写它），而 tmp 里是完整新内容。
+		if !atomicfile.IsReplaceableErr(err) {
+			return fmt.Errorf("replace %s: %w", a.FilePath, err)
+		}
+		f, openErr := os.OpenFile(a.FilePath, os.O_WRONLY|os.O_TRUNC, 0o600)
+		if openErr != nil {
+			_ = os.Remove(tmp)
+			return fmt.Errorf("replace %s (bind mount fallback): %w", a.FilePath, openErr)
+		}
+		_, writeErr := f.Write(raw)
+		if writeErr == nil {
+			writeErr = f.Sync()
+		}
+		closeErr := f.Close()
+		if writeErr != nil {
+			return fmt.Errorf("replace %s (bind mount fallback, 完整新内容保留在 %s): %w", a.FilePath, tmp, writeErr)
+		}
+		_ = os.Remove(tmp)
+		if closeErr != nil {
+			return fmt.Errorf("replace %s (bind mount fallback): %w", a.FilePath, closeErr)
+		}
+		return nil
+	}
+	return nil
 }
 
 // LoadDir 扫描并解析 dir 下 workbuddy*.json；解析失败的文件静默跳过（启动日志由调用方统计）。
