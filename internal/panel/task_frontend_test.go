@@ -37,6 +37,18 @@ assert.equal(balErr.severity,'err');
 // 签到真的完成但余额刷新失败：仍要显示余额失败。
 const balErr2=ctx.checkinResultNote({checkin_done:true,balance_error:'upstream returned null data'});
 assert(balErr2.message.includes('余额刷新失败'),'签到完成+余额失败应显示余额失败，实际: '+balErr2.message);
+ // **跳过态不是错误**：企业账号没有签到体系（checkin_done 恒为 false、
+ // checkin_message 是固定解释性文案），若当成错误渲染，一排健康的企业账号
+ // 会全显示成红色「签到未完成」（外部脚本与旧缓存前端都会中招）。
+ const skipped=ctx.checkinResultNote({checkin_done:false,checkin_skipped:true,checkin_message:'企业账号无签到体系（已跳过签到，仅刷新额度）',credits:1187});
+ assert.notEqual(skipped.severity,'err','跳过态不应渲染成错误，实际: '+skipped.severity);
+ assert(skipped.message.includes('企业账号无签到体系'),'跳过态要说明原因，实际: '+skipped.message);
+ // 兜底：后端还没升级（没有 checkin_skipped 字段）时，只要是企业号 +
+ // 有解释性文案 + 没有真错误，也不该渲染成 err。
+ const legacyEnt=ctx.checkinResultNote({enterprise:true,checkin_done:false,checkin_message:'企业账号无签到体系（已跳过签到，仅刷新额度）'});
+ assert.notEqual(legacyEnt.severity,'err','旧后端的企业跳过态不应渲染成错误，实际: '+legacyEnt.severity);
+ // 但**真的失败**（有 checkin_error）仍然必须是 err。
+ assert.equal(ctx.checkinResultNote({enterprise:true,checkin_done:false,checkin_error:'上游返回异常'}).severity,'err');
 const summary=ctx.taskResultSummary([{status:'done'},{status:'awaiting_progress'},{status:'done',claim_error:'denied'},{status:'skipped'},{status:'error'}]);
 assert(summary.message.includes('已完成 1 项'));assert(summary.message.includes('等待计分 1 项'));assert(summary.message.includes('领奖待重试 1 项'));assert.equal(summary.severity,'err');
 const gs=src.indexOf('function groupItems(d)'),ge=src.indexOf('const ST_WORDS');
