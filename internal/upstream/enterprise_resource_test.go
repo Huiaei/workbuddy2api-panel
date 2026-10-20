@@ -1,6 +1,7 @@
 package upstream
 
 import (
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -38,14 +39,14 @@ func TestEnterpriseResourceMapsAllocatedQuota(t *testing.T) {
 	if gotEnt != "ent-1" {
 		t.Errorf("X-Enterprise-Id=%q want ent-1", gotEnt)
 	}
-	// 2000 - round(812.45) = 1188。
-	if remain != 1188 || total != 2000 {
-		t.Errorf("remain=%d total=%d want 1188/2000", remain, total)
+	// 2000 - ceil(812.45) = 2000 - 813 = 1187（向上取整，见 enterpriseResource 注释）。
+	if remain != 1187 || total != 2000 {
+		t.Errorf("remain=%d total=%d want 1187/2000", remain, total)
 	}
 	if expiring != 0 {
 		t.Errorf("soon=0 不应分桶，expiring=%d", expiring)
 	}
-	if earliestAt.IsZero() || earliestRemaining != 1188 {
+	if earliestAt.IsZero() || earliestRemaining != 1187 {
 		t.Errorf("最早到期批次未记录：at=%v remaining=%d", earliestAt, earliestRemaining)
 	}
 
@@ -54,8 +55,78 @@ func TestEnterpriseResourceMapsAllocatedQuota(t *testing.T) {
 	if err != nil {
 		t.Fatalf("err=%v", err)
 	}
-	if expiring2 != 1188 {
-		t.Errorf("周期内 expiring=%d want 1188", expiring2)
+	if expiring2 != 1187 {
+		t.Errorf("周期内 expiring=%d want 1187", expiring2)
+	}
+}
+
+// TestEnterpriseResourceUsedRoundsUp 企业的 credit 是浮点已用量，池内取整数：
+// **向上取整**（issue #222 建议 1）——宁可少报剩余额度不可多报。
+//
+// 多报会让调度器以为账号还有额度而继续派发，实际打过去就是 402；少报只会让
+// 调度器提前换号，不造成 402。
+func TestEnterpriseResourceUsedRoundsUp(t *testing.T) {
+	cases := []struct {
+		name       string
+		credit     string
+		limitNum   int64
+		wantRemain int64
+	}{
+		{"整数原样", "800", 2000, 1200},
+		{"小数向上", "812.45", 2000, 1187}, // ceil(812.45)=813
+		{"0.1 也向上", "0.1", 2000, 1999}, // ceil(0.1)=1
+		{"0.5 向上", "0.5", 2000, 1999},  // ceil(0.5)=1
+		{"0.9 向上", "0.9", 2000, 1999},  // ceil(0.9)=1
+		{"恰好整数不加一", "813", 2000, 1187},
+		{"超过额度钳零", "2500", 2000, 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Write([]byte(`{"code":0,"msg":"OK","data":{"credit":` + tc.credit +
+					`,"limitNum":` + fmt.Sprintf("%d", tc.limitNum) + `}}`))
+			}))
+			defer srv.Close()
+
+			c := &Client{HTTP: srv.Client(), BillingBaseCN: srv.URL}
+			a := &auth.Auth{UID: "u1", AccessToken: "at", EnterpriseID: "ent-1"}
+
+			remain, total, _, _, _, err := c.UserResourceDetailedWithExpiry(a, 0)
+			if err != nil {
+				t.Fatalf("err=%v", err)
+			}
+			if remain != tc.wantRemain {
+				t.Errorf("credit=%s remain=%d want %d", tc.credit, remain, tc.wantRemain)
+			}
+			if total != tc.limitNum {
+				t.Errorf("credit=%s total=%d want %d", tc.credit, total, tc.limitNum)
+			}
+		})
+	}
+}
+
+// TestEnterpriseResourceNullData 上游偶发 `data: null`（个人接口 Accounts: null 是
+// 同源现象）。json.Unmarshal(null, &resp) 不报错且 resp 全零 → remain=0、total=0，
+// 表现为「额度 0，但账号健康」，与「接口偶发失败」无法区分。必须显式判空并返回
+// error，让上层显示「查询失败」（issue #222 建议 3）。
+func TestEnterpriseResourceNullData(t *testing.T) {
+	for _, body := range []string{
+		`{"code":0,"msg":"OK","data":null}`,
+		`{"code":0,"msg":"OK"}`,
+	} {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Write([]byte(body))
+		}))
+
+		c := &Client{HTTP: srv.Client(), BillingBaseCN: srv.URL}
+		a := &auth.Auth{UID: "u1", AccessToken: "at", EnterpriseID: "ent-1"}
+
+		remain, total, _, _, _, err := c.UserResourceDetailedWithExpiry(a, 0)
+		srv.Close()
+		if err == nil {
+			t.Errorf("body=%s 期望返回 error，实际 remain=%d total=%d（会被误显示成「额度 0」）",
+				body, remain, total)
+		}
 	}
 }
 
