@@ -1657,8 +1657,12 @@ let taskJobsLoading = false;
 function checkinResultNote(r) {
   if (r.skipped) return { message: r.skip_reason || '该账号不适用签到', severity: '' };
   const balance = r.credits != null ? '，积分 ' + r.credits + (r.credits_total > 0 ? '/' + r.credits_total : '') : '';
+  // balance_error 优先于 checkin_done 判断：企业账号没有签到体系
+  // （checkin_done 恒为 false、checkin_error 是固定的解释性文案），若先判
+  // checkin_done，用户永远只看到「签到未完成：企业账号无签到体系…」，**看不到
+  // 余额查询真正失败的原因**（例如上游返回 data:null → 「余额刷新失败」）。
+  if (r.balance_error) return { message: '余额刷新失败：' + r.balance_error, severity: 'err' };
   if (!r.checkin_done) return { message: '签到未完成：' + (r.checkin_error || r.checkin_message || '请稍后重试') + balance, severity: 'err' };
-  if (r.balance_error) return { message: '签到已完成；余额刷新失败：' + r.balance_error, severity: 'err' };
   return { message: '签到已完成' + balance, severity: 'ok' };
 }
 
