@@ -953,6 +953,46 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				st.outcome = reqlog.OutcomeHTTPError
 				return
 			}
+			// 11-128 / 11128「通道校验失败」：上游判定请求可能不是官方客户端发出
+			//（displayMsg「请求被拦截，请重新发送」、displayTips「没通过渠道校验，
+			// 可能不是官方客户端发出的」）。这是**请求形状/出口通道**的问题，不是账号
+			// 的问题——账号本身健康（官方客户端可正常使用同一账号），故 applyErrorPolicy
+			// 对 ErrChannelRefused **零动作**（不冷却/不熔断/不 NoteFailures）。
+			//
+			// 为什么不轮转：通道指纹是**出口 IP + 出站头部 + 请求体形状**的组合，换号
+			// 不改变它——同一个号换出去还是同一个出口、同样的头。轮转只会把无效请求
+			// 放大 MaxRotate 倍、每号各交一次上游配额，最后末端落成
+			// 「其余保持 503 no_healthy_account」，把一个**确定性的客户端侧问题**伪装
+			// 成「服务端暂时过载」，客户端于是对必然失败的请求无限重试。故立即透传
+			// 上游原文回 400 + 可操作的 gateway_hint（排查 UA/头部/拦截代理）。
+			//
+			// 例外：跨域回退开启（pool.cross_domain_fallback，默认关）且**另一域还有
+			// 能服务该模型的号**时，换域确实可能换到另一条通道（CN 域与国际域的端点
+			// 与校验链不同）——此时值得再试一次，故不终止轮转。
+			if kind == upstream.ErrChannelRefused {
+				otherHasAccount := crossRealm && h.cfg.Pool.ServableForModelRealm(bareModel, otherRealm(acct.Realm())) > 0
+				if otherHasAccount {
+					// 换域可能换到另一条通道：让轮转继续试另一域的号（仍不罚号）。
+					h.applyErrorPolicy(acct.UID, kind, string(respBody), bareModel, uerr)
+					fail(acct.UID)
+					lastErr = &upstream.Error{Kind: kind, Status: status, Msg: string(respBody), RetryAfter: uerr.RetryAfter}
+					if !rotateBackoff(i, r.Context()) {
+						break
+					}
+					continue
+				}
+				h.applyErrorPolicy(acct.UID, kind, string(respBody), bareModel, uerr)
+				fail(acct.UID)
+				msg := string(respBody)
+				if strings.TrimSpace(msg) == "" {
+					msg = "upstream rejected the request channel (it may not look like the official client)"
+				}
+				writeOpenAIErrorHint(w, http.StatusBadRequest, "channel_refused", msg,
+					h.hintOf(upstream.ErrChannelRefused, string(respBody), bareModel, reqHasImage, uerr))
+				st.status = http.StatusBadRequest
+				st.outcome = reqlog.OutcomeHTTPError
+				return
+			}
 			// 11115「prompt is too long」：立即透传上游原文回客户端，**不罚号不轮转**
 			// ——上下文超限是请求的问题（同一 body 换任何号都超限，白扔健康号配额；
 			// 与 WAF IP fail-fast 同哲学：确定与账号无关的错误直接终止轮转）。
@@ -1233,6 +1273,13 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// 含 requestId，客户端按 SDK 退避重试即可。
 			code = "upstream_busy"
 			msg = "upstream capacity is full (queue.full); retry after a short wait"
+		case upstream.ErrChannelRefused:
+			// 11-128/11128 通道校验失败（防御路径：正常已在轮转循环内 fail-fast
+			// 拦截；只有跨域回退开着且另一域还有号时才会走到这里）。400 +
+			// 不可重试语义——换号不换通道，重试必然同样失败。
+			code = "channel_refused"
+			status = http.StatusBadRequest
+			msg = "upstream rejected the request channel (it may not look like the official client); check user-agent/headers or an intercepting proxy"
 		case upstream.ErrModelBlocked:
 			// 11102「该后端无此模型」：上游原文（下方统一透传）已经写清了原因，但
 			// code 此前停在默认的 no_healthy_account —— 那是"服务端过载"的语义，
@@ -1465,30 +1512,24 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 		// 偶发路径缺失不是限流信号，不该按限流惩罚升级。
 		h.cfg.Pool.Cooldown(uid, pool.CoolSoft, notFoundCooldown, "upstream 404")
 	case upstream.ErrAccountFault:
-		// 账号级授权/配额故障按**业务码**分野（口径见 upstream.IsChannelVerificationBlocked）：
-		//   - 11-128 / 11128「request illegal」→ 上游**渠道校验拦截**，不是账号封禁。
-		//     上游 body 自带 displayMsg「请求被拦截，请重新发送」与 displayTips「渠道校验失败，
-		//     可能不是从官方客户端发出的，请用官方客户端重新发送」——上游明示这是可重试的请求级
-		//     拦截。实测该账号凭证/余额/JWT 全部正常，同一套出站头部换健康账号即可 200，换任何
-		//     模型、任何 header 变体都稳定复现，属**请求形状**没过渠道校验（多因缺会话头三元组，
-		//     见 upstream/headers.go）。历史实现在此处 Disable，会把仍可用的账号永久踢出池子并
-		//     要求人工解冻（issue #197）。改为软冷却：账号暂时出池、自动轮换，上游解除标记后
-		//     自愈，绝不永久禁用。
-		//   - 11140「request illegal」→ **真的**账号级授权封禁（auth/auth_forbidden），
-		//     必须 Disable 并提示重新登录。这是两种形态唯一的区别，msg 文案完全相同，
-		//     只看文案会把真封禁降级成软冷却（账号永远轮换、永远不恢复）。
+		// 账号级授权/配额故障按**业务码**分野（口径与 Classify 一致）：
+		//   - 11140 + "request illegal" → 账号被上游限制（异常行为/风控）：硬禁用。
+		//     解除只能由用户在 WorkBuddy 官方渠道申诉，重登无效。
 		//   - 14017（trial not activated）→ register 未完成，补完 register 后可能自愈，
 		//     **保持软冷却**（禁用会让用户补完 register 后仍无法用）。
-		// 大小写不敏感（与 Classify 的 marker 匹配同口径）。
-		if upstream.IsChannelVerificationBlocked(body) {
-			h.cfg.Pool.CooldownSoftRate(uid, h.softCooldown(), time.Time{}, "channel verification blocked (11-128 request illegal)")
-			return
-		}
-		if strings.Contains(strings.ToLower(body), "request illegal") {
-			h.cfg.Pool.Disable(uid, "account banned by upstream (11140 request illegal), re-login required")
+		// 注意 11-128/11128 的 msg 同为 "request illegal"，但那是通道校验失败，已在
+		// Classify 分流到 ErrChannelRefused，走不到这里。
+		if upstream.IsAccountRestricted(body) {
+			h.cfg.Pool.Disable(uid, "account restricted by upstream (11140 request illegal); appeal in WorkBuddy (submit feedback) to lift the restriction")
 			return
 		}
 		h.cfg.Pool.Cooldown(uid, pool.CoolSoft, h.softCooldown(), "account fault (14017)")
+	case upstream.ErrChannelRefused:
+		// 11-128 / 11128 通道校验失败（上游判定请求可能不是官方客户端发出，displayMsg
+		// 就是「请求被拦截，请重新发送」）。账号本身健康——官方客户端可正常使用同一账号，
+		// 这不是账号级故障，**不罚账号**（无冷却/熔断/NoteFailures）。与
+		// ErrContentBlocked 同待遇，由轮转继续尝试（换号不改变通道指纹，若全池同错
+		// 会把上游原文透传给客户端，提示排查客户端指纹）。
 	case upstream.ErrServer:
 		// 5xx 上游故障：Classify 已把 ≥500 判为 ErrServer，在此喂熔断计数（不再手写 status>=500）。
 		h.cfg.Pool.NoteError(uid)
