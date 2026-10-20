@@ -144,10 +144,13 @@ func (p *Pool) applyAccountsLocked(accounts map[string]stateAccount) {
 			errTotal = int64(s.ErrCount)
 		}
 		e := &entry{
-			a:                        &auth.Auth{UID: uid}, // placeholder，Add 时会换成完整凭证
-			credits:                  s.Credits,
-			creditsRemainder:         s.CreditsRemainder,
-			creditsTotal:             s.CreditsTotal,
+			a:                &auth.Auth{UID: uid}, // placeholder，Add 时会换成完整凭证
+			credits:          s.Credits,
+			creditsRemainder: s.CreditsRemainder,
+			creditsTotal:     s.CreditsTotal,
+			// 旧状态文件无 credits_known 字段 ⇒ 用「正余额证明读到过」推断；
+			// 0 视为未知（保守：不套用 credit_floor，避免静默挡掉新号）。
+			creditsKnown:             s.CreditsKnown || s.Credits > 0,
 			creditsExpiring:          s.CreditsExpiring,
 			creditsEarliestExpiry:    s.CreditsEarliestExpiry,
 			creditsEarliestRemaining: s.CreditsEarliestRemaining,
@@ -308,9 +311,11 @@ func (p *Pool) stateOverviewLocked() stateFile {
 	sf := stateFile{Accounts: map[string]stateAccount{}, Scheduling: p.scheduling}
 	for uid, e := range p.byUID {
 		s := stateAccount{
-			Credits:                  e.credits,
-			CreditsRemainder:         e.creditsRemainder,
-			CreditsTotal:             e.creditsTotal,
+			Credits:          e.credits,
+			CreditsRemainder: e.creditsRemainder,
+			CreditsTotal:     e.creditsTotal,
+			CreditsKnown:     e.creditsKnown,
+
 			Disabled:                 e.disabled,
 			Paused:                   e.paused,
 			Reason:                   e.reason,

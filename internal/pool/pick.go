@@ -292,6 +292,18 @@ func (p *Pool) floorBlockedForRealmModel(e *entry, model, realm string, now time
 	if p.creditFloor <= 0 || model == "" || e.exactCredits() >= float64(p.creditFloor) {
 		return false
 	}
+	// **额度未知 ≠ 额度为 0**。
+	//
+	// 从没成功读到过上游余额的账号（刚导入、余额查询失败、额度信封判空…）在
+	// 池里的 credits 是初始 0。若把它当成「余额 0」套用 credit_floor，配了
+	// credit_floor>0 的部署会**静默挡掉所有新账号的收费模型**——号在池里、
+	// 面板显示「余额 0」、但一个请求都接不到，且没有任何日志解释为什么。
+	//
+	// 口径：只有**读到过**上游权威余额（creditsKnown）才把「余额 < floor」
+	// 当成触底；未知时放行（真正的触底会在下一次余额刷新后被拦住）。
+	if !e.creditsKnown {
+		return false
+	}
 	// 1) 本地实测台账：最权威（真实扣费证据）。
 	if mc, ok := e.modelCostOf(model, now); ok {
 		return mc.CostPer1k > 0

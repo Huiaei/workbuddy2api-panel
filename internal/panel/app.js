@@ -406,16 +406,23 @@ function renderAccounts(list) {
     // 企业版不限量：上游 limitNum == -1，网关以 credits_total=-1 透出（见 upstream
     // enterpriseUnlimitedTotal）。此时剩余额度不参与展示，直接标「不限」。
     const unlimited = s.credits_total === -1;
+    // 「额度未知」与「额度 0」必须可区分（credits_known）：前者是上游额度查询
+    // 失败 / 账号刚导入还没跑过余额刷新，后者是真的没额度。显示成同一个「0」
+    // 会让运维去充值，而真正的问题在上游接口。
+    const credUnknown = !unlimited && s.credits_known === false;
     const cred = unlimited ? '不限'
-      : (s.credits == null ? '—' : (s.credits_total > 0 ? s.credits + '<span class="of">/' + s.credits_total + '</span>' : String(s.credits)));
+      : (credUnknown ? '<span class="of">未知</span>'
+        : (s.credits == null ? '—' : (s.credits_total > 0 ? s.credits + '<span class="of">/' + s.credits_total + '</span>' : String(s.credits))));
     const pct = unlimited ? 100
-      : (s.credits_total > 0
+      : (credUnknown ? 0
+        : (s.credits_total > 0
         ? Math.min(100, Math.round((s.credits || 0) / s.credits_total * 100))
-        : Math.round((s.credits || 0) / maxCred * 100));
+        : Math.round((s.credits || 0) / maxCred * 100)));
     // 成本台账 tooltip（model_costs）：每模型实测单价（≤0 = 实测免费），运维据此
     // 看「为什么总选它」——免费号垄断 / 单价排序一眼可见。
     let credTip;
     if (unlimited) credTip = '企业版不限量（上游 limitNum=-1）';
+    else if (credUnknown) credTip = '额度未知：还没成功读到过上游余额（刚导入或上游额度查询失败）';
     else if (s.credits_total > 0) {
       credTip = (s.enterprise ? '企业版剩余额度 ' : '剩余 ')
         + s.credits + ' / ' + (s.enterprise ? '分配 ' : '总额 ') + s.credits_total + '（' + pct + '%）';
@@ -527,9 +534,14 @@ async function loadOverview(quiet) {
     $('sDisabled').textContent = d.disabled;
     // 暂停选号单列（issue #125）：它只关选号、照常签到保活，与禁用是两种状态。
     if ($('sPaused')) $('sPaused').textContent = d.paused == null ? '-' : d.paused;
-    const remSum = (d.accounts || []).reduce((a, s) => a + (s.credits || 0), 0);
-  const totSum = (d.accounts || []).reduce((a, s) => a + (s.credits_total || 0), 0);
-  $('sCredits').textContent = totSum > 0 ? remSum + ' / ' + totSum : remSum;
+    // 积分汇总：只累加**额度已知**的账号（credits_known）。额度未知的账号
+    // credits=0，累加进去会让「一部分号没读到余额」看起来像「余额变成 0 了」。
+    const knownAcc = (d.accounts || []).filter(s => s.credits_known !== false);
+    const unknownCount = (d.accounts || []).length - knownAcc.length;
+    const remSum = knownAcc.reduce((a, s) => a + (s.credits || 0), 0);
+    const totSum = knownAcc.reduce((a, s) => a + (s.credits_total || 0), 0);
+    $('sCredits').textContent = (totSum > 0 ? remSum + ' / ' + totSum : String(remSum))
+      + (unknownCount > 0 ? '（' + unknownCount + ' 个额度未知）' : '');
     $('sSticky').textContent = d.sticky_sessions;
     $('navSub').textContent = 'v' + d.version;
     $('navVer').textContent = 'v' + d.version;

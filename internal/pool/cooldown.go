@@ -17,6 +17,8 @@ func (p *Pool) SetCredits(uid string, credits, total int64) {
 		e.credits = credits
 		e.creditsRemainder = 0
 		e.creditsTotal = total
+		// 读到过上游权威余额 ⇒ 「额度已知」（含读到 0 的情形）。
+		e.creditsKnown = true
 		p.dirty.Store(true)
 	}
 }
@@ -120,6 +122,8 @@ func (p *Pool) SetCreditsSnapshot(uid string, s CreditsSnapshot) {
 	// 否则残留的分数会叠加到下一轮扣减上（#104 的计费修正）。
 	e.creditsRemainder = 0
 	e.creditsTotal = s.Total
+	// 读到过权威余额 ⇒ 「额度已知」（含读到 0 的情形）。
+	e.creditsKnown = true
 	e.creditsExpiring = expiring
 	e.creditsEarliestExpiry = earliestAt
 	e.creditsEarliestRemaining = earliestRemaining

@@ -74,6 +74,13 @@ type Status struct {
 	Nickname     string `json:"nickname,omitempty"`
 	Credits      int64  `json:"credits"`
 	CreditsTotal int64  `json:"credits_total,omitempty"` // 积分总额度（各套餐聚合）；0 = 未知（旧 state/查询失败）
+	// CreditsKnown 报告**是否读到过**上游权威余额。
+	//
+	// credits=0 有两种含义：「读到 0（真没额度）」与「从没读到过（上游查询失败
+	// / 账号刚导入还没跑过余额刷新）」。对运维来说这两者必须可区分：前者要
+	// 去充值，后者要去查上游额度接口为什么失败。credits=false 时面板应显示
+	// 「未知」而不是「0」。
+	CreditsKnown bool `json:"credits_known"`
 	// CreditsExpiring / CreditsEarliestExpiry / CreditsEarliestRemaining 描述当前积分中
 	// 的到期压力。CreditsExpiring 是配置窗口内的剩余积分；后两者是全部未来到期批次中
 	// 最早的一批及其剩余量，供 WorkDaddy 同口径的“最早到期优先”路由使用。
@@ -205,6 +212,19 @@ type entry struct {
 	// because credits is the nearest integer to the exact balance.
 	creditsRemainder float64
 	creditsTotal     int64 // 积分总额度（UserResource 聚合；0 = 未知）
+	// creditsKnown 报告**是否读到过**上游权威余额。
+	//
+	// 为什么要区分「未知」与「0」：credit_floor（积分保底）会把「余额 < floor」
+	// 的账号挡在收费模型之外，但「从没读到过余额」（上游额度查询失败、账号刚
+	// 导入还没跑过余额刷新）同样落 credits=0 —— 于是**新账号在配了
+	// credit_floor>0 的部署里被静默挡掉**，且面板上显示「余额 0」让人以为账号
+	// 没额度（issue #222 建议 3 的连锁面）。
+	//
+	// 口径：只有**成功读到过**上游余额（SetCredits / SetCreditsSnapshot /
+	// ReenableIfCredits / reviveCoolingLocked）才置 true；从未读到过就是 false，
+	// 此时**不套用 credit_floor**（未知 ≠ 余额为 0）。已读到过且真的读到 0
+	// ⇒ creditsKnown=true ⇒ 保底照常拦截。
+	creditsKnown bool
 	// creditsExpiring 配置窗口内即将过期的可用积分子集，是 credits 的一部分。
 	// creditsEarliestExpiry / creditsEarliestRemaining 是全部未来到期批次中的最早一批；
 	// 两者均由签到/余额刷新更新，供 earliest-expiry 路由和状态观测使用。
@@ -487,6 +507,13 @@ type stateAccount struct {
 	Credits          int64     `json:"credits"`
 	CreditsRemainder float64   `json:"credits_remainder,omitempty"`
 	CreditsTotal     int64     `json:"credits_total,omitempty"`
+	// CreditsKnown 记录该账号**是否读到过**上游权威余额（entry.creditsKnown）。
+	//
+	// 旧版状态文件没有这个字段 ⇒ 只能靠 credits 推断：正余额只可能来自一次
+	// 成功的上游读取 ⇒ 视为已知；0 既可能是「读到 0」也可能是「从没读到过」
+	// （新账号的初始值）⇒ 保守视为**未知**（未知时不套用 credit_floor，
+	// 方向是「不静默挡号」；下一次余额刷新会把它变成已知）。
+	CreditsKnown bool `json:"credits_known,omitempty"`
 	Disabled         bool      `json:"disabled"`
 	Paused           bool      `json:"paused,omitempty"`
 	Reason           string    `json:"reason,omitempty"`
