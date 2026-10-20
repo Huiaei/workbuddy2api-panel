@@ -594,6 +594,10 @@ func StreamHint(w http.ResponseWriter, r io.Reader, hintFn func(string) string, 
 				if o.onErrorFrame != nil {
 					o.onErrorFrame(payload)
 				}
+				// 逐帧观察者（issue #149 停摆判定）：error 帧也是合法 JSON，一并观察。
+				for _, obs := range o.frameObservers {
+					obs(obj)
+				}
 				if werr := writeRaw(payload); werr != nil {
 					return 0, werr
 				}
@@ -611,6 +615,10 @@ func StreamHint(w http.ResponseWriter, r io.Reader, hintFn func(string) string, 
 				if v, ok := obj["id"].(string); !ok || v == "" {
 					obj["id"] = firstID
 				}
+			}
+			// 规范化透传：白名单重建后的帧才是写给客户端的内容。
+			if raw, err := json.Marshal(normalizeFrame(obj)); err == nil {
+				payload = string(raw)
 			}
 			// 逐帧观察者（issue #149 停摆判定）：只看原始上游帧——判定口径必须是
 			// 「上游真的吐了 tool_calls 吗」，而不是「网关规范化之后有没有」。
