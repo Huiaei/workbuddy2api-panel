@@ -539,23 +539,41 @@ func (p *Pool) recordBreakerFailureLocked(e *entry) {
 	e.breakerUntil = time.Now().Add(d)
 }
 
-// CooldownUntilTomorrow4AM 冷却到下一个 04:00（本地时区）。
+// CooldownUntilTomorrow4AM 冷却到下一个 04:00（**上游时区** CST = UTC+8）。
 // 用于 ErrHardCredit 场景：积分耗尽账号等签到任务（09:00/21:00）恢复。
+//
+// 时区口径：上游的每日积分重置按**上游时区**（Asia/Shanghai，UTC+8 无夏令时）
+// 走，不按部署机器的本地时区。理由：
+//   - 硬冷却的目的是「等上游把积分额度重置了」——重置墙钟由上游决定，
+//     释放时间必须跟着上游的墙钟走；
+//   - 用服务器本地时区时，部署在 UTC 的机器会在上游已重置后仍冷却
+//     （早放：白冷一部分），部署在 UTC+13 的机器则会多冷近 5 小时
+//     （晚放：账号多闲置 5 小时，调度器少一个可用号）；
+//   - 同口径先例：internal/scheduler/travel.go 的自然日切分已固定用
+//     cstZone（UTC+8），internal/upstream/client.go 的 promoZone 同样是
+//     FixedZone("CST", 8*3600)。这里保持一致。
+//
+// 固定 +8 不依赖 tzdata（精简容器镜像常缺 /usr/share/zoneinfo），也不受夏令时影响。
 func (p *Pool) CooldownUntilTomorrow4AM(uid string, reason string) {
 	now := time.Now()
 	p.Cooldown(uid, CoolHard, nextDay4AM(now).Sub(now), reason)
 }
 
-// nextDay4AM 返回 now 之后最近的一个 04:00（与 now 同一时区）。
+// upstreamCSTZone 上游时区（Asia/Shanghai）。中国无夏令时，固定 +8 即可，
+// 且不依赖 tzdata（精简容器镜像常缺 /usr/share/zoneinfo）。
+var upstreamCSTZone = time.FixedZone("CST", 8*3600)
+
+// nextDay4AM 返回 now 之后最近的一个**上游时区**04:00。
 // now 在当天 04:00 之前（凌晨 00:00~04:00）时返回当天 04:00——此时签到尚未执行，
 // 该窗内触发的硬冷却等当天签到即可恢复；返回次日会白冷约一天。
 // 04:00 整及之后返回次日 04:00。
 // time.Date 对日溢出自动进位（月末→下月 1 号、年末→下年 1 号），天然覆盖跨日/跨月/跨年。
 func nextDay4AM(now time.Time) time.Time {
-	if now.Hour() < 4 {
-		return time.Date(now.Year(), now.Month(), now.Day(), 4, 0, 0, 0, now.Location())
+	local := now.In(upstreamCSTZone)
+	if local.Hour() < 4 {
+		return time.Date(local.Year(), local.Month(), local.Day(), 4, 0, 0, 0, upstreamCSTZone)
 	}
-	return time.Date(now.Year(), now.Month(), now.Day()+1, 4, 0, 0, 0, now.Location())
+	return time.Date(local.Year(), local.Month(), local.Day()+1, 4, 0, 0, 0, upstreamCSTZone)
 }
 
 // ReenableIfCredits 签到/余额刷新后解冻：仅当 remain > 0 且账号非禁用时，解冻
