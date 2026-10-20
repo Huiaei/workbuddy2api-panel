@@ -777,7 +777,22 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	//     粘性 key 进程内稳定生成；粘性 key 也空时走轮级兜底（TurnKey/TurnRequestID），
 	//     无 user 消息时退化成本请求级随机——轮转内捕获一次即共享；
 	//   - messageID 在 ChatHeaders 内每条消息生成（消息级独立，无需外部可见）。
-	chatMeta := upstream.ChatMeta{ConversationID: session.ResolveConversationID(body)}
+	//
+	// conversationID 透传客户端会话 id；不带 conversation_id 的客户端
+	// （Anthropic / Claude Code 入站流量）回退到已解析的会话键 sessKey
+	// （system + 首条 user 派生，会话内稳定）。不回退的话，上游 prompt_cache_key
+	// 会退化成「每账号一个常量」——同账号下所有客户端（Claude Code 会话、桌面端等）
+	// 共用同一个上游前缀缓存槽，互相覆盖，导致前缀命中不稳定、常整段 miss
+	//（issue #169 / #229：缓存命中率≈0）。
+	//
+	// 注意：这里只在 conversationID 为空且 sessKey 非空时回退。sessKey 为空
+	//（body 无 user 消息，或带 user_id 从而抑制派生）时保持空串——此时
+	// injectConversationHeaders 才会补随机 32 hex，与 v1.13.0 原行为一致。
+	convID := session.ResolveConversationID(body)
+	if convID == "" {
+		convID = sessKey
+	}
+	chatMeta := upstream.ChatMeta{ConversationID: convID}
 	if v := r.Header.Get("X-Conversation-Request-ID"); v != "" {
 		chatMeta.ConversationRequestID = v
 	} else if turnKey != "" && sessKey != "" {
