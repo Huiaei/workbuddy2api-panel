@@ -36,7 +36,16 @@ func TestWriteAtomicReplace(t *testing.T) {
 // TestWriteFallbackDirWhenPrimaryDirUnwritable 复现 issue #226/#134 的核心现场：
 // 目标文件所在目录不可写（单文件 bind mount + 非属主 uid），但 fallback 目录可写。
 // 此时必须落盘成功，且内容完整。
+//
+// 平台说明：Windows 的 os.Chmod 只能改「只读属性」，没有目录写保护语义
+// → chmod(0o555) 之后目录照样可写 → 本用例在 Windows 上退化成「正常写入」，
+// 断言仍成立但覆盖不到 fallback 路径（fallback 路径由
+// TestWriteTempDirFallback 与 Windows 专项用例覆盖）。故 Windows 上直接跳过，
+// 避免出现「假通过且看不出在测什么」的情况。
 func TestWriteFallbackDirWhenPrimaryDirUnwritable(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows 没有目录写权限语义，无法构造「目录不可写」现场")
+	}
 	root := t.TempDir()
 	roDir := filepath.Join(root, "ro")
 	fbDir := filepath.Join(root, "fallback")
@@ -70,6 +79,9 @@ func TestWriteFallbackDirWhenPrimaryDirUnwritable(t *testing.T) {
 // TestWriteNoFallbackReturnsPermissionError 无 fallback 可用时，错误信息必须点名
 // 不可写的 tmp 路径并给出 Docker 权限指引（而不是裸 syscall 错误）。
 func TestWriteNoFallbackReturnsPermissionError(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows 没有目录写权限语义，无法构造「目录不可写」现场")
+	}
 	root := t.TempDir()
 	roDir := filepath.Join(root, "ro")
 	if err := os.MkdirAll(roDir, 0o755); err != nil {
@@ -99,6 +111,9 @@ func TestWriteNoFallbackReturnsPermissionError(t *testing.T) {
 // TestWriteTempDirFallback 系统临时目录兜底：同目录不可写、无显式 fallback 时，
 // 仍应通过 os.TempDir() 完成落盘。
 func TestWriteTempDirFallback(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows 没有目录写权限语义，无法构造「目录不可写」现场")
+	}
 	root := t.TempDir()
 	roDir := filepath.Join(root, "ro")
 	if err := os.MkdirAll(roDir, 0o755); err != nil {
