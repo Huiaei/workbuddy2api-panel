@@ -425,7 +425,13 @@ func RepairAggregatedResponse(resp map[string]any, allowed map[string]bool, allo
 		if !ok {
 			continue
 		}
-		if tcs, ok := msg["tool_calls"].([]any); ok && len(tcs) > 0 {
+		// 已有真实工具调用 ⇒ 不得用标记还原出的调用覆盖它。
+		//
+		// 判读必须认全类型：Aggregate 产出的 message.tool_calls 是
+		// `[]map[string]any`，而 JSON 反序列化的 body 里是 `[]any`。早先这里
+		// 只认 `[]any` ⇒ 守卫失效 ⇒ 修复器用还原出的调用**覆盖真实调用**，
+		// 调用参数被改写（实测 Hangzhou → Beijing）。
+		if HasStructuredToolCalls(msg["tool_calls"]) {
 			continue
 		}
 		if fr, _ := c["finish_reason"].(string); fr != "stop" {
