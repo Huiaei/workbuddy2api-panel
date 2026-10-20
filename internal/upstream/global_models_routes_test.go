@@ -140,25 +140,39 @@ func TestNonChatModelGenerationTags(t *testing.T) {
 	}
 }
 
-// TestDesktopUAForGlobalAccount 桌面端 UA 按 realm 切平台段：global 账号必须是
-// `WorkBuddy AI`（送错平台段会触发上游 403 code=11140 风控）。探测主路用这个 UA，
-// 与 chat 路径同源——global 目录探测因此拿到客户端同款模型集。
+// TestDesktopUAForGlobalAccount 桌面端 UA 按 realm 切品牌段。
+//
+// 品牌段的**真值**来自 2026-10-20 同机同代理双版本真机抓包（CN 115 条 / GL 151 条）：
+//
+//	CN 5.8.3    → WorkBuddy/5.8.3 WorkBuddy/5.8.3 CLI/2.161.0     （驼峰原样）
+//	global 5.8.4 → workbuddy-ai/5.8.4 workbuddy-ai/5.8.4 CLI/2.161.0（小写连字符 slug）
+//
+// 旧断言要求 global 含 `WorkBuddy AI`（展示名本体），那是**按「客户端 UA 推理」**
+// 得出的猜测，与真机不符：global 走 Electron userAgentFallback 的 asciiSlug 路径，
+// `WorkBuddy AI` → `workbuddy-ai`。送错品牌段正是 #231「渠道校验拦截」的一类诱因，
+// 故此处按实测值钉死。
 func TestDesktopUAForGlobalAccount(t *testing.T) {
 	c := New()
 	global := &auth.Auth{UID: "u1", Domain: "www.workbuddy.ai"}
 	global.BackfillRealm()
 	ua := c.defaultWorkBuddyUAFor(global)
-	if want := "WorkBuddy AI"; !contains(ua, want) {
+	if want := "workbuddy-ai/"; !contains(ua, want) {
 		t.Errorf("global desktop UA = %q, want it to contain %q", ua, want)
+	}
+	if contains(ua, "WorkBuddy AI") {
+		t.Errorf("global desktop UA = %q, must not contain the display-name form %q", ua, "WorkBuddy AI")
 	}
 	if !contains(ua, "CLI/") {
 		t.Errorf("global desktop UA = %q, want CLI segment", ua)
 	}
-	// CN 账号保持 WorkBuddy（零回归）。
+	// CN 账号保持驼峰 WorkBuddy（零回归，且 slug 化才是非官方指纹）。
 	cn := &auth.Auth{UID: "u2", Domain: "copilot.tencent.com"}
 	cn.BackfillRealm()
-	if ua := c.defaultWorkBuddyUAFor(cn); contains(ua, "WorkBuddy AI") {
-		t.Errorf("cn desktop UA = %q, must not contain 'WorkBuddy AI'", ua)
+	if ua := c.defaultWorkBuddyUAFor(cn); !contains(ua, "WorkBuddy/") {
+		t.Errorf("cn desktop UA = %q, want the camelCase brand segment", ua)
+	}
+	if ua := c.defaultWorkBuddyUAFor(cn); contains(ua, "workbuddy-ai/") {
+		t.Errorf("cn desktop UA = %q, must not use the global slug brand", ua)
 	}
 }
 
