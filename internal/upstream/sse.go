@@ -264,6 +264,13 @@ func Aggregate(r io.Reader) (map[string]any, error) {
 		// （不臆造：单边有值无法合成可信的 total）。
 		resp["usage"] = normalizeUsageCacheAliases(ensureUsageTotal(usage))
 	}
+	// 截断标记：上游没有显式发 data: [DONE] 就 EOF 收尾 = 流被截断（传输层中断）。
+	// 与 finish_reason="length"（模型因 max_tokens 提前中止）并列，两种截断都
+	// **不是**「模型只说了话就收尾」——停摆判定（issue #149）必须把截断排除，
+	// 否则一次网络抖动会被误报成上游行为缺陷。
+	if !sawDone {
+		resp["_truncated"] = true
+	}
 	return resp, nil
 }
 
@@ -488,6 +495,10 @@ type streamOptions struct {
 	// frameObserver 旁路观察每个上游帧（原始 chunk 对象）。纯观测：不改任何
 	// 透传字节、不影响帧计数。用于「零 tool_calls 停摆」判定（issue #149）。
 	frameObserver func(obj map[string]any)
+	// streamEndObserver 在**流读取结束**时回调一次，参数是「本流是否被截断」
+	// （上游没发 data: [DONE] 就 EOF = 截断）。纯观测，不改任何透传字节。
+	// 停摆判定需要它：截断的零 tool_calls 是「帧没到齐」，不是「模型不调工具」。
+	streamEndObserver func(truncated bool)
 }
 
 // WithFrameObserver 注册一个**逐帧旁路观察者**：每个解析成功的上游 chunk 对象
@@ -500,6 +511,15 @@ type streamOptions struct {
 // 非 JSON 帧不会回调（无法解析成对象）。error 帧**会**回调（它也是合法 JSON）。
 func WithFrameObserver(fn func(obj map[string]any)) StreamOption {
 	return func(o *streamOptions) { o.frameObserver = fn }
+}
+
+// WithStreamEndObserver 注册一个**流结束观察者**：本流读取结束时回调一次，参数
+// truncated=true 表示上游没发 data: [DONE] 就 EOF 收尾（流被截断）。
+//
+// 用途（issue #149）：「零 tool_calls 停摆」判定必须排除截断——截断时工具调用
+// 帧可能还没到就被切断，那是传输层问题，不是上游行为缺陷。透传字节逐字节不变。
+func WithStreamEndObserver(fn func(truncated bool)) StreamOption {
+	return func(o *streamOptions) { o.streamEndObserver = fn }
 }
 
 // WithMarkupRepair 注册「模型原生工具调用标记」修复器（见 dsml.go）。
@@ -734,6 +754,7 @@ func StreamHint(w http.ResponseWriter, r io.Reader, hintFn func(string) string, 
 
 	br := bufio.NewReaderSize(r, 64*1024)
 	validFrames := 0
+	sawDone := false
 readLoop:
 	for {
 		line, err := br.ReadString('\n')
@@ -742,6 +763,7 @@ readLoop:
 		case strings.HasPrefix(trimmed, "data: [DONE]"):
 			// 上游显式结束：停止读取，DONE 之后的任何数据（含垃圾帧）一律不再透传。
 			// [DONE] 统一在循环结束后写出，保证恰好一个。
+			sawDone = true
 			break readLoop
 		case strings.HasPrefix(trimmed, "data: "):
 			n, werr := writeFrame(strings.TrimPrefix(trimmed, "data: "))
@@ -765,6 +787,10 @@ readLoop:
 			}
 			return err
 		}
+	}
+	// 流结束观测：sawDone=false = 上游没发 [DONE] 就 EOF = 流被截断。纯观测。
+	if o.streamEndObserver != nil {
+		o.streamEndObserver(!sawDone)
 	}
 	// 标记修复的尾部收尾：流结束时仍未判定的字节一律原文回吐（绝不吞字节，未闭合
 	// 的块连起始标记一起交还）；若本流还原过调用、但上游从未给出收尾帧，补一帧

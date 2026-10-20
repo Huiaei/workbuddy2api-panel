@@ -598,6 +598,20 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 让客户端多等一轮）。停摆的语义是「本轮本该调工具却没调」，只有本请求自己
 	// 声明了 tools 才有「本该调」这回事。
 	stallDeclaredTools := upstream.DeclaredToolNames(body)
+	// 停摆判定的第二个必要条件：**历史里还没有工具结果**。
+	//
+	// 真实 agentic 客户端（DSH、Codex、Cline…）每轮都重发同一份 tools 声明，于是
+	// 多轮会话的**正常收尾轮**（最终答案 + stop + 零 tool_calls）也满足「本请求声明
+	// 了 tools」的表面条件——只看这一条会把每一次正常收尾都误判成停摆，每次多花
+	// 一次上游调用 + 一次计费。
+	//
+	// 判据是「历史里出现过 role=tool 的结果」：有结果 = 工具**跑过了**，本轮正文
+	// 就是最终答案 → 不是停摆；没有结果 = 上一轮刚要调工具、本轮正文就停住了 →
+	// 正是停摆的现场。解析失败按「没有结果」处理（宁可多判一次，不放过真停摆）。
+	stallHistoryHasResult := upstream.HistoryHasToolResult(body)
+	// tool_choice 点名了要调某个函数 → 「零 tool_calls」是**确定**的停摆
+	// （模型被明确要求调它却只回正文），此时不看历史。
+	stallForcedTool := upstream.ToolChoiceForcesTool(body)
 
 	// realm 前缀解析（D6）：model 名可能带 "[realm:]" 前缀。剥出 realm + bareModel，
 	// bareModel 用于选号/粘性/出站 body 重写（前缀是网关侧路由协议，上游只认裸名）。
@@ -639,6 +653,10 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 与 MaxRotate 独立：停摆重试消耗的是轮转名额（continue 会走下一轮），
 	// 但它有自己的上限（cfg.ToolStallRetry），避免一次请求连续撞上多个停摆号。
 	stallRetry := 0
+	// stallFallback 保存停摆那一跳的**上游正文**：当重试预算用尽、或池里选不出
+	// 第二个号时，把它原样返回给客户端（200）——上游确实答了（只是没调工具），
+	// 丢掉它反而让客户端收到 503 no_healthy_account 并无限重试。
+	var stallFallback map[string]any
 	// modelBlock 记录本次是否因「模型级冷却」而选不到号（下方 acct==nil 分支填充）。
 	// 默认零值 Blocked=false = 按既有的"没有可用账号"口径报错。
 	var modelBlock pool.ModelBlockStatus
@@ -835,7 +853,28 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	chatMeta.TraceID = r.Header.Get("X-Trace-ID")
 
-	for i := 0; i < h.cfg.MaxRotate; i++ {
+	// 轮转预算：MaxRotate 次**换号重试**机会（错误恢复用）。
+	//
+	// 停摆重试（issue #149）**不消耗**这份预算：它有自己的独立配额
+	// （cfg.ToolStallRetry）。为什么分开——两种重试的失败形态完全不同：
+	//   - 停摆重试 = 「同一份请求换个号再问一次」，失败形态高度相关（上游这会儿
+	//     就是不肯调工具），换号成功率本来就低；
+	//   - MaxRotate = 「换号去绕开一个**错误**」（限流/封禁/网络抖动），那才是
+	//     真正的错误恢复能力。
+	// 若停摆吃 MaxRotate 的名额，tool_stall_retry=3 就把错误恢复能力吃光
+	// （实测：跳 1、2 停摆，跳 3 真 429 → 客户端直接吃 429，没人再救）。
+	rotateUsed := 0
+	// allowExtraIteration：本轮结束时的 continue 是否来自停摆重试（它不消耗
+	// 轮转预算，因此即使 rotateUsed 已达上限也要允许再进一次循环体）。
+	allowExtraIteration := false
+	for attempt := 0; rotateUsed < h.cfg.MaxRotate || allowExtraIteration; attempt++ {
+		allowExtraIteration = false
+		// 退避序号：随尝试次数指数增长（backoffAfter 内部有封顶）。停摆重试也
+		// 走同一退避（避免连续打同一个上游）。
+		i := attempt
+		if i > 8 {
+			i = 8
+		}
 		// 选号：粘性号优先（PickByUIDForModel 已校验该模型可用性 + 在途未满），否则普通轮换。
 		var acct *auth.Auth
 		if stickyUID != "" {
@@ -868,6 +907,19 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		if acct == nil {
+			// 停摆重试后**选不出第二个号**：上游其实已经回过正文（只是没调工具），
+			// 丢掉它改成 503 no_healthy_account 会让客户端把「模型给了答案」误读成
+			// 「服务端没号可用」，并触发客户端无限重试（那才是真正的浪费）。
+			// 有停摆正文就直接返回它（200）。
+			if stallFallback != nil {
+				writeJSON(w, http.StatusOK, stallFallback)
+				st.status = http.StatusOK
+				st.outcome = reqlog.OutcomeSuccess
+				st.toks = completionTokens(stallFallback)
+				log.Printf("WARN: [server] non-stream model=%s: no second account available after tool-stall — returning upstream content as-is",
+					bareModel)
+				return
+			}
 			st.status = http.StatusServiceUnavailable
 			// 记下"是不是模型级阻塞"。选号返回 nil 有两种完全不同的成因：
 			//   (a) 池子真的没有可用号（账号级冷却/在途占满/积分保底）；
@@ -916,6 +968,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				if !rotateBackoff(i, r.Context()) {
 					break // ctx 取消：终止轮转（refresh 失败换号退避）
 				}
+				rotateUsed++ // refresh 失败换号（错误恢复：消耗轮转预算）
 				continue
 			}
 			if err := acct.SaveAtomic(); err != nil {
@@ -966,6 +1019,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			if !rotateBackoff(i, r.Context()) {
 				break // ctx 取消：终止轮转（传输层错误换号退避）
 			}
+			rotateUsed++ // 传输层错误换号（错误恢复：消耗轮转预算）
 			continue
 		}
 		if status >= 400 {
@@ -990,6 +1044,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				delete(tried, acct.UID) // 单账号池也能拿到重试机会（降级重试占一次名额）
 				releaseHeld()
 				log.Printf("content-blocked (likely fingerprint false positive) -> degraded prompt retry")
+				rotateUsed++ // 内容降级重试（错误恢复：消耗轮转预算）
 				continue
 			}
 			if kind == upstream.ErrContentBlocked {
@@ -1034,6 +1089,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				if !rotateBackoff(i, r.Context()) {
 					break
 				}
+				rotateUsed++ // 11-128 通道校验换号（错误恢复：消耗轮转预算）
 				continue
 			}
 			// 11115「prompt is too long」：立即透传上游原文回客户端，**不罚号不轮转**
@@ -1123,6 +1179,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			if !rotateBackoff(i, r.Context()) {
 				break // ctx 取消：终止轮转（分类错误换号退避）
 			}
+			rotateUsed++ // 分类错误换号（错误恢复：消耗轮转预算）
 			continue
 		}
 		// 成功判定与粘性绑定一律**延后到这一跳真正成功之后**（见下方流式/非流式分支）：
@@ -1145,12 +1202,15 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			repair := upstream.NewMarkupRepair(declaredTools, true)
 			// 零 tool_calls 停摆探测器（issue #149）：流式路径**不重试**（帧已写给
 			// 客户端收不回来），只做观测——判定口径与非流式一致（见 DetectToolStall）。
-			stallDetect := upstream.NewStreamToolStallDetector(stallDeclaredTools)
+			stallDetect := upstream.NewStreamToolStallDetector(stallDeclaredTools, stallHistoryHasResult, stallForcedTool)
 			sErr := upstream.StreamHint(w, stats, upstream.FrameHintFunc(func() upstream.HintContext {
 				return h.hintContext(bareModel, reqHasImage)
 			}), upstream.WithErrorFrameObserver(func(payload string) { errFrame = payload }),
 				upstream.WithMarkupRepair(repair),
-				upstream.WithFrameObserver(stallDetect.Observe))
+				upstream.WithFrameObserver(stallDetect.Observe),
+				// 流结束观测：上游没发 [DONE] 就 EOF = 流被截断 → 零 tool_calls 是
+				// 「帧没到齐」而不是「模型不调工具」→ 不判停摆（与非流式同口径）。
+				upstream.WithStreamEndObserver(stallDetect.MarkTruncated))
 			switch {
 			case upstream.IsEmptyStreamError(sErr):
 				// 上游 200 但空流（0 有效帧）：StreamHint 已写 error 帧 + [DONE]
@@ -1209,6 +1269,10 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			if n := repair.Converted(); n > 0 {
 				// 修复命中：上游本来会把工具调用吐成正文标记，这里已还原成 tool_calls。
 				// 打一行便于运维确认「这次不再空转」以及统计发生率。
+				//
+				// 同时告诉停摆探测器：上游**确实调了工具**（只是吐成了文本标记），
+				// 否则流式会判停摆、非流式（先修复再判定）不判——同一形态两种口径。
+				stallDetect.MarkRepaired(n)
 				log.Printf("INFO: [server] stream acct=%s model=%s: repaired %d native tool call(s) from assistant text (tool names known=%d)",
 					logfmt.Label(acct.UID, acct.Nickname), bareModel, n, len(declaredTools))
 			} else if m := repair.Seen(); m > 0 {
@@ -1274,14 +1338,15 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		// 零 tool_calls 停摆检测（issue #149）：请求声明了 tools，模型却只回了正文
 		// 并以 stop 收尾——工具一次没跑，客户端会按「正常完成」收尾，任务停在原地。
 		//
-		// 判定口径只按「零 tool_calls」（+ stop 收尾），**绝不按正文长度**：报告方
-		// 的教训是按长度阈值判会把 glm-5.3 的停摆率算成 0%（它 3 次停摆的正文都是
-		// 1000+ 字符），实际按零 tool_calls 算是 13%。
+		// 判定口径只按「零 tool_calls」（+ stop 收尾 + 历史里还没有工具结果 +
+		// 本轮未被截断），**绝不按正文长度**：报告方的教训是按长度阈值判会把
+		// glm-5.3 的停摆率算成 0%（它 3 次停摆的正文都是 1000+ 字符），实际按零
+		// tool_calls 算是 13%。
 		//
 		// 这是**上游行为缺陷**，不是账号问题 → **绝不罚账号**（不冷却/不熔断/
 		// NoteFailures/NoteError），只换号再问一次。流式路径不做重试（帧已写给
 		// 客户端收不回来），只做观测。
-		stall := upstream.DetectToolStall(resp, stallDeclaredTools)
+		stall := upstream.DetectToolStall(resp, stallDeclaredTools, stallHistoryHasResult, stallForcedTool)
 		// 账本记账**必须在停摆重试之前**：这一跳的上游调用**真的花了钱**（token +
 		// 积分），重试只是再问一次，不会退回上一跳的消耗。若把记账放在重试之后，
 		// 停摆的那一跳在账本上凭空消失 → 账号余额被高估（选号会继续往它身上派，
@@ -1302,26 +1367,49 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			st.hasCredit = true
 			h.cfg.Pool.NoteModelCost(acct.UID, bareModel, credit, total)
 			// 积分燃尽熔断计账（issue #229）：窗口内烧掉的积分超阈值 → 该号熔断。
-			h.cfg.Pool.NoteBurn(acct.UID, credit)
+			//
+			// 但**停摆的那一跳不能喂燃尽熔断**：停摆是上游行为缺陷，不是账号烧钱
+			// 的证据——把「模型这一轮没调工具」记成「这个号在烧积分」会让熔断器
+			// 误伤健康号（熔断开启的部署会中招）。停摆跳仍然记账（余额要准），
+			// 只是不参与燃尽熔断的计账。
+			if !stall.Suspect {
+				h.cfg.Pool.NoteBurn(acct.UID, credit)
+			}
 		}
 		if stall.Suspect {
 			st.toolStall = true
 			st.toolStallText = stall.ContentLen
 			log.Printf("WARN: [server] non-stream model=%s acct=%s: zero-tool_call stall (declared tools=%d, text_len=%d, finish=%s) — upstream answered with text only, tools not invoked",
 				bareModel, logfmt.Label(acct.UID, acct.Nickname), stall.DeclaredTools, stall.ContentLen, stall.FinishReason)
+			// 留住这一跳的正文：重试预算用尽 / 池里选不出第二个号时原样返回。
+			stallFallback = resp
 			// 重试预算：配置的重试次数（默认 1）。重试时**换号**（同号重问大概率
 			// 得到同样的停摆）。
 			if stallRetry < h.cfg.ToolStallRetry {
 				stallRetry++
-				// 不罚号：释放租约（它没做错什么，只是上游这一轮没调工具），
-				// 但把它标记为「已用过」让选号避开它 → 换号再问一次。
-				tried[acct.UID] = true
-				releaseHeld()
+				// 不罚号：fail() 只做「释放租约 + 解绑粘性」，**不含任何惩罚语义**
+				// （不冷却/不熔断/不 NoteFailures/不 NoteError/不禁用）。
+				//
+				// 必须用 fail() 而不是 releaseHeld()：粘性绑定若不解绑，下一轮
+				// PickByUIDForModel(stickyUID) 会**无视 tried** 再选中同一个停摆号
+				// （该路径不查 tried）→ 「换号」变成空转，同一个号被问两遍，
+				// 第二个号从来没被调用。实测：默认 session_sticky.enabled=true
+				// 时 u1=2 次、u2=0 次；关掉粘性才是 u1=1/u2=1。
+				fail(acct.UID)
 				if !rotateBackoff(i, r.Context()) {
 					break
 				}
+				// 停摆重试**不消耗**轮转预算（它有独立配额 cfg.ToolStallRetry），
+				// 但要允许再进一次循环体 → allowExtraIteration。
+				allowExtraIteration = true
 				continue
 			}
+			// 重试预算用尽（或池里已经选不出第二个号）：**把这一跳的正文原样返回**
+			// ——上游确实答了（只是没调工具），丢掉它改成 503 no_healthy_account 会
+			// 让客户端把「模型给了答案」误读成「服务端没号可用」，并触发客户端
+			// 无限重试（那才是真正的浪费）。
+			log.Printf("WARN: [server] non-stream model=%s acct=%s: tool-stall retry budget exhausted — returning upstream content as-is",
+				bareModel, logfmt.Label(acct.UID, acct.Nickname))
 		}
 		writeJSON(w, http.StatusOK, resp)
 		st.status = http.StatusOK
