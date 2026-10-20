@@ -70,6 +70,39 @@ func (s *Scheduler) RunTravelNow() {
 	}
 }
 
+// RunTravelNowFor 对**单个**账号执行一趟旅行巡检（issue #227）。
+//
+// 与 RunTravelNow 的差别：只跑指定 uid，且**不做账号间限速**（单号触发
+// 没有并发批量压力，不需要 sleep 800ms）——面板「按号触发」按钮点下去应当
+// 立刻返回结果，而不是先干等一秒。
+//
+// 返回值：
+//   - ran=false, skip_reason 非空 → 被门控跳过（禁用/无 RT/global/企业/API Key）
+//   - ran=true  → 已执行一趟巡检（RPC 失败只在日志里体现，不影响返回值）
+func (s *Scheduler) RunTravelNowFor(uid string) (ran bool, skipReason string) {
+	if uid == "" {
+		return false, "uid required"
+	}
+	a := s.cfg.Pool.AuthByUID(uid)
+	if a == nil {
+		return false, "account not found"
+	}
+	if st, ok := s.cfg.Pool.Status(uid); ok && st.Disabled {
+		return false, "account disabled"
+	}
+	if a.RefreshTokenValue() == "" {
+		return false, "no refresh token"
+	}
+	if a.IsGlobal() {
+		return false, "global account has no CN task system"
+	}
+	if !a.SupportsBehaviorEvents() {
+		return false, "account has no growth task system"
+	}
+	s.travelOne(a)
+	return true, ""
+}
+
 // travelOne 单账号单趟状态机：查有无猫 + 查状态 + 最多一个动作，不轮询不等待。
 func (s *Scheduler) travelOne(a *auth.Auth) {
 	buddy, err := s.cfg.Upstream.BuddyInfo(a)

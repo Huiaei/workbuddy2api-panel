@@ -46,13 +46,24 @@ func InjectPromptCacheKey(body []byte, uid, conversationID string) []byte {
 	}
 	// 优先级 2：body 里的 conversation_id / conversationId 做会话哈希源。
 	conv := conversationID
+	bodyHasConv := false
 	if v := strField(obj, "conversation_id"); v != "" {
-		conv = v
+		conv, bodyHasConv = v, true
 	} else if v := strField(obj, "conversationId"); v != "" {
-		conv = v
+		conv, bodyHasConv = v, true
 	}
 	key := buildCacheKey(uid, conv)
 	obj["prompt_cache_key"] = key
+	// 部分上游后端（hy4-preview-f / step-5-preview 等）按 **body 的
+	// conversation_id** 分前缀缓存槽，并不认 prompt_cache_key：客户端
+	// （zcode / Claude Code 系）不发 conversation_id 时，同一账号上所有
+	// 会话塌进同一个缓存槽互相驱逐——实测整段未命中（0%）vs 补齐后 ~92%
+	// （issue #169 的 A/B 对照实验：只注入 prompt_cache_key 仍然 0%）。
+	// 故在算出会话标识后同步补齐 body 级 conversation_id；客户端已自带
+	// 时不覆盖（保持原语义）。
+	if conv != "" && !bodyHasConv {
+		obj["conversation_id"] = conv
+	}
 	out, err := json.Marshal(obj)
 	if err != nil {
 		return body

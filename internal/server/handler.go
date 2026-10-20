@@ -1177,6 +1177,8 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				if total, tok := stats.TotalTokens(); tok && total > 0 {
 					h.cfg.Pool.NoteModelCost(acct.UID, bareModel, credit, total)
 				}
+				// 积分燃尽熔断计账（issue #229）：窗口内烧掉的积分超阈值 → 该号熔断。
+				h.cfg.Pool.NoteBurn(acct.UID, credit)
 			}
 			rc.Close()
 			return
@@ -1227,6 +1229,8 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			st.credit = credit
 			st.hasCredit = true
 			h.cfg.Pool.NoteModelCost(acct.UID, bareModel, credit, total)
+			// 积分燃尽熔断计账（issue #229）。
+			h.cfg.Pool.NoteBurn(acct.UID, credit)
 		}
 		return
 	}
@@ -1375,16 +1379,22 @@ func promptTooLongMessage(body string) string {
 }
 
 // usageCreditTotal 从聚合响应取 usage.credit 与 total_tokens（成本台账非流式入口）。
-// 任一字段缺失/非法 → ok=false（不记录）。
+//
+// 两个字段各自独立判定（issue #179 / #181）：此前要求 total_tokens>0 才返回 ok，
+// 于是「上游给了 credit 但没给 total_tokens」的非流式响应整条**不记积分**——
+// 「积分扣除历史」因此系统性少记（用户实测：消耗 2.4K 只记到 500~600）。
+// 现在：credit 存在即返回 hasCredit=true，total 缺失只影响 token 口径
+// （记 0 并不伪造 token 观测），两者互不牵连。
 func usageCreditTotal(resp map[string]any) (credit float64, total int, ok bool) {
 	usage, _ := resp["usage"].(map[string]any)
 	if usage == nil {
 		return 0, 0, false
 	}
-	c, _ := usage["credit"].(float64)
+	c, hasCredit := usage["credit"].(float64)
 	t, _ := usage["total_tokens"].(float64)
 	if t <= 0 {
-		return 0, 0, false
+		// total_tokens 缺失：token 口径记 0，但**保留 credit 观测**。
+		return c, 0, hasCredit
 	}
 	return c, int(t), true
 }

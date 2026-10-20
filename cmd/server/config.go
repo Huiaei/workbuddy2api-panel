@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -231,6 +232,17 @@ type Config struct {
 		// tier 0（免费）/ tier 1（无观测）不受限；签到回血越过 floor 自动恢复。
 		// 默认 0 = 关闭；负值钳 0。
 		CreditFloor int64 `json:"credit_floor"`
+		// BurnGuardLimit 积分燃尽熔断阈值（issue #229）：窗口内单账号累计烧掉的
+		// 积分超过该值 → 该账号进入熔断（暂时不参与选号），避免高缓存 miss 的
+		// 模型（如 hy4-preview）一轮烧掉 20+ 积分而无人拦截。
+		// 0 = 关闭熔断（默认，零回归）。
+		BurnGuardLimit float64 `json:"burn_guard_limit"`
+		// BurnGuardWindow 燃尽计账窗口（如 "10m"）：窗口滑动重置计账。
+		BurnGuardWindow string `json:"burn_guard_window"`
+		// BurnGuardCooldown 熔断冷却时长（首次触发）；随连续触发次数递增。
+		BurnGuardCooldown string `json:"burn_guard_cooldown"`
+		// BurnGuardCooldownMax 熔断冷却时长上限。
+		BurnGuardCooldownMax string `json:"burn_guard_cooldown_max"`
 		// CrossDomainFallback 裸模型名跨域回退开关（issue #135），默认 false（零回归）。
 		// 开启后：请求模型名不带 realm 前缀时，首选域（cn）选不到可用账号（账号级冷却/
 		// 熔断/在途占满，或该域账号对这个模型 11102 后进入模型级负缓存）会自动改用
@@ -259,6 +271,11 @@ type Config struct {
 	ExpiringSoonDur        time.Duration `json:"-"`
 	// CostExploreIntervalDur 解析后的 costTier 探索窗口（issue #136）；0 = 关停。
 	CostExploreIntervalDur time.Duration `json:"-"`
+	// BurnGuardWindowDur / BurnGuardCooldownDur / BurnGuardCooldownMaxDur 解析后的
+	// 积分燃尽熔断参数（issue #229）；0 = 用默认。
+	BurnGuardWindowDur      time.Duration `json:"-"`
+	BurnGuardCooldownDur    time.Duration `json:"-"`
+	BurnGuardCooldownMaxDur time.Duration `json:"-"`
 	// ServerReadTimeoutDur 解析后的入站请求读取上限（issue #100）；0 = 不限制。
 	ServerReadTimeoutDur time.Duration `json:"-"`
 }
@@ -326,6 +343,10 @@ func Default() *Config {
 	c.Pool.ExpiringSoon = "168h" // 快过期窗口默认 7 天：官方活动奖励积分多在两周内过期
 	// costTier 探索默认 30m（issue #136：垄断破除 + 搭车改道零新增请求）；"0" 关停。
 	c.Pool.CostExploreInterval = "30m"
+	// 积分燃尽熔断（issue #229）：默认关闭（阈值 0 = 不熔断，零回归）。
+	c.Pool.BurnGuardWindow = "10m"
+	c.Pool.BurnGuardCooldown = "10m"
+	c.Pool.BurnGuardCooldownMax = "2h"
 	c.SessionSticky.Enabled = true
 	c.SessionSticky.TTL = "30m"
 	c.SessionSticky.GCInterval = "5m"
@@ -414,6 +435,11 @@ func applyEnv(c *Config) {
 		c.Listen = v
 	}
 	if v := os.Getenv("WB2A_API_KEY"); v != "" {
+		// 环境变量优先于 config.json（既有语义），但**必须留痕**：此前是静默
+		// 覆盖，用户改完 config.json 重启后仍被旧 env key 挡住，而面板把
+		// 401 吞掉 → 表现为「改了密钥不生效、旧登录态还在」（issue #155）。
+		// 这里打一行 WARN 说明来源（只打来源与长度，绝不打明文）。
+		log.Printf("WARN: [config] api_key 来自环境变量 WB2A_API_KEY（%d 字符），已覆盖 config.json 中的 api_key", len(v))
 		c.APIKey = v
 	}
 	if v := os.Getenv("WB2A_AUTH_DIR"); v != "" {
@@ -565,6 +591,37 @@ func (c *Config) normalize() error {
 	// 积分保底：负值钳 0（= 关闭）。0 是合法默认（关闭），无需空值回落。
 	if c.Pool.CreditFloor < 0 {
 		c.Pool.CreditFloor = 0
+	}
+	// 积分燃尽熔断（issue #229）：阈值 <= 0 = 关闭（默认，零回归）。
+	if c.Pool.BurnGuardLimit < 0 {
+		c.Pool.BurnGuardLimit = 0
+	}
+	if c.Pool.BurnGuardWindow == "" {
+		c.Pool.BurnGuardWindow = "10m"
+	}
+	if c.BurnGuardWindowDur, err = time.ParseDuration(c.Pool.BurnGuardWindow); err != nil {
+		return fmt.Errorf("pool.burn_guard_window: %w", err)
+	}
+	if c.BurnGuardWindowDur < 0 {
+		c.BurnGuardWindowDur = 0
+	}
+	if c.Pool.BurnGuardCooldown == "" {
+		c.Pool.BurnGuardCooldown = "10m"
+	}
+	if c.BurnGuardCooldownDur, err = time.ParseDuration(c.Pool.BurnGuardCooldown); err != nil {
+		return fmt.Errorf("pool.burn_guard_cooldown: %w", err)
+	}
+	if c.BurnGuardCooldownDur < 0 {
+		c.BurnGuardCooldownDur = 0
+	}
+	if c.Pool.BurnGuardCooldownMax == "" {
+		c.Pool.BurnGuardCooldownMax = "2h"
+	}
+	if c.BurnGuardCooldownMaxDur, err = time.ParseDuration(c.Pool.BurnGuardCooldownMax); err != nil {
+		return fmt.Errorf("pool.burn_guard_cooldown_max: %w", err)
+	}
+	if c.BurnGuardCooldownMaxDur < 0 {
+		c.BurnGuardCooldownMaxDur = 0
 	}
 	if c.Pool.BreakerThreshold <= 0 {
 		c.Pool.BreakerThreshold = 3

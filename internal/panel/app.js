@@ -459,6 +459,8 @@ function renderAccounts(list) {
         '<button class="xs ghost" data-a="balance" data-u="' + esc(s.uid) + '"' + (noGrowth ? ' title="刷新企业版已分配额度（上游 get-enterprise-user-usage）"' : '') + '>' + (noGrowth ? '额度' : '余额') + '</button>' +
         (noGrowth ? '' :
           '<button class="xs ghost" data-a="tasks" data-u="' + esc(s.uid) + '">任务</button>') +
+        (noGrowth || s.realm === 'global' ? '' :
+          '<button class="xs ghost" data-a="travel" data-u="' + esc(s.uid) + '" title="只跑这一个号的猫猫旅行巡检（不等全池）">旅行</button>') +
         (frozen ? '<button class="xs primary" data-a="revive" data-u="' + esc(s.uid) + '">解冻</button>'
                 : (s.paused ? '<button class="xs primary" data-a="resume" data-u="' + esc(s.uid) + '">恢复选号</button>'
                             : '<button class="xs ghost" data-a="pause" data-u="' + esc(s.uid) + '" title="' + (noGrowth ? '退出选号，但照常保活 / 刷新额度' : '退出选号，但照常签到 / 活跃上报 / 保活 / 刷新余额') + '">暂停选号</button>')) +
@@ -565,6 +567,9 @@ $('accBody').addEventListener('click', async ev => {
       toast('已恢复选号', 'ok');
     } else if (a === 'tasks') {
       openTasks(u);
+    } else if (a === 'travel') {
+      const r = await api('accounts/' + encodeURIComponent(u) + '/travel', { method: 'POST' });
+      toast(r.skipped ? ('已跳过：' + (r.skip_reason || '不满足触发条件')) : '旅行巡检已执行，结果见日志', r.skipped ? 'err' : 'ok');
     } else if (a === 'remove') {
       const r = await api('accounts/' + encodeURIComponent(u) + '/remove', { method: 'POST' });
       toast(r.file_error ? '已移除（凭证文件删除失败：' + r.file_error + '）' : '已移除', 'ok');
@@ -1522,8 +1527,20 @@ function start() {
   checkAuthGate();
 }
 async function checkAuthGate() {
+  // 401 必须在**任何**静默路径上把密钥对话框弹出来：改完 config.json 的
+  // api_key 并重启后，本机 localStorage 里还是旧 key，首次 overview 请求
+  // 401 —— 但 loadOverview(quiet=true) 会吞掉错误、checkAuthGate 又把它
+  // 静默 return，于是「密钥已改」表现为「面板还在用旧登录态」（issue #155）。
+  // 这里显式识别 401 并弹框 + 提示重新输入，兼顾 quiet 与非 quiet 两条路径。
   try { await api('overview'); }
-  catch (e) { if (String(e.message).includes('密钥') || String(e.message).includes('api_key')) return; }
+  catch (e) {
+    const msg = String(e.message || '');
+    if (msg.includes('密钥') || msg.includes('api_key')) {
+      openKey();
+      toast('密钥已变更或无效，请重新输入面板密钥', 'err');
+      return;
+    }
+  }
 }
 start();
 

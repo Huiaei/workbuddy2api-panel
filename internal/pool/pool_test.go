@@ -1817,12 +1817,14 @@ func TestPreferExpiringDisabledRestoresWeight(t *testing.T) {
 	p.SetCreditsDetailed("a", 100, 100, 50, now.Add(time.Hour), 50)
 	p.SetCreditsDetailed("b", 100, 100, 0, time.Time{}, 0)
 
+	// 快过期梯度（issue #160）：窗口未知（未 SetExpiringSoonWindow）时退化为
+	// 固定上限倍率 expiringMaxMultiplier。
 	p.mu.Lock()
 	we := p.routingWeightOf(p.byUID["a"], 100, now)
 	wn := p.routingWeightOf(p.byUID["b"], 100, now)
 	p.mu.Unlock()
-	if we != wn*expiringVirtualSlots {
-		t.Fatalf("enabled expiring weight=%v want %v", we, wn*expiringVirtualSlots)
+	if we != wn*expiringMaxMultiplier {
+		t.Fatalf("enabled expiring weight=%v want %v", we, wn*expiringMaxMultiplier)
 	}
 
 	p.SetPreferExpiring(false)
@@ -1833,6 +1835,45 @@ func TestPreferExpiringDisabledRestoresWeight(t *testing.T) {
 	p.mu.Unlock()
 	if wa != wb {
 		t.Fatalf("disabled expiring weights differ: %v/%v", wa, wb)
+	}
+}
+
+// TestExpiringUrgencyGradient 钉住快过期紧迫度梯度（issue #160）：
+// 倍率随「剩余时间/窗口」线性上升——刚进窗口 ≈ M_base，临近到期 ≈ M_max。
+func TestExpiringUrgencyGradient(t *testing.T) {
+	const win = 168 * time.Hour
+	p := New("")
+	p.Add(&auth.Auth{UID: "a"})
+	p.SetExpiringSoonWindow(win)
+	now := time.Now()
+
+	cases := []struct {
+		name  string
+		until time.Time
+		want  float64
+	}{
+		{"窗口边缘", now.Add(win), expiringBaseMultiplier},
+		{"窗口中点", now.Add(win / 2), (expiringBaseMultiplier + expiringMaxMultiplier) / 2},
+		{"临近到期", now.Add(time.Minute), expiringMaxMultiplier - (expiringMaxMultiplier-expiringBaseMultiplier)/float64(win)*float64(time.Minute)},
+	}
+	for _, c := range cases {
+		p.SetCreditsDetailed("a", 100, 100, 50, c.until, 50)
+		p.mu.Lock()
+		got := p.expiringMultiplier(p.byUID["a"], now)
+		p.mu.Unlock()
+		if diff := got - c.want; diff > 1e-6 || diff < -1e-6 {
+			t.Errorf("%s: multiplier=%v want %v (diff %v)", c.name, got, c.want, diff)
+		}
+	}
+
+	// 窗口外：不做额外加权（倍率 = 1）。
+	p.SetCreditsDetailed("a", 100, 100, 50, now.Add(2*win), 50)
+	p.mu.Lock()
+	we := p.routingWeightOf(p.byUID["a"], 100, now)
+	wn := p.routingWeightOf(p.byUID["a"], 100, now)
+	p.mu.Unlock()
+	if we != wn {
+		t.Fatalf("窗口外不应额外加权: %v/%v", we, wn)
 	}
 }
 

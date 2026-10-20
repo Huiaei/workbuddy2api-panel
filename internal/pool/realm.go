@@ -24,6 +24,10 @@ func (p *Pool) AvailableUIDsForRealm(realm string) []string {
 		if !e.healthy(now) {
 			continue
 		}
+		// 积分燃尽熔断（issue #229）：熔断中的账号不参与选号，与 pick 口径一致。
+		if p.burnBlocked(e, now) {
+			continue
+		}
 		if p.inFlightFull(e) {
 			continue
 		}
@@ -50,6 +54,10 @@ func (p *Pool) ServableForModelRealm(model, realm string) int {
 			continue
 		}
 		if !e.healthyForModel(now, model) {
+			continue
+		}
+		// 积分燃尽熔断（issue #229）：熔断号不算「能服务该模型」。
+		if p.burnBlocked(e, now) {
 			continue
 		}
 		if p.inFlightFull(e) {
@@ -81,6 +89,11 @@ func (p *Pool) WeightedAvailableUIDsForModelRealm(model, realm string) []string 
 			continue
 		}
 		if !e.healthyForModel(now, model) {
+			continue
+		}
+		// 积分燃尽熔断（issue #229）：熔断号不列入可用集合（会话粘性分配
+		// 也不该把它选为候选）。
+		if p.burnBlocked(e, now) {
 			continue
 		}
 		if p.inFlightFull(e) {
@@ -117,6 +130,11 @@ func (p *Pool) AvailableUIDsForModelRealm(model, realm string) []string {
 			continue
 		}
 		if !e.healthyForModel(now, model) {
+			continue
+		}
+		// 积分燃尽熔断（issue #229）：熔断号不列入可用集合（会话粘性分配
+		// 也不该把它选为候选）。
+		if p.burnBlocked(e, now) {
 			continue
 		}
 		if p.inFlightFull(e) {

@@ -11,7 +11,10 @@
 // 的条目让会话自愈，宁可丢一轮工具上下文，也好过整条会话死亡。
 package upstream
 
-import "strings"
+import (
+	"fmt"
+	"strings"
+)
 
 // repackToolResultBlocks 把插在 assistant.tool_calls 与其 tool 结果之间的非 tool 消息
 // 挪到整组之后，保证同一批 tool_call 的结果在 wire 上连续。
@@ -109,6 +112,93 @@ func repackToolResultBlocks(messages []any) ([]any, bool) {
 	return out, true
 }
 
+// hasDuplicateCallIDs 报告是否有 id 被多个 tool_call 复用（issue #81）。
+func hasDuplicateCallIDs(callCount map[string]int) bool {
+	for _, n := range callCount {
+		if n > 1 {
+			return true
+		}
+	}
+	return false
+}
+
+// renameDuplicateToolCallIDs 给重复出现的 tool_call id 加唯一后缀并同步改写
+// role:tool 结果的 tool_call_id（issue #81）。返回是否发生了改名。
+//
+// 规则：同一 id 的第 1 次出现保持原样，第 k 次（k≥2）改为 "<id>_d<k>"；
+// role:tool 结果按出现顺序消费一个待配对的改名槽位——即第 k 个引用该 id 的
+// 结果消息拿到 "<id>_d<k>"。这样「调用 ↔ 结果」重新一一对应，上游不再因
+// 多余调用报 11148。
+//
+// 幂等：改名后的 id 形如 "<id>_d2"，若再次跑本函数，其计数为 1（不再重复），
+// 故不会二次改名。
+func renameDuplicateToolCallIDs(messages []any, callCount map[string]int) bool {
+	// 每个 id 的新名字序列（按调用侧出现顺序）：["X", "X_d2", "X_d3", ...]。
+	names := map[string][]string{}
+	// 结果侧：id → 已消费到的序号（结果与调用按出现顺序一一配对）。
+	used := map[string]int{}
+	changed := false
+	// 先扫 assistant：算出每个调用的新 id。
+	for _, m := range messages {
+		msg, ok := m.(map[string]any)
+		if !ok {
+			continue
+		}
+		if role, _ := msg["role"].(string); role != "assistant" {
+			continue
+		}
+		tcs, ok := msg["tool_calls"].([]any)
+		if !ok || len(tcs) == 0 {
+			continue
+		}
+		for _, tci := range tcs {
+			tc, ok := tci.(map[string]any)
+			if !ok {
+				continue
+			}
+			id, _ := tc["id"].(string)
+			if id == "" {
+				continue
+			}
+			k := len(names[id]) + 1
+			newID := id
+			if k > 1 {
+				newID = fmt.Sprintf("%s_d%d", id, k)
+			}
+			names[id] = append(names[id], newID)
+			if newID != id {
+				tc["id"] = newID
+				changed = true
+			}
+		}
+	}
+	// 再扫 role:tool：第 k 条引用该 id 的结果 → 拿第 k 个名字。
+	for _, m := range messages {
+		msg, ok := m.(map[string]any)
+		if !ok {
+			continue
+		}
+		if role, _ := msg["role"].(string); role != "tool" {
+			continue
+		}
+		id, _ := msg["tool_call_id"].(string)
+		if id == "" {
+			continue
+		}
+		used[id]++
+		k := used[id]
+		seq := names[id]
+		if k < 1 || k > len(seq) {
+			continue // 没有对应的第 k 个调用：保持原样（后续由孤儿裁剪处理）
+		}
+		if seq[k-1] != id {
+			msg["tool_call_id"] = seq[k-1]
+			changed = true
+		}
+	}
+	return changed
+}
+
 // cleanupOrphanToolCalls 剔除无法配对的 tool_call 与 tool 结果（所有模型，独立于
 // deepseek-only 的 sanitize 开关）。语义对齐参考仓库 resolveToolPairing：
 //
@@ -128,6 +218,13 @@ func cleanupOrphanToolCalls(messages []any) ([]any, bool) {
 	resultIDs := map[string]bool{}
 	nameBadIDs := map[string]bool{}
 	hasTraffic := false
+	// 重复 id 计数：同一 id 被多个 tool_call 复用时，上游按「调用/结果必须
+	// 一一对应」校验，多余的调用没有对应结果 → 400 / 11148
+	// "tool calls and tool results do not match"，整条会话持续 503
+	// （issue #81：客户端历史里 SSHManager:0 之类 id 每条消息从 0 重来，
+	// 一个会话能攒出几十个同名 id）。集合层面看不出重复，故这里按出现
+	// 次数计数，供下面的改名步骤使用。
+	callCount := map[string]int{}
 	for _, m := range messages {
 		msg, ok := m.(map[string]any)
 		if !ok {
@@ -148,6 +245,7 @@ func cleanupOrphanToolCalls(messages []any) ([]any, bool) {
 					}
 					if id, ok := tc["id"].(string); ok && id != "" {
 						callIDs[id] = true
+						callCount[id]++
 						if toolCallNameEmpty(tc) {
 							nameBadIDs[id] = true
 						}
@@ -159,6 +257,47 @@ func cleanupOrphanToolCalls(messages []any) ([]any, bool) {
 	}
 	if !hasTraffic {
 		return messages, false
+	}
+	// 重复 id 改名：第 1 次出现的 id 保持原样，第 2..n 次出现改名为
+	// "<id>_d<n>"，并同步改写其后的 role:tool 结果的 tool_call_id，
+	// 让「调用 ↔ 结果」重新一一对应（issue #81 建议的口径）。
+	// 改名按下标全局计数：同一 id 的第 k 次出现固定叫 _d<k>，
+	// 结果消息按出现顺序一一跟随（上游/客户端的配对语义是「按序」，
+	// 改名保持相对顺序不变）。
+	renamed := false
+	if hasDuplicateCallIDs(callCount) {
+		renamed = renameDuplicateToolCallIDs(messages, callCount)
+		// 改名后 id 集合变化：重算两侧集合，供 keepCalls 使用。
+		callIDs = map[string]bool{}
+		resultIDs = map[string]bool{}
+		nameBadIDs = map[string]bool{}
+		for _, m := range messages {
+			msg, ok := m.(map[string]any)
+			if !ok {
+				continue
+			}
+			switch msg["role"] {
+			case "tool":
+				if id, ok := msg["tool_call_id"].(string); ok && id != "" {
+					resultIDs[id] = true
+				}
+			case "assistant":
+				if tcs, ok := msg["tool_calls"].([]any); ok {
+					for _, tci := range tcs {
+						tc, ok := tci.(map[string]any)
+						if !ok {
+							continue
+						}
+						if id, ok := tc["id"].(string); ok && id != "" {
+							callIDs[id] = true
+							if toolCallNameEmpty(tc) {
+								nameBadIDs[id] = true
+							}
+						}
+					}
+				}
+			}
+		}
 	}
 	// keepCalls：调用 id 是否双侧齐全（调用存在且结果存在）。重复 id 与乱序均按集合处理。
 	//
@@ -176,6 +315,10 @@ func cleanupOrphanToolCalls(messages []any) ([]any, bool) {
 		}
 	}
 	changed := false
+	if renamed {
+		// 改名本身就是一次出站变更（即使配对集合没变，id 也不同了）。
+		changed = true
+	}
 	// 1) assistant.tool_calls：按 keepCalls 对称裁剪——只留有结果的调用，过滤后为空则删键。
 	//
 	// 历史实现是「批内每个 id 都齐才整批保留，否则删掉整个 tool_calls 键」。那会留下

@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
@@ -36,6 +37,13 @@ func (p *Panel) accountTasks(w http.ResponseWriter, r *http.Request) {
 	// 静态 API Key 账号无成长任务体系：明确拒绝（不静默空跑）。
 	if a.IsAPIKey() {
 		writeErr(w, http.StatusUnprocessableEntity, "API Key 账号无签到/成长任务体系")
+		return
+	}
+	// 国际版（workbuddy.ai）无国内版成长任务体系：与任务中心队列同口径门控
+	// （taskcenter.go 的 D4 门控），否则本路径会静默拉一份字段名不同的任务
+	// 列表、解析出空编号，按钮点了没反应（issue #163）。
+	if a.IsGlobal() {
+		writeErr(w, http.StatusUnprocessableEntity, "国际版账号无成长任务体系（该功能仅国内版 workbuddy.cn 支持）")
 		return
 	}
 	tasks, err := p.cfg.Upstream.ListTasks(a)
@@ -74,6 +82,25 @@ func (p *Panel) accountTaskAccept(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "task_codes required")
 		return
 	}
+	// 国际版账号无成长任务体系：明确拒绝（不静默空跑，issue #163）。
+	if a.IsGlobal() {
+		writeErr(w, http.StatusUnprocessableEntity, "国际版账号无成长任务体系（该功能仅国内版 workbuddy.cn 支持）")
+		return
+	}
+	// 空编号过滤：上游解析不出 task_code（国际版字段名不同 / 上游缺字段）时
+	// 面板会拿到 codes=[""]，提交上去只会得到 task not found，却仍回 ok:true
+	// ——这里提前拦下并把真实问题透给前端（issue #163）。
+	codes := make([]string, 0, len(body.TaskCodes))
+	for _, c := range body.TaskCodes {
+		if strings.TrimSpace(c) != "" {
+			codes = append(codes, c)
+		}
+	}
+	if len(codes) == 0 {
+		writeErr(w, http.StatusBadRequest, "task_codes 为空：上游未返回可接受的任务编号（该账号可能不支持成长任务体系）")
+		return
+	}
+	body.TaskCodes = codes
 	if err := p.cfg.Upstream.AcceptTasks(a, body.TaskCodes); err != nil {
 		writeErr(w, http.StatusBadGateway, "accept: "+err.Error())
 		return
@@ -99,6 +126,11 @@ func (p *Panel) taskAcceptAll(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusUnprocessableEntity, "API Key 账号无签到/成长任务体系")
 		return
 	}
+	// 国际版账号无成长任务体系：明确拒绝（与任务中心队列同口径，issue #163）。
+	if a.IsGlobal() {
+		writeErr(w, http.StatusUnprocessableEntity, "国际版账号无成长任务体系（该功能仅国内版 workbuddy.cn 支持）")
+		return
+	}
 	tasks, err := p.cfg.Upstream.ListTasks(a)
 	if err != nil {
 		writeErr(w, http.StatusBadGateway, "list tasks: "+err.Error())
@@ -108,6 +140,10 @@ func (p *Panel) taskAcceptAll(w http.ResponseWriter, r *http.Request) {
 	for _, t := range tasks {
 		// 跳过已完成/已领取/已接受的；locked 的也不碰（上游未开放）。
 		if t.Claimed || t.Locked || t.AcceptStatus == "accepted" || t.AcceptStatus == "completed" {
+			continue
+		}
+		// 编号为空的条目上游必然 task not found（issue #163）。
+		if strings.TrimSpace(t.TaskCode) == "" {
 			continue
 		}
 		codes = append(codes, t.TaskCode)

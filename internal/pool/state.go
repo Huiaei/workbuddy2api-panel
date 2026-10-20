@@ -386,6 +386,10 @@ func (p *Pool) AvailableUIDs() []string {
 		if !e.healthy(now) {
 			continue
 		}
+		// 积分燃尽熔断（issue #229）：熔断号不参与选号。
+		if p.burnBlocked(e, now) {
+			continue
+		}
 		if p.inFlightFull(e) {
 			continue
 		}
@@ -405,6 +409,10 @@ func (p *Pool) AvailableUIDsForModel(model string) []string {
 	uids := make([]string, 0, len(p.byUID))
 	for uid, e := range p.byUID {
 		if !e.healthyForModel(now, model) {
+			continue
+		}
+		// 积分燃尽熔断（issue #229）：熔断号不参与选号。
+		if p.burnBlocked(e, now) {
 			continue
 		}
 		if p.inFlightFull(e) {
@@ -429,6 +437,13 @@ func (p *Pool) PickByUIDForModel(uid, model string) *auth.Auth {
 	}
 	now := time.Now()
 	if !e.healthyForModel(now, model) {
+		return nil
+	}
+	// 积分燃尽熔断（issue #229）：粘性号在熔断期内同样不可用 → 解绑走普通轮换，
+	// 让流量落到未熔断的账号上，而不是继续在一个已超阈值的号上烧。
+	if p.burnBlocked(e, now) {
+		log.Printf("WARN: [pool] burn guard: sticky acct=%s unbind (%s)",
+			logfmt.Label(e.a.UID, e.a.Nickname), p.burnReason(e.a.UID, now))
 		return nil
 	}
 	// 积分保底（粘性路径）：与 pick 的 floorBlocked 同判据——触底 + 收费即拦
@@ -462,6 +477,10 @@ func (p *Pool) PickByUID(uid string) *auth.Auth {
 	}
 	now := time.Now()
 	if !e.healthy(now) {
+		return nil
+	}
+	// 积分燃尽熔断（issue #229）：熔断号不可被直取（粘性快路径）。
+	if p.burnBlocked(e, now) {
 		return nil
 	}
 	if p.inFlightFull(e) {
@@ -556,6 +575,11 @@ func (p *Pool) ServableForRealm(realm string) bool {
 			continue
 		}
 		if p.inFlightFull(e) {
+			continue
+		}
+		// 积分燃尽熔断（issue #229）：熔断号不可服务（与 pick 口径一致），
+		// 否则探活会误报「可服务」而 chat 实际选不出号。
+		if p.burnBlocked(e, now) {
 			continue
 		}
 		// 存在性语义：账号级 healthy，或处于模型级豁免形态（6004 单模型软冷却——
@@ -653,6 +677,17 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 		st.CoolRemaining = remaining
 		if st.CoolKind == "" {
 			st.CoolKind = e.coolKind.String()
+		}
+	}
+	// 积分燃尽熔断（issue #229）：熔断中的账号同样「不可选」，但它不是
+	// 软/硬冷却（不会自动解除，也不进 cooldown 台账），故单独透出原因，
+	// 面板据此显示「积分燃尽熔断」而不是笼统的「不可用」。
+	if br := p.burnReason(uid, now); br != "" {
+		st.Cooling = true
+		st.CoolKind = "burn"
+		st.Reason = br
+		if r := int64(time.Until(p.burnGuard[uid].until).Seconds() + 0.999); r > 0 {
+			st.CoolRemaining = r
 		}
 	}
 	return st

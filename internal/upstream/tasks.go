@@ -147,7 +147,11 @@ func parseClaimReward(data json.RawMessage) (credit, energy int64, err error) {
 func parseGrowthTasks(data json.RawMessage) ([]Task, error) {
 	var resp struct {
 		Tasks []struct {
-			TaskCode     string          `json:"task_code"`
+			TaskCode string `json:"task_code"`
+			// Code 是国际版（workbuddy.ai）任务列表的编号字段名；国内版
+			// （workbuddy.cn）用 task_code。两者只生效其一，故并列声明，
+			// 解析后由下方 code() 归一（issue #163）。
+			Code         string          `json:"code"`
 			Title        string          `json:"title"`
 			Description  string          `json:"description"`
 			TaskDesc     string          `json:"task_desc"`
@@ -183,8 +187,15 @@ func parseGrowthTasks(data json.RawMessage) ([]Task, error) {
 			}
 		}
 		claimed := t.AcceptStatus == "claimed"
+		// 任务编号归一：国内版 task_code / 国际版 code（issue #163）。
+		// 国际版上游返回 {"task_id":1,"code":"first_chat",...}，只认 task_code
+		// 会解析出空编号 → 面板按钮编号为空、accept 静默失败。
+		code := t.TaskCode
+		if code == "" {
+			code = t.Code
+		}
 		out = append(out, Task{
-			TaskCode:     t.TaskCode,
+			TaskCode:     code,
 			Title:        t.Title,
 			Description:  t.Description,
 			TaskDesc:     t.TaskDesc,

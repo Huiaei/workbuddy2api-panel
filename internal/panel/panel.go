@@ -165,6 +165,7 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/resume", p.withAuth(p.accountResume))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/checkin", p.withAuth(p.accountCheckin))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/balance", p.withAuth(p.accountBalance))
+	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/travel", p.withAuth(p.accountTravel)) // 单号旅行巡检（issue #227）
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/remove", p.withAuth(p.accountRemove))
 	p.mux.HandleFunc("GET /panel/api/accounts/{uid}/tasks", p.withAuth(p.accountTasks))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/tasks/accept", p.withAuth(p.accountTaskAccept))
@@ -674,6 +675,28 @@ func (p *Panel) travelAll(w http.ResponseWriter, r *http.Request) {
 	go p.cfg.Scheduler.RunTravelNow()
 	log.Printf("panel: 手动全量旅行巡检已触发")
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "started": true})
+}
+
+// accountTravel 手动触发**单个**账号的猫猫旅行巡检（issue #227）。
+//
+// 全量 travel_all 只能整池跑（RunTravelNow 无子集参数），且账号间固定
+// 800ms 限速——40 个号就是 32s，运维想单独试一个号只能等全池跑完。
+// 这里给单号一个同步端点：单号无并发压力，故不限速，点完即出结果。
+func (p *Panel) accountTravel(w http.ResponseWriter, r *http.Request) {
+	if p.cfg.Scheduler == nil {
+		writeErr(w, http.StatusNotImplemented, "scheduler not available")
+		return
+	}
+	uid := r.PathValue("uid")
+	ran, skipReason := p.cfg.Scheduler.RunTravelNowFor(uid)
+	if !ran {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok": true, "ran": false, "skipped": true, "skip_reason": skipReason,
+		})
+		return
+	}
+	log.Printf("panel: 手动旅行巡检已触发 uid=%s", uid)
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "ran": true, "skipped": false})
 }
 
 // activityAll 手动触发全量活跃上报（异步执行；点亮连登 + 解锁领养前置）。
