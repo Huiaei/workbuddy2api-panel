@@ -39,13 +39,14 @@ func (p *Panel) accountTasks(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusUnprocessableEntity, "API Key 账号无签到/成长任务体系")
 		return
 	}
-	// 国际版（workbuddy.ai）无国内版成长任务体系：与任务中心队列同口径门控
-	// （taskcenter.go 的 D4 门控），否则本路径会静默拉一份字段名不同的任务
-	// 列表、解析出空编号，按钮点了没反应（issue #163）。
-	if a.IsGlobal() {
-		writeErr(w, http.StatusUnprocessableEntity, "国际版账号无成长任务体系（该功能仅国内版 workbuddy.cn 支持）")
-		return
-	}
+	// 国际版（workbuddy.ai）无国内版成长任务体系：**只读**语义——照常返回列表，
+	// 但 accept/claim/automate 三个能力全关（见下方 capabilities）。
+	//
+	// 分支原为 422 直接拒绝（issue #163：只认 task_code 时国际版编号解析为空、
+	// 按钮点了没反应）。上游 #104 把国际版编号归一（task_code / code 双写 +
+	// task_id）并用 capabilities=false 表达「只读」，前端据此隐藏按钮——
+	// 既修了 #163 的空编号问题，又保留了只读可见性，故取上游口径。
+	// 写路径（accept / accept_all / claim）仍是 501 + globalTaskWriteMessage。
 	tasks, err := p.cfg.Upstream.ListTasks(a)
 	if err != nil {
 		writeErr(w, http.StatusBadGateway, "list tasks: "+err.Error())
@@ -95,11 +96,6 @@ func (p *Panel) accountTaskAccept(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || len(body.TaskCodes) == 0 {
 		writeErr(w, http.StatusBadRequest, "task_codes required")
-		return
-	}
-	// 国际版账号无成长任务体系：明确拒绝（不静默空跑，issue #163）。
-	if a.IsGlobal() {
-		writeErr(w, http.StatusUnprocessableEntity, "国际版账号无成长任务体系（该功能仅国内版 workbuddy.cn 支持）")
 		return
 	}
 	// 空编号过滤：上游解析不出 task_code（国际版字段名不同 / 上游缺字段）时

@@ -8,25 +8,38 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
 )
 
+// TestUsageCreditTotalRequiresValidExplicitCreditAndTokens 锁定计费台账的取值口径。
+//
+// 合并语义（上游 #104 + 分支 issue #179/#181）：
+//   - credit 必须是「显式存在、有限、非负」的数——零是合法值（确认免费）。
+//   - total_tokens 必须是「有限正整数」才进 token 口径。
+//   - 两者**独立判定**：上游给了 credit 却没给 total_tokens 时，整条观测
+//     不能被丢掉（分支 issue #179/#181：否则「积分扣除历史」系统性少记），
+//     此时 total 记 0、credit 照收，ok=true。
+//   - credit 缺失/非法时，无论 total_tokens 合不合法都不记（避免把「没给
+//     费用」当成「确认免费」造出免费观测）。
 func TestUsageCreditTotalRequiresValidExplicitCreditAndTokens(t *testing.T) {
 	tests := []struct {
-		name  string
-		usage map[string]any
-		want  bool
+		name      string
+		usage     map[string]any
+		want      bool
+		wantTotal int
 	}{
-		{name: "confirmed free", usage: map[string]any{"credit": float64(0), "total_tokens": float64(10)}, want: true},
-		{name: "paid", usage: map[string]any{"credit": float64(0.1), "total_tokens": float64(10)}, want: true},
+		{name: "confirmed free", usage: map[string]any{"credit": float64(0), "total_tokens": float64(10)}, want: true, wantTotal: 10},
+		{name: "paid", usage: map[string]any{"credit": float64(0.1), "total_tokens": float64(10)}, want: true, wantTotal: 10},
 		{name: "missing credit", usage: map[string]any{"total_tokens": float64(10)}},
 		{name: "negative credit", usage: map[string]any{"credit": float64(-0.1), "total_tokens": float64(10)}},
 		{name: "nan credit", usage: map[string]any{"credit": math.NaN(), "total_tokens": float64(10)}},
 		{name: "infinite credit", usage: map[string]any{"credit": math.Inf(1), "total_tokens": float64(10)}},
 		{name: "string credit", usage: map[string]any{"credit": "0", "total_tokens": float64(10)}},
-		{name: "missing total", usage: map[string]any{"credit": float64(0)}},
-		{name: "zero total", usage: map[string]any{"credit": float64(0), "total_tokens": float64(0)}},
-		{name: "negative total", usage: map[string]any{"credit": float64(0), "total_tokens": float64(-1)}},
-		{name: "fractional total", usage: map[string]any{"credit": float64(0), "total_tokens": float64(1.5)}},
-		{name: "infinite total", usage: map[string]any{"credit": float64(0), "total_tokens": math.Inf(1)}},
-		{name: "out of range total", usage: map[string]any{"credit": float64(0), "total_tokens": math.Exp2(63)}},
+		// 以下六例：credit 合法但 total_tokens 缺失/非法 → 保留 credit 观测，
+		// token 口径记 0（分支 issue #179/#181），不再整条丢弃。
+		{name: "missing total", usage: map[string]any{"credit": float64(0)}, want: true, wantTotal: 0},
+		{name: "zero total", usage: map[string]any{"credit": float64(0), "total_tokens": float64(0)}, want: true, wantTotal: 0},
+		{name: "negative total", usage: map[string]any{"credit": float64(0), "total_tokens": float64(-1)}, want: true, wantTotal: 0},
+		{name: "fractional total", usage: map[string]any{"credit": float64(0), "total_tokens": float64(1.5)}, want: true, wantTotal: 0},
+		{name: "infinite total", usage: map[string]any{"credit": float64(0), "total_tokens": math.Inf(1)}, want: true, wantTotal: 0},
+		{name: "out of range total", usage: map[string]any{"credit": float64(0), "total_tokens": math.Exp2(63)}, want: true, wantTotal: 0},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -34,8 +47,11 @@ func TestUsageCreditTotalRequiresValidExplicitCreditAndTokens(t *testing.T) {
 			if ok != tt.want {
 				t.Fatalf("usageCreditTotal ok=%v, want %v (credit=%v total=%d)", ok, tt.want, credit, total)
 			}
-			if ok && (credit < 0 || total <= 0) {
-				t.Fatalf("accepted invalid cost fields: credit=%v total=%d", credit, total)
+			if ok && total != tt.wantTotal {
+				t.Fatalf("usageCreditTotal total=%d, want %d (credit=%v)", total, tt.wantTotal, credit)
+			}
+			if ok && (credit < 0 || math.IsNaN(credit) || math.IsInf(credit, 0)) {
+				t.Fatalf("accepted invalid credit: credit=%v total=%d", credit, total)
 			}
 		})
 	}
