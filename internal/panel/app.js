@@ -930,12 +930,17 @@ async function loadLogs() {
 function renderRequestMetrics(m, entries) {
   m = m || {};
   const a = m.archive || {};
+  // 零 tool_calls 停摆计数（issue #149）：上游只回了正文、没调工具。上游行为质量
+  // 指标 —— 不是账号问题（所以没有冷却/禁用），但它意味着「那一轮任务没推进」，
+  // 运维需要在请求表里一眼看到有多少。
+  const stallCount = (entries || []).filter(e => e && e.tool_stall).length;
   $('reqSummary').textContent =
     '已完成 ' + fmtTok(m.completed) +
     ' · 成功 ' + (m.success_rate == null ? '—' : Number(m.success_rate).toFixed(1) + '%') +
     ' · HTTP ' + (m.http_success_rate == null ? '—' : Number(m.http_success_rate).toFixed(1) + '%') +
     ' · 平均 ' + fmtMs(m.avg_duration_ms) +
-    ' · 进行中 ' + String(m.in_flight || 0);
+    ' · 进行中 ' + String(m.in_flight || 0) +
+    (stallCount ? ' · 停摆 ' + stallCount : '');
   $('reqNote').textContent = a.enabled
     ? 'JSONL 归档 ' + fmtBytes(a.bytes) + (a.dropped_writes ? ' · 丢弃 ' + a.dropped_writes + ' 条' : '') +
       (a.last_error ? ' · 错误：' + a.last_error : '')
@@ -1041,6 +1046,16 @@ function reqOutcomeTag(e) {
   return '<span class="tag ' + cls + '">' + esc(String(e && e.status || '—') + ' ' + label) + '</span>';
 }
 
+// 零 tool_calls 停摆标记（issue #149）：上游只回了正文、没调工具 —— 工具一次没跑，
+// 客户端会按「正常完成」收尾。停摆率是上游行为质量指标，不是账号问题，所以做成
+// 一个独立的角标挂在结果列旁边（不改变 outcome 本身：那一跳可能最终成功）。
+function reqStallTag(e) {
+  if (!e || !e.tool_stall) return '';
+  const n = Number(e.tool_stall_text || 0);
+  return '<span class="tag warn" title="零 tool_calls 停摆：上游只回了正文，没调工具（正文 ' +
+    (Number.isFinite(n) ? n : 0) + ' 字符）">停摆</span>';
+}
+
 function reqTokenCell(e) {
   const total = Number(e && e.total_tokens || 0) ||
     (Number(e && e.prompt_tokens || 0) + Number(e && e.completion_tokens || 0));
@@ -1066,7 +1081,7 @@ function renderRequestTable() {
     const rid = e && e.request_id ? e.request_id : '';
     return '<tr title="' + esc(requestLogText(e)) + '">' +
       '<td class="num">' + esc(when) + '</td>' +
-      '<td>' + reqOutcomeTag(e) + '</td>' +
+      '<td>' + reqOutcomeTag(e) + reqStallTag(e) + '</td>' +
       '<td>' + esc(e && e.model || '—') + '</td>' +
       '<td>' + esc(e && e.account || '—') + '</td>' +
       '<td>' + (ip ? '<span class="clip ip" title="' + esc(ip) + '">' + esc(ip) + '</span>' : '<span class="muted">—</span>') + '</td>' +
@@ -1130,6 +1145,7 @@ function requestLogText(e) {
     fmtTok(token) + ' tok',
     credit,
     cacheRateText(e && e.cache_hit_tokens, e && e.cache_miss_tokens) === '—' ? '' : '命中 ' + cacheRateText(e && e.cache_hit_tokens, e && e.cache_miss_tokens),
+    e && e.tool_stall ? '零 tool_calls 停摆（正文 ' + (Number(e.tool_stall_text || 0)) + ' 字符）' : '',
     e && e.request_id || '—',
   ].filter(Boolean).join(' | ');
 }

@@ -2,6 +2,7 @@ package panel
 
 import (
 	"bytes"
+	"encoding/json"
 	"net/http/httptest"
 	"os"
 	"os/exec"
@@ -274,6 +275,67 @@ process.stdout.write(JSON.stringify({
 	want := `{"good":` + strconv.Quote(text) + `,"noSource":` + strconv.Quote(noSource) + `,"cached":` + strconv.Quote(cached) + `}`
 	if strings.TrimSpace(string(out)) != want {
 		t.Fatalf("request log formatting=%s want %s", out, want)
+	}
+}
+
+// 零 tool_calls 停摆角标（issue #149）：命中停摆的那一行要挂一个「停摆」标签，
+// 没命中的行不能有（不能给所有行都挂）。
+func TestAppJSRequestStallTag(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed; request stall tag test skipped")
+	}
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const start = src.indexOf('function reqStallTag');
+// 只切到下一个函数边界之前：reqStallTag 后面紧跟的是 reqTokenCell，之间不含
+// 任何面板级代码（$() 之类的引用），所以按 'function reqTokenCell' 截断。
+const end = src.indexOf('function reqTokenCell');
+if ([start, end].some(v => v < 0)) throw new Error('stall tag helper not found');
+const ctx = { Number, String };
+vm.createContext(ctx);
+vm.runInContext(
+  src.slice(start, end) +
+  '\nthis.reqStallTag=reqStallTag;',
+  ctx
+);
+process.stdout.write(JSON.stringify({
+  stall: ctx.reqStallTag({ tool_stall: true, tool_stall_text: 1200 }),
+  plain: ctx.reqStallTag({ tool_stall: false }),
+  missing: ctx.reqStallTag({}),
+  none: ctx.reqStallTag(null),
+}));`
+	f, err := os.CreateTemp(t.TempDir(), "request-stall-tag-*.cjs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(script); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	out, err := exec.Command(node, f.Name(), "app.js").CombinedOutput()
+	if err != nil {
+		t.Fatalf("request stall tag node test failed: %v\n%s", err, out)
+	}
+	if !strings.Contains(string(out), "停摆") {
+		t.Fatalf("stall tag output=%s want a 停摆 label", out)
+	}
+	if !strings.Contains(string(out), "1200") {
+		t.Fatalf("stall tag output=%s want the text length 1200", out)
+	}
+	// 三种未命中的形态都必须输出空串（前端拼接时才不会多出分隔符）。
+	var got struct {
+		Stall   string `json:"stall"`
+		Plain   string `json:"plain"`
+		Missing string `json:"missing"`
+		None    string `json:"none"`
+	}
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatalf("decode stall tag output %s: %v", out, err)
+	}
+	if got.Plain != "" || got.Missing != "" || got.None != "" {
+		t.Fatalf("non-stall rows must render an empty tag, got %q/%q/%q", got.Plain, got.Missing, got.None)
 	}
 }
 
