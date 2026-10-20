@@ -109,19 +109,77 @@ func FrameHintFunc(ctxFn func() HintContext) func(string) string {
 // FrameKind 从 SSE error 帧 payload 判定 ErrKind：6004 模型级限流的流式形态
 // （IsModelRateLimit 对帧 JSON 直接命中）优先；其余取帧内 error.message 走
 // Classify（请求级 400 口径）。判不出 → ErrNone（无 hint）。
+//
+// **必须把 error.code 一起带进分类**（不能只传 message）：
+//
+// 上游用「HTTP 200 + SSE error 帧」回报错误时，帧形如
+//
+//	data: {"error":{"code":11128,"message":"request illegal"}}
+//
+// 11-128/11128（通道校验）与 11140（账号被限制）的判据**在业务码上**
+// （见 IsChannelRefused / IsAccountRestricted），文案「request illegal」是两者
+// 共用的。只传 message ⇒ 业务码丢失 ⇒ 11-128 落通用 4xx ErrClient ⇒
+// handler 的 default 分支喂 `NoteFailures` ⇒ **5 次就把健康号降权出池 10 分钟**。
+//
+// 而非流式路径走 `Classify(status, 完整 body)`，同一个上游错误在那边是
+// `ErrChannelRefused`（零动作）。于是**同一个错误两条路径处置相反** ——
+// 这正是本次修复要消灭的「因渠道校验失败伤好账号」，只是从「禁用」换成了
+// 「降权」。
+//
+// 做法：把 error.code 与 error.message 合成一个**最小业务信封**再交给 Classify，
+// 这样判定口径与非流式完全一致（也顺带让 11140 的模型级限流否决生效）。
 func FrameKind(payload string) ErrKind {
 	if IsModelRateLimit(payload) {
 		return ErrSoftRate
 	}
 	var f struct {
 		Error struct {
-			Message string `json:"message"`
+			Code    json.RawMessage `json:"code"`
+			Message string          `json:"message"`
 		} `json:"error"`
 	}
 	if json.Unmarshal([]byte(payload), &f) != nil || f.Error.Message == "" {
 		return ErrNone
 	}
-	return Classify(http.StatusBadRequest, f.Error.Message)
+	// 合成业务信封：{"code":<原码>,"msg":<原文案>}。
+	//
+	// code 原样搬运（可能是数字 11128，也可能是字符串 "11-128"），因此用
+	// json.RawMessage 直接嵌入，避免数字化时把 "11-128" 变成 11-128 之类的
+	// 无效 JSON。msg 走 json.Marshal 转义，原始文案不丢。
+	code := strings.TrimSpace(string(f.Error.Code))
+	if code == "" || code == "null" {
+		// 没有业务码：只能按文案判（与旧行为一致）。
+		return Classify(http.StatusBadRequest, f.Error.Message)
+	}
+	// 合成业务信封：**搬运整个 error 对象**（不只 code + msg），把 code 提到顶层
+	// 并把 message 映射成 msg，其余字段（displayMsg / displayTips / actions …）
+	// 原样保留。
+	//
+	// 为什么必须保留其余字段：11140 的模型级限流否决句
+	// （"The model provider is rate-limiting requests."）只出现在 displayMsg 里
+	// （msg 仍是 "request illegal"）。若只搬运 code+msg，那句限流说明会被丢掉 ⇒
+	// IsAccountRestricted 判不出限流变体 ⇒ 把**模型侧限流**当成账号封禁 ⇒
+	// 永久禁用健康号（不可自愈、不可申诉）。保留全字段后，非流式与流式的
+	// 判定口径完全一致。
+	var env map[string]any
+	if json.Unmarshal([]byte(payload), &env) != nil {
+		return Classify(http.StatusBadRequest, f.Error.Message)
+	}
+	errObj, _ := env["error"].(map[string]any)
+	if errObj == nil {
+		return Classify(http.StatusBadRequest, f.Error.Message)
+	}
+	out := make(map[string]any, len(errObj)+2)
+	for k, v := range errObj {
+		out[k] = v
+	}
+	out["code"] = json.RawMessage(code)
+	out["msg"] = f.Error.Message
+	raw, err := json.Marshal(out)
+	if err != nil {
+		return Classify(http.StatusBadRequest, f.Error.Message)
+	}
+	return Classify(http.StatusBadRequest, string(raw))
 }
 
 // isModelParamInvalid 上游 11133 body 判定（code 11133 / extError.code=
