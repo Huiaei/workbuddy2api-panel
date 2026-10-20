@@ -662,11 +662,23 @@ func (p *Panel) accountCheckin(w http.ResponseWriter, r *http.Request) {
 	}
 	checkinMsg := ""
 	checkinDone := false
+	// checkinSkipped 标记「这次根本没有发起签到调用」（企业版无签到体系）。
+	// 这类情况**不是错误** —— 但 checkin_done 恒为 false，若把解释性文案同时
+	// 塞进 checkin_error，前端就会把**健康**的企业账号渲染成「签到未完成 · 红色报错」。
+	//
+	// 现场：企业账号每次 /checkin 都返回 checkin_error="企业账号无签到体系…"
+	// + checkin_done=false → 面板上永远是一行红色错误，运维误以为账号坏了
+	// （外部脚本与旧缓存前端同样中招）。
+	// 修法：跳过态只给 checkin_message（说明性），**不给** checkin_error；
+	// 同时给一个显式的 checkin_skipped 标记，让调用方能区分
+	// 「跳过（不适用）」与「失败」。
+	checkinSkipped := false
 	// 企业版无签到体系（上游 400 code 10001「企业账号不支持该操作」）：不发起该调用，
 	// 端点退化为「刷新额度」——企业额度走 get-enterprise-user-usage 口径（见 upstream）。
 	// 前端对企业号不渲染「签到」按钮；此处是 API 侧防御（外部脚本/旧缓存前端仍可能调用）。
 	if a.IsEnterprise() {
 		checkinMsg = "企业账号无签到体系（已跳过签到，仅刷新额度）"
+		checkinSkipped = true
 	} else if err := p.cfg.Upstream.DailyCheckin(a); err != nil {
 		checkinMsg = err.Error() // "今天已签到"等业务错误照常查余额
 		// 幂等拒绝同样是「今日已签」，标记后按钮显示「已签」。
@@ -682,9 +694,13 @@ func (p *Panel) accountCheckin(w http.ResponseWriter, r *http.Request) {
 	if a.IsEnterprise() {
 		resp["enterprise"] = true
 	}
+	if checkinSkipped {
+		resp["checkin_skipped"] = true
+	}
 	if checkinMsg != "" {
 		resp["checkin_message"] = checkinMsg
-		if !checkinDone {
+		// 只有**真的没签到**才是错误；跳过态（企业版）不算错误。
+		if !checkinDone && !checkinSkipped {
 			resp["checkin_error"] = checkinMsg
 		}
 	}

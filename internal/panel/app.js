@@ -1680,6 +1680,11 @@ function checkinResultNote(r) {
   // checkin_done，用户永远只看到「签到未完成：企业账号无签到体系…」，**看不到
   // 余额查询真正失败的原因**（例如上游返回 data:null → 「余额刷新失败」）。
   if (r.balance_error) return { message: '余额刷新失败：' + r.balance_error, severity: 'err' };
+  // 跳过态（企业账号无签到体系）：**不是错误**。后端已用 checkin_skipped 显式
+  // 标记；此处也要兜住「后端还没升、只有 checkin_message 的企业号」——
+  // 否则健康的企业账号会被渲染成「签到未完成」红色报错。
+  if (r.checkin_skipped) return { message: (r.checkin_message || '该账号不适用签到') + balance, severity: '' };
+  if (r.enterprise && !r.checkin_error && r.checkin_message) return { message: r.checkin_message + balance, severity: '' };
   if (!r.checkin_done) return { message: '签到未完成：' + (r.checkin_error || r.checkin_message || '请稍后重试') + balance, severity: 'err' };
   return { message: '签到已完成' + balance, severity: 'ok' };
 }
