@@ -38,7 +38,7 @@ const (
 	ErrContentBlocked                // 内容策略拦截（400 + 审核文案）→ 不罚账号，走降级重试
 	ErrBadParams                     // 请求体解析失败（400 + Unmarshal chat params failed / 11101）→ 请求级错误：不罚号、不轮转，末端 400 透传原文
 	ErrAccountFault                  // 账号级授权/配额故障（11140 request illegal / 14017 trial not activated）→ 冷却轮换，不无限重试
-	ErrChannelRefused                // 11-128/11128 通道校验失败（请求形状没过官方渠道校验，账号本身健康）→ 不罚号、不轮转
+	ErrChannelRefused                // 11-128/11128 通道校验失败（请求形状没过官方渠道校验，账号本身健康）→ 不罚号、继续轮转
 	ErrModelBlocked                  // 11102「该后端无此模型」→ (账号,模型) 负缓存避让，切模型/切账号
 	ErrWafBlock                      // 403 + 非业务信封体（APISIX WAF 拦截页/空体）→ 账号软冷却 + 抖动退避
 	ErrPromptTooLong                 // 11115「prompt is too long」→ 请求级错误（上下文超限是请求的问题非账号的问题）：不罚号、不轮转，末端透传原文
@@ -170,8 +170,13 @@ const accountRestrictedMsg = "request illegal"
 //
 // 第三条排除项（限流文案）：11140 的信封里 msg 与 displayMsg 是两个字段，上游
 // 可能给出 msg="request illegal" 而 displayMsg 带模型级限流说明。此时**不能**
-// 永久禁用账号——那是模型侧限流，等几分钟自愈。命中限流文案即放弃封禁判定，
-// 让分类链继续走到 softRateMarkers 归 ErrSoftRate。
+// 永久禁用账号——那是模型侧限流，等几分钟自愈。命中**上游那一句固定限流句**
+// 即放弃封禁判定，让分类链继续走到 softRateMarkers 归 ErrSoftRate。
+//
+// 注意：排除项刻意**不**复用 softRateMarkers 整张词表（宽口径，含 "rate
+// limit" / "too many" / "usage limit"），因为那些词同样出现在真封禁文案里
+// （"Too many login attempts…" / "Your usage limit has been reached."），
+// 按宽词表否决会让真封禁账号永不禁用。
 func IsAccountRestricted(body string) bool {
 	lower := strings.ToLower(body)
 	if !strings.Contains(lower, accountRestrictedMsg) {
@@ -180,10 +185,24 @@ func IsAccountRestricted(body string) bool {
 	if !hasBusinessCode(body, "11140") {
 		return false
 	}
-	// 限流文案优先：模型级限流变体不得被当成账号封禁（否则一次限流就把好号
-	// 永久禁用，面板还标成 banned，用户只能重新登录——而重登对限流无效）。
-	for _, m := range softRateMarkers {
-		if strings.Contains(lower, strings.ToLower(m)) {
+	// 模型级限流句优先：**只认上游那一句固定文案**（及其中文对应句）。上游的
+	// 11140 信封里 msg 与 displayMsg 是两个字段，可能给出 msg="request illegal"
+	// 而 displayMsg 带模型级限流说明；那种场景是模型侧限流，等几分钟自愈，
+	// 不得永久禁用账号（重登对限流无效）。
+	//
+	// 这里**不能**复用 softRateMarkers 整张词表（它含 "rate limit" / "too many"
+	// / "usage limit" / "限流" 等宽口径）：那些词同样出现在真封禁文案里
+	// （"Too many login attempts, please try again later." /
+	// "Your usage limit has been reached." /
+	// "This account was restricted. Rate limit abuse detected."），
+	// 一旦按宽词表否决，真封禁账号就**永不禁用**——它会一直带病服务，用户也
+	// 无从申诉（面板只显示「可用」）。那比误封更糟。
+	for _, m := range []string{
+		"the model provider is rate-limiting requests",
+		"模型提供方正在限流",
+		"模型服务方正在限流",
+	} {
+		if strings.Contains(lower, m) {
 			return false
 		}
 	}
@@ -671,9 +690,10 @@ func Classify(status int, body string) ErrKind {
 	//     归 ErrChannelRefused 不罚号。误判成 account_fault 会硬禁用健康账号
 	//     （issue #197 / #231 的用户侧症状：官方客户端能聊、面板里却标成 banned）。
 	//   - 11140 = 账号被上游限制（异常行为/风控）→ ErrAccountFault，由 handler 禁用。
-	// 两者都要求 code + 文案双条件，避免 11140 的模型级限流变体被误判（见
-	// IsAccountRestricted 注释），也避免 11128 的内容审核变体被误判（见
-	// IsChannelRefused 注释）。
+	// 判据分工：通道校验是 **code 优先**（文案只作补充，不参与否决——同一个
+	// 业务码下上游有多个 msg 变体，见 IsChannelRefused 注释）；账号封禁是
+	// **code + 文案双条件**（文案 "request illegal" 与通道校验共用，必须靠
+	// 11140 区分；且要排除 11140 的模型级限流变体，见 IsAccountRestricted 注释）。
 	if IsChannelRefused(body) {
 		return ErrChannelRefused
 	}

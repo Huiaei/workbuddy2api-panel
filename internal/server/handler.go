@@ -1270,9 +1270,12 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			code = "upstream_busy"
 			msg = "upstream capacity is full (queue.full); retry after a short wait"
 		case upstream.ErrChannelRefused:
-			// 11-128/11128 通道校验失败（防御路径：正常已在轮转循环内 fail-fast
-			// 拦截；只有跨域回退开着且另一域还有号时才会走到这里）。400 +
-			// 不可重试语义——换号不换通道，重试必然同样失败。
+			// 11-128/11128 通道校验失败：**正常的末端路径**（轮转耗尽后才到这
+			// 里；轮转循环内不 fail-fast，因为上游风控是按账号判定的，换号可能
+			// 换到能过的号——issue #197 的实测：同一时刻被记成「禁用」的号稳定
+			// 400 11-128，而另一个健康号稳定 200）。
+			// 400 + 不可重试语义：轮转已把所有可用号试过一遍，同一客户端指纹
+			// 再发一次还是同样失败，让客户端去查指纹/代理，而不是无脑重试。
 			code = "channel_refused"
 			status = http.StatusBadRequest
 			msg = "upstream rejected the request channel (it may not look like the official client); check user-agent/headers or an intercepting proxy"
@@ -1530,8 +1533,9 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 		// 11-128 / 11128 通道校验失败（上游判定请求可能不是官方客户端发出，displayMsg
 		// 就是「请求被拦截，请重新发送」）。账号本身健康——官方客户端可正常使用同一账号，
 		// 这不是账号级故障，**不罚账号**（无冷却/熔断/NoteFailures）。与
-		// ErrContentBlocked 同待遇，由轮转继续尝试（换号不改变通道指纹，若全池同错
-		// 会把上游原文透传给客户端，提示排查客户端指纹）。
+		// ErrContentBlocked 同待遇：交给轮转继续尝试（上游风控按账号判定，换号
+		// 可能换到能过的号——issue #197 实测）；轮转耗尽后由末端映射回
+		// 400 + channel_refused，并把上游原文透传给客户端，提示排查客户端指纹。
 	case upstream.ErrServer:
 		// 5xx 上游故障：Classify 已把 ≥500 判为 ErrServer，在此喂熔断计数（不再手写 status>=500）。
 		h.cfg.Pool.NoteError(uid)
