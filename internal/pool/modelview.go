@@ -116,7 +116,10 @@ func (p *Pool) ModelLockView() []ModelLockRow {
 			if e.a.Realm() != realm {
 				continue
 			}
-			if e.healthyForModel(now, model) && !p.inFlightFull(e) {
+			// 熔断号在选号层面不可用（burnBlocked 在各选号路径上都生效），
+			// 不得计入 Servable —— 否则面板显示「2 个可服务」而实际只有 1 个
+			// 能选出来，排障方向会错。
+			if e.healthyForModel(now, model) && !p.inFlightFull(e) && !p.burnBlocked(e, now) {
 				row.Servable++
 			}
 		}

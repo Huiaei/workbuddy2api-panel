@@ -93,6 +93,11 @@ func (p *Pool) Revive(uid string) bool {
 	e.fails = 0
 	e.retryCount = 0
 	e.breakerUntil = time.Time{}
+	// 积分燃尽熔断也要清：面板「解冻」的语义是「运维口径无条件恢复」
+	//（panel.go 的 accountRevive 注释原文如此）。不清的话，运维点了恢复，
+	// 账号**依然选不出来**（熔断在选号路径上照样生效），而且没有任何提示
+	// 说明「还差 cooldown 到期」——运维会以为按钮坏了。
+	delete(p.burnGuard, uid)
 	p.dirty.Store(true)
 	return true
 }
@@ -545,6 +550,16 @@ func (p *Pool) countsDetailedForRealm(realm string) (total, healthy, cooling, di
 			// 它与「禁用」是两种运维状态，这里分开计；要不要合并由调用方决定。
 			paused++
 		case !e.healthy(now):
+			cooling++
+		case p.burnBlocked(e, now):
+			// 积分燃尽熔断：账号本身「健康」（可登入、可签到），但**选号层面**
+			// 已被熔断排除（burnBlocked 在各选号路径上都生效，见 burnguard.go）。
+			// 若把它计入 healthy，运维看面板总览以为「还有 1 个健康号」，
+			// 实际那号根本选不出来 ⇒ 排障方向完全错（去查「号为什么不出
+			// 请求」，而不是查积分燃尽熔断）。
+			//
+			// 归入 cooling 桶与 statusOf 的口径对齐（statusOf 已把 burn 显示为
+			// Cooling=true / CoolKind="burn"）——数据本来就有，聚合口径跟上即可。
 			cooling++
 		default:
 			healthy++
