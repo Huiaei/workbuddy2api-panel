@@ -314,19 +314,11 @@ func containsMarkupCall(text string) bool {
 //   - 上游偶发用对象：message.tool_calls 是单个对象；
 //   - Responses 风格：message.function_call 是对象。
 func hasToolCalls(msg map[string]any) bool {
-	switch v := msg["tool_calls"].(type) {
-	case []any:
-		return len(v) > 0
-	case map[string]any:
-		return len(v) > 0
-	}
-	switch v := msg["function_call"].(type) {
-	case map[string]any:
-		return len(v) > 0
-	case []any:
-		return len(v) > 0
-	}
-	return false
+	// 统一走 MessageHasToolCalls：它同时认 `[]any`（JSON 反序列化产物）与
+	// `[]map[string]any`（Aggregate 产出的聚合形态）。早先这里只认 []any，
+	// 而 Aggregate 产出的是 []map[string]any ⇒ 非流式路径把「工具其实调了」
+	// 的回合误判成停摆（白烧一次上游调用 + 白解绑一次粘性会话）。
+	return MessageHasToolCalls(msg)
 }
 
 // StreamToolStallDetector 在**流式**路径上做同样的判定。
@@ -413,10 +405,13 @@ func (d *StreamToolStallDetector) Observe(obj map[string]any) {
 		if delta == nil {
 			continue
 		}
-		if tcs, ok := delta["tool_calls"].([]any); ok && len(tcs) > 0 {
+		// 判读认全类型（[]any / []map[string]any / 单个调用对象）：流式 delta
+		// 里的 tool_calls 形态随上游而异（整包 delta、index→call 映射、
+		// 分片增量都可能），只认 []any 会漏判「工具其实调了」。
+		if HasStructuredToolCalls(delta["tool_calls"]) {
 			d.toolCallSeen = true
 		}
-		if fc, ok := delta["function_call"].(map[string]any); ok && len(fc) > 0 {
+		if HasStructuredToolCalls(delta["function_call"]) {
 			d.toolCallSeen = true
 		}
 		if txt, ok := delta["content"].(string); ok {
