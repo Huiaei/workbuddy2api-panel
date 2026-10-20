@@ -23,6 +23,8 @@
 package atomicfile
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -30,6 +32,12 @@ import (
 	"path/filepath"
 	"syscall"
 )
+
+// stagingName 决定暂存文件名。默认是 tmpName（唯一名）。
+//
+// 抽成变量是为了让测试能观测「每次写用了哪个暂存名」——并发写的核心不变量
+// 就是「不同写者不得共用同一个暂存名」。仅测试使用，生产路径恒为 tmpName。
+var stagingName = tmpName
 
 // Write 把 data 写入 path。
 //
@@ -39,20 +47,32 @@ import (
 //
 // 失败时返回的错误里会带上可操作信息（哪个路径不可写、完整新内容留在哪）。
 func Write(path string, data []byte, mode os.FileMode, fallbackDirs ...string) error {
-	primary := path + ".tmp"
-	primaryErr := os.WriteFile(primary, data, mode)
+	dir := filepath.Dir(path)
+	base := filepath.Base(path)
+
+	primary, nameErr := stagingName(dir, base)
+	primaryErr := nameErr
+	if nameErr == nil {
+		primaryErr = os.WriteFile(primary, data, mode)
+	}
 	if primaryErr == nil {
 		// 正常路径：同目录 tmp + rename（原子）。
 		if err := os.Rename(primary, path); err == nil {
 			return nil
 		} else {
-			// rename 失败（EXDEV 跨设备 / EBUSY 单文件挂载点 / EXDEV 目标为目录…）：
+			// rename 失败（EXDEV 跨设备 / EBUSY 单文件挂载点 / 目标被占用…）：
 			// 退化为原地覆盖；tmp 里已是完整新内容，失败时留在原地供恢复。
+			//
+			// 注意错误信息里**必须带上 rename 的原始原因**：否则像 Windows
+			// 「源文件被独占」这类真实原因会被原地覆盖的次生错误盖住
+			//（实测踩过：rename 因共享冲突失败 → 原地覆盖因目标尚不存在
+			//  报 ERROR_FILE_NOT_FOUND → 排查时看到的是一个完全误导的错误）。
+			renameErr := err
 			if werr := writeInPlace(path, data); werr == nil {
 				_ = os.Remove(primary)
 				return nil
 			} else {
-				return fmt.Errorf("replace %s: %w（完整新内容保留在 %s）", path, werr, primary)
+				return fmt.Errorf("replace %s: rename 失败(%v)，原地覆盖也失败: %w（完整新内容保留在 %s）", path, renameErr, werr, primary)
 			}
 		}
 	}
@@ -68,7 +88,10 @@ func Write(path string, data []byte, mode os.FileMode, fallbackDirs ...string) e
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			continue
 		}
-		alt := filepath.Join(dir, filepath.Base(path)+".tmp")
+		alt, err := stagingName(dir, base)
+		if err != nil {
+			continue
+		}
 		if err := os.WriteFile(alt, data, mode); err != nil {
 			continue
 		}
@@ -80,12 +103,15 @@ func Write(path string, data []byte, mode os.FileMode, fallbackDirs ...string) e
 			_ = os.Remove(alt)
 			return nil
 		} else {
-			return fmt.Errorf("replace %s: %w（完整新内容保留在 %s）", path, werr, alt)
+			return fmt.Errorf("replace %s: 原地覆盖也失败: %w（完整新内容保留在 %s）", path, werr, alt)
 		}
 	}
 
 	// 全部退路都失败：把原因讲清楚，并附上权限排查指引。
-	msg := fmt.Sprintf("write %s: %v（临时文件 %s 无法创建：所在目录不可写）", path, primaryErr, primary)
+	msg := fmt.Sprintf("write %s: %v", path, primaryErr)
+	if primary != "" {
+		msg += fmt.Sprintf("（临时文件 %s 无法创建：所在目录不可写）", primary)
+	}
 	if errors.Is(primaryErr, fs.ErrPermission) {
 		msg += "\n（Docker 部署：容器内用户对目标文件所在目录无写权限。解法任选：" +
 			"1) 以本机 uid 运行容器：PUID=$(id -u) PGID=$(id -g) docker compose up -d；" +
@@ -95,10 +121,46 @@ func Write(path string, data []byte, mode os.FileMode, fallbackDirs ...string) e
 	return errors.New(msg)
 }
 
+// tmpName 为暂存文件生成一个**唯一**名字（放在 dir 下）。
+//
+// 为什么不能用固定的 path+".tmp"：两个并发写同一目标会互相踩——
+//  1. 后写者的 os.WriteFile 会把前写者**已暂存好的内容截断重写**，
+//     前写者随后 rename，落盘的是后写者的内容（甚至两者的混合）；
+//  2. 前写者 rename 成功后暂存文件消失，后写者 rename 报「源文件不存在」；
+//  3. Windows 上更糟：文件正被另一个进程打开时 MoveFileEx 会因共享冲突失败
+//     （ERROR_SHARING_VIOLATION / ERROR_ACCESS_DENIED），
+//     随后的原地覆盖又因「目标文件尚不存在」报 ERROR_FILE_NOT_FOUND
+//     → 一次本该成功的并发写变成失败。
+//
+// 唯一名字让每个写者只操作自己的暂存文件，rename 仍然是同文件系统内的
+// 原子替换，互不干扰。
+//
+// 代价：进程被强杀可能留下形如 config.json.tmp-<16位十六进制> 的残留文件。
+// 这是「宁可留下可识别的残留，也不写坏主文件」的取舍。
+func tmpName(dir, base string) (string, error) {
+	var b [8]byte
+	for attempt := 0; attempt < 4; attempt++ {
+		if _, err := rand.Read(b[:]); err != nil {
+			return "", err
+		}
+		name := filepath.Join(dir, base+".tmp-"+hex.EncodeToString(b[:]))
+		if _, err := os.Lstat(name); os.IsNotExist(err) {
+			return name, nil
+		}
+	}
+	return "", fmt.Errorf("无法为 %s 在 %s 生成唯一暂存文件名", base, dir)
+}
+
 // writeInPlace 原地覆盖目标文件（不新建）。用于「rename 不可用」的降级路径：
 // 单文件 bind mount（EBUSY）与跨设备（EXDEV）。
+//
+// 注意：目标文件**可能还不存在**（例如并发写同一个新文件时，
+// 另一个写者已把目标 rename 走、或目标本来就是新建的）。
+// Windows 上「以 O_WRONLY|O_TRUNC 打开一个不存在的文件」报
+// ERROR_FILE_NOT_FOUND → 必须用 O_CREATE 补上，否则一次本该成功的写
+// 会以「系统找不到指定的文件」失败。
 func writeInPlace(path string, data []byte) error {
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_TRUNC, 0o600)
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_TRUNC|os.O_CREATE, 0o600)
 	if err != nil {
 		return err
 	}
