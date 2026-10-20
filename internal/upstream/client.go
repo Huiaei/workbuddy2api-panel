@@ -2328,6 +2328,13 @@ func (c *Client) enterpriseResource(a *auth.Auth, soon time.Duration) (remain, t
 	if !quota.hasQuotaField {
 		return 0, 0, 0, time.Time{}, 0, fmt.Errorf("enterprise resource: upstream returned empty quota payload")
 	}
+	// 字段存在但**类型/格式不可解析**（例如 credit 写成 "812.45" 以外的怪值）：
+	// 这既不是「没给额度」也不是「额度为 0」——数值不可信，必须报错。
+	// 静默当成 0 会让面板显示「剩余 2000/2000」（实际 1187），或把健康账号
+	// 误判成额度耗尽而挡掉收费模型。
+	if quota.badType {
+		return 0, 0, 0, time.Time{}, 0, fmt.Errorf("enterprise resource: upstream returned quota fields with unparsable values")
+	}
 	limit := quota.limitNum
 	used := quota.credit
 	if used == 0 && quota.usedNum != 0 {
@@ -2407,8 +2414,12 @@ func personalAccountsFieldPresent(data json.RawMessage) bool {
 // 信息」（data 为 null、空对象、或只带 cycleEndTime 之类非额度字段）是**故障态**。
 // 两者必须分开，否则「额度 0 但账号健康」会继续伪装成真实余额，把一个空响应
 // 变成余额归零。
+//
+// badType 记录「字段存在但类型/格式不对」的情况：这种响应**不是**「没给额度」，
+// 但数值不可信 —— 调用方据此报错，而不是把一个读不出来的额度当成 0。
 type enterpriseQuota struct {
 	hasQuotaField  bool
+	badType        bool
 	credit         float64
 	limitNum       int64
 	usedNum        float64
@@ -2426,6 +2437,16 @@ type enterpriseQuota struct {
 //
 // 归一化后等价族：credit / Credit / CREDIT、limitNum / limit_num / LIMITNUM、
 // usedNum / used_num。
+//
+// **同族多键的取值必须确定**（不能「谁后覆盖谁」）：Go 的 map 遍历顺序是随机的，
+// 若上游同时给出 "credit" 与 "Credit"（一个真实值、一个占位 0），「后者覆盖前者」
+// 会让**同一份响应每次解析出不同的余额**（实测 200 次解析得到 {0:166, 812.45:34}）
+// → 余额随机跳变 → 面板显示的额度与调度器按的额度不一致 → 派活后 402。
+// 这里改成「按归一化键分组，组内取**非零**值；全零时取任一（都是 0，无所谓）」。
+//
+// **类型不匹配不能静默当 0**：上游偶尔把数值写成字符串（"812.45"）或反过来。
+// 静默当 0 会让「额度 812.45」变成「额度 0」→ 面板显示剩余 2000/2000（实际 1187）、
+// 或账号被误判耗尽。这里能解析字符串形式的数字就解析，解析不了就置 badType。
 func parseEnterpriseQuota(data json.RawMessage) (enterpriseQuota, error) {
 	var q enterpriseQuota
 	trimmed := strings.TrimSpace(string(data))
@@ -2436,6 +2457,20 @@ func parseEnterpriseQuota(data json.RawMessage) (enterpriseQuota, error) {
 	if err := json.Unmarshal(data, &probe); err != nil {
 		return q, err
 	}
+	// 先按归一化键分组，组内收集全部候选值。
+	type group struct {
+		values []float64
+		bad    bool
+	}
+	groups := map[string]*group{}
+	get := func(key string) *group {
+		g, ok := groups[key]
+		if !ok {
+			g = &group{}
+			groups[key] = g
+		}
+		return g
+	}
 	for key, raw := range probe {
 		norm := strings.ToLower(strings.ReplaceAll(key, "_", ""))
 		switch norm {
@@ -2443,34 +2478,76 @@ func parseEnterpriseQuota(data json.RawMessage) (enterpriseQuota, error) {
 			q.hasQuotaField = true
 		}
 		switch norm {
-		case "credit":
-			var f float64
-			if json.Unmarshal(raw, &f) == nil {
-				q.credit = f
+		case "credit", "limitnum", "usednum":
+			g := get(norm)
+			f, ok := quotaNumber(raw)
+			if !ok {
+				g.bad = true
+				q.badType = true
+				continue
 			}
-		case "limitnum":
-			var f float64
-			if json.Unmarshal(raw, &f) == nil {
-				q.limitNum = int64(f)
-			}
-		case "usednum":
-			var f float64
-			if json.Unmarshal(raw, &f) == nil {
-				q.usedNum = f
-			}
-		case "cycleendtime":
+			g.values = append(g.values, f)
+		case "cycleendtime", "cycleresettime":
 			var s string
 			if json.Unmarshal(raw, &s) == nil {
-				q.cycleEndTime = s
-			}
-		case "cycleresettime":
-			var s string
-			if json.Unmarshal(raw, &s) == nil {
-				q.cycleResetTime = s
+				if norm == "cycleendtime" {
+					q.cycleEndTime = s
+				} else {
+					q.cycleResetTime = s
+				}
 			}
 		}
 	}
+	// 组内取值：优先非零；全零时取零。**顺序无关** ⇒ 同一份响应永远解析成同一个值。
+	pick := func(key string) (float64, bool) {
+		g := groups[key]
+		if g == nil {
+			return 0, false
+		}
+		for _, v := range g.values {
+			if v != 0 {
+				return v, true
+			}
+		}
+		if len(g.values) > 0 {
+			return 0, true
+		}
+		return 0, false
+	}
+	if v, ok := pick("credit"); ok {
+		q.credit = v
+	}
+	if v, ok := pick("usednum"); ok {
+		q.usedNum = v
+	}
+	if v, ok := pick("limitnum"); ok {
+		q.limitNum = int64(v)
+	}
 	return q, nil
+}
+
+// quotaNumber 解析一个额度数值：接受 JSON number，也接受**数字字符串**
+// （上游偶尔把数值序列化成字符串）。
+//
+// 返回 ok=false 表示类型/格式不可解析 —— 调用方必须报错，**不能**当成 0。
+func quotaNumber(raw json.RawMessage) (float64, bool) {
+	var f float64
+	if err := json.Unmarshal(raw, &f); err == nil {
+		return f, true
+	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err == nil {
+		s = strings.TrimSpace(s)
+		if s == "" {
+			return 0, false
+		}
+		v, err := strconv.ParseFloat(s, 64)
+		if err != nil {
+			return 0, false
+		}
+		return v, true
+	}
+	return 0, false
 }
 
 // UserResourceDetailedWithExpiry 在 UserResourceDetailed 基础上返回最早未来到期批次：
