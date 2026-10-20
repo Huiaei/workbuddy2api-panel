@@ -31,6 +31,7 @@ import (
 	"os"
 	"path/filepath"
 	"syscall"
+	"time"
 )
 
 // stagingName 决定暂存文件名。默认是 tmpName（唯一名）。
@@ -57,26 +58,34 @@ func Write(path string, data []byte, mode os.FileMode, fallbackDirs ...string) e
 	}
 	if primaryErr == nil {
 		// 正常路径：同目录 tmp + rename（原子）。
-		if err := os.Rename(primary, path); err == nil {
+		//
+		// rename 可能因为**另一个写者正在替换同一目标**而失败 —— Windows 上
+		// MoveFileEx(..., MOVEFILE_REPLACE_EXISTING) 在目标文件被其它句柄占用
+		// 时返回 ERROR_ACCESS_DENIED(5) / ERROR_SHARING_VIOLATION(32)，
+		// 这在「两个写者并发写同一文件」时是**必然会撞上**的（不是罕见故障）。
+		// 此时退化为原地覆盖往往也会失败（目标正被另一个句柄独占），
+		// 于是并发写会**偶发失败**（Windows CI 实测：60 轮里第 5 轮就挂）。
+		//
+		// 正确做法：这类「目标侧临时占用」的错误**重试几次**（每次间隔很短），
+		// 让另一个写者先完成。重试仍失败才降级原地覆盖。
+		renameErr := retryRename(primary, path)
+		if renameErr == nil {
+			return nil
+		}
+		// rename 失败（EXDEV 跨设备 / EBUSY 单文件挂载点 / 目标被占用…）：
+		// 退化为原地覆盖；tmp 里已是完整新内容，失败时留在原地供恢复。
+		//
+		// 注意错误信息里**必须带上 rename 的原始原因**：否则像 Windows
+		// 「源文件被独占」这类真实原因会被原地覆盖的次生错误盖住
+		//（实测踩过：rename 因共享冲突失败 → 原地覆盖因目标尚不存在
+		//  报 ERROR_FILE_NOT_FOUND → 排查时看到的是一个完全误导的错误）。
+		if werr := writeInPlace(path, data); werr == nil {
+			_ = os.Remove(primary)
 			return nil
 		} else {
-			// rename 失败（EXDEV 跨设备 / EBUSY 单文件挂载点 / 目标被占用…）：
-			// 退化为原地覆盖；tmp 里已是完整新内容，失败时留在原地供恢复。
-			//
-			// 注意错误信息里**必须带上 rename 的原始原因**：否则像 Windows
-			// 「源文件被独占」这类真实原因会被原地覆盖的次生错误盖住
-			//（实测踩过：rename 因共享冲突失败 → 原地覆盖因目标尚不存在
-			//  报 ERROR_FILE_NOT_FOUND → 排查时看到的是一个完全误导的错误）。
-			renameErr := err
-			if werr := writeInPlace(path, data); werr == nil {
-				_ = os.Remove(primary)
-				return nil
-			} else {
-				return fmt.Errorf("replace %s: rename 失败(%v)，原地覆盖也失败: %w（完整新内容保留在 %s）", path, renameErr, werr, primary)
-			}
+			return fmt.Errorf("replace %s: rename 失败(%v)，原地覆盖也失败: %w（完整新内容保留在 %s）", path, renameErr, werr, primary)
 		}
 	}
-
 	// 同目录 tmp 不可写：退到可写暂存目录。
 	// 常见现场：单文件 bind mount（tmp 落在镜像目录 /app）+ 非 10001 uid 运行。
 	// 末位追加系统临时目录：几乎总能写（/tmp 默认 1777）。
@@ -121,8 +130,44 @@ func Write(path string, data []byte, mode os.FileMode, fallbackDirs ...string) e
 	return errors.New(msg)
 }
 
-// tmpName 为暂存文件生成一个**唯一**名字（放在 dir 下）。
+// renameRetryAttempts / renameRetryDelay 是 rename 因「目标侧临时占用」而失败时的
+// 重试次数与间隔。
 //
+// 为什么需要重试：Windows 上 MoveFileEx(..., MOVEFILE_REPLACE_EXISTING) 在目标
+// 文件**正被另一个句柄打开**时返回 ERROR_ACCESS_DENIED(5) /
+// ERROR_SHARING_VIOLATION(32)。两个写者并发替换同一目标时，这必然会撞上
+// （不是罕见故障）——另一个写者的 rename 窗口只有几微秒，但重试机制是让
+// 双方最终都成功的唯一办法：
+//
+//	写者 A: rename(tmpA, target)   ← 成功
+//	写者 B: rename(tmpB, target)   ← 撞上 A 的窗口 → ERROR_ACCESS_DENIED
+//
+// 不重试时 B 的原地覆盖也会失败（目标正被 A 的句柄独占），结果就是
+// 「一次本该成功的并发写变成失败」（Windows CI 实测：60 轮里第 5 轮挂）。
+const (
+	renameRetryAttempts = 40
+	renameRetryDelay    = 5 * time.Millisecond
+)
+
+// retryRename 执行 rename，遇到「目标侧临时占用」类错误时短暂重试。
+//
+// 返回 nil 表示成功；否则返回**最后一次**的错误（供调用方决定是否降级）。
+func retryRename(tmp, path string) error {
+	var err error
+	for i := 0; i < renameRetryAttempts; i++ {
+		err = os.Rename(tmp, path)
+		if err == nil {
+			return nil
+		}
+		if !isTargetBusyErr(err) {
+			return err // 跨设备 / 挂载点等，重试没有意义
+		}
+		time.Sleep(renameRetryDelay)
+	}
+	return err
+}
+
+// tmpName 为暂存文件生成一个**唯一**名字（放在 dir 下）。
 // 为什么不能用固定的 path+".tmp"：两个并发写同一目标会互相踩——
 //  1. 后写者的 os.WriteFile 会把前写者**已暂存好的内容截断重写**，
 //     前写者随后 rename，落盘的是后写者的内容（甚至两者的混合）；

@@ -61,3 +61,27 @@ func CanFallbackToInPlace(err error) bool {
 	}
 	return errors.Is(err, fs.ErrPermission)
 }
+
+// isTargetBusyErr 报告 rename 失败是否属于「**目标侧临时占用**」——
+// 也就是「另一个进程/写者此刻正持有目标文件的句柄」，稍后重试就能成。
+//
+// Windows 上的典型来源：MoveFileEx(..., MOVEFILE_REPLACE_EXISTING) 在目标
+// 被独占打开时返回 ERROR_ACCESS_DENIED(5) / ERROR_SHARING_VIOLATION(32) /
+// ERROR_LOCK_VIOLATION(33)。这在「两个写者并发替换同一目标」时是**必然会
+// 撞上**的（另一个写者的 rename 窗口只有几微秒，但足以让本写者失败）。
+//
+// 与 CanFallbackToInPlace 的区别：后者回答「能不能降级为原地覆盖」，
+// 本函数回答「值不值得**重试**」。ERROR_ACCESS_DENIED 两边都命中 ——
+// 它既可能是「目标被占用（重试能成）」，也可能是「目标只读/无权限
+// （重试没用，只能降级）」，所以两个判定都保守地包含它。
+func isTargetBusyErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	for _, errno := range windowsReplaceableErrno {
+		if errors.Is(err, errno) {
+			return true
+		}
+	}
+	return errors.Is(err, fs.ErrPermission)
+}
