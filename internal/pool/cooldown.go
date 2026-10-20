@@ -563,6 +563,11 @@ func (p *Pool) CooldownUntilTomorrow4AM(uid string, reason string) {
 // 且不依赖 tzdata（精简容器镜像常缺 /usr/share/zoneinfo）。
 var upstreamCSTZone = time.FixedZone("CST", 8*3600)
 
+// UpstreamCSTZone 暴露上游时区，供调用方（与测试）按同一口径判断「冷却到
+// 上游的哪个时刻」—— 断言必须看上游时区的小时数，而不是部署机器的本地小时数
+// （两者在 UTC 机器上差 8 小时，会让测试在本地过、CI 挂）。
+func UpstreamCSTZone() *time.Location { return upstreamCSTZone }
+
 // nextDay4AM 返回 now 之后最近的一个**上游时区**04:00。
 // now 在当天 04:00 之前（凌晨 00:00~04:00）时返回当天 04:00——此时签到尚未执行，
 // 该窗内触发的硬冷却等当天签到即可恢复；返回次日会白冷约一天。

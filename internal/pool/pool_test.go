@@ -649,11 +649,14 @@ func TestCooldownUntilTomorrow4AM(t *testing.T) {
 	}
 	// 冷却截止必须是"此刻之后的最近一个 04:00"：晚于 now、距今不超过 24h
 	//（凌晨 00:00~04:00 触发时落在当天 04:00，其余时段落在次日 04:00，跨度恒 < 24h）。
+	//
+	// 时区口径：截止时刻是**上游时区**（CST=UTC+8）的 04:00，不是部署机器的
+	// 本地 04:00 —— 上游额度重置的墙钟由上游决定。因此断言要在 CST 下看小时。
 	if st.Until.Before(after) {
 		t.Errorf("until %v is in the past (call span %v..%v)", st.Until, before, after)
 	}
-	if st.Until.Hour() != 4 {
-		t.Errorf("until hour=%d want 4", st.Until.Hour())
+	if st.Until.In(upstreamCSTZone).Hour() != 4 {
+		t.Errorf("until hour=%d (CST) want 4; until=%v", st.Until.In(upstreamCSTZone).Hour(), st.Until)
 	}
 	if d := st.Until.Sub(after); d > 24*time.Hour {
 		t.Errorf("until %v is more than 24h out: %v", st.Until, d)
@@ -674,7 +677,8 @@ func TestCooldownUntilTomorrow4AMPersists(t *testing.T) {
 	p2 := New(fp)
 	p2.Add(&auth.Auth{UID: "u1"})
 	st, ok := p2.Status("u1")
-	if !ok || st.Until.Hour() != 4 || st.Reason != "余额不足" {
+	// 截止时刻是**上游时区**（CST=UTC+8）的 04:00。
+	if !ok || st.Until.In(upstreamCSTZone).Hour() != 4 || st.Reason != "余额不足" {
 		t.Errorf("status after reload=%+v ok=%v", st, ok)
 	}
 }
