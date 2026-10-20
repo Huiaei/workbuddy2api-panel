@@ -553,6 +553,11 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 	// 同目录 tmp 不可写时退到 data 目录暂存（Docker 单文件 bind mount 场景：
 	// config.json 挂在 /app/config.json，而 /app 属镜像内 uid 10001，
 	// tmp 写不动；./data 是宿主机挂载目录，一定可写）——见 issue #226 / #134。
+	//
+	// 覆盖前先留一份 .bak 备份：降级路径（rename 不可用时的原地覆盖）是
+	// O_TRUNC 覆写、非原子，写一半被打断 ⇒ 磁盘上留下半截 config.json ⇒
+	// 下次启动解析失败、服务起不来。留了备份就能自动回退（见 config.go Load）。
+	backupConfigBeforeWrite(path)
 	if err := atomicfile.Write(path, out, 0o600, fallbackDirs...); err != nil {
 		return nil, err
 	}

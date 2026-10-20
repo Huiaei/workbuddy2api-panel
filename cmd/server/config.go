@@ -371,7 +371,22 @@ func Default() *Config {
 	return c
 }
 
+// configBackupSuffix 是配置备份文件的后缀。
+//
+// 为什么需要：落盘的降级路径（rename 不可用时的原地覆盖）是 O_TRUNC 覆写，
+// **非原子**——进程在写一半时被杀 ⇒ 磁盘上留下**半截** config.json。半截配置
+// 解析失败 ⇒ main.go log.Fatalf ⇒ **服务起不来**（issue #226 场景下用户改
+// 配置改到一半断电，下次启动直接起不来，且旧值已被覆盖、无法找回）。
+//
+// 留一份「上一份完整配置」备份，启动时主配置解析失败就回退到它（并打 WARN），
+// 服务照常起来；备份也坏掉时才报错，且错误信息给出恢复路径。
+const configBackupSuffix = ".bak"
+
 // Load 从文件读，再用 WB2A_* env 覆盖。
+//
+// 主配置**解析失败**时自动回退到 "<path>.bak"（上一份完整配置），避免
+// 「半截配置 ⇒ 服务起不来」。回退只在备份**本身可解析**时发生——绝不拿半截
+// 配置启动（那比启动失败更难排查：面板/调度器会拿着缺字段的配置跑）。
 func Load(path string) (*Config, error) {
 	c := Default()
 	if path != "" {
@@ -387,7 +402,15 @@ func Load(path string) (*Config, error) {
 			return nil, fmt.Errorf("read config: %w", err)
 		}
 		if _, err := ParseConfigInto(raw, c); err != nil {
-			return nil, err
+			// 主配置坏了 → 尝试回退到备份。
+			if bak, berr := loadConfigBackup(path); berr == nil {
+				log.Printf("WARN: [config] %s 解析失败（%v），已回退到备份 %s —— "+
+					"上一次保存过程中的写入可能被打断；确认无误后请重新保存配置", path, err, path+configBackupSuffix)
+				return bak, nil
+			}
+			return nil, fmt.Errorf("config %s 解析失败: %w（备份 %s%s 也不可用："+
+				"请从 config.example.json 复制一份重新配置，或删除该文件让程序自动生成推荐配置）",
+				path, err, path, configBackupSuffix)
 		}
 	}
 	applyEnv(c)
@@ -395,6 +418,39 @@ func Load(path string) (*Config, error) {
 		return nil, err
 	}
 	return c, nil
+}
+
+// loadConfigBackup 读取并解析 "<path>.bak"。备份不存在/也坏了 → 返回错误。
+func loadConfigBackup(path string) (*Config, error) {
+	raw, err := os.ReadFile(path + configBackupSuffix)
+	if err != nil {
+		return nil, err
+	}
+	c := Default()
+	if _, err := ParseConfigInto(raw, c); err != nil {
+		return nil, err
+	}
+	applyEnv(c)
+	if err := c.normalize(); err != nil {
+		return nil, err
+	}
+	return c, nil
+}
+
+// backupConfigBeforeWrite 在覆盖配置**之前**把当前内容复制到 "<path>.bak"。
+//
+// 只在当前内容**可解析**时备份（半截内容不值得备份成「上一份完整配置」），
+// 备份失败不阻断保存（备份是保险，不是主路径）。
+func backupConfigBeforeWrite(path string) {
+	raw, err := os.ReadFile(path)
+	if err != nil || len(raw) == 0 {
+		return
+	}
+	var probe any
+	if json.Unmarshal(raw, &probe) != nil {
+		return // 当前就是坏的，不备份
+	}
+	_ = os.WriteFile(path+configBackupSuffix, raw, 0o600)
 }
 
 // ParseConfigInto 把 JSON 覆盖到 c 上并 normalize（不做 env、不读文件）。
