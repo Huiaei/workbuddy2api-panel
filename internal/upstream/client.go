@@ -2320,8 +2320,14 @@ func (c *Client) enterpriseResource(a *auth.Auth, soon time.Duration) (remain, t
 	// json.Unmarshal(null, &resp) 不报错且 resp 全零 → 若继续走，limit=0、used=0
 	// → remain=0、total=0，表现为「额度 0，但账号健康」——与「接口偶发失败」无法
 	// 区分，排障时只能靠猜。这里显式判空并返回 error，让上层显示「查询失败」。
-	if len(data) == 0 || string(data) == "null" {
-		return 0, 0, 0, time.Time{}, 0, fmt.Errorf("enterprise resource: upstream returned null data")
+	//
+	// 判空口径 = **额度字段一个都不存在**（而不是「数值都是 0」）：
+	// 「额度确实是 0」是合法态（企业号用光了），和「上游没给额度信息」必须分开。
+	// 所以按**字段存在性**判定：data 为 null/空对象，或四个额度字段
+	// （credit/limitNum/limit_num/used_num）一个都没出现 → 判为「上游没给数据」。
+	// 只出现其中一个（比如只有 cycleEndTime）同样判空——那不是额度响应。
+	if !enterpriseQuotaFieldsPresent(data) {
+		return 0, 0, 0, time.Time{}, 0, fmt.Errorf("enterprise resource: upstream returned empty quota payload")
 	}
 	limit := resp.LimitNum
 	if limit == 0 && resp.LimitNumSnake != 0 {
@@ -2369,6 +2375,58 @@ func (c *Client) enterpriseResource(a *auth.Auth, soon time.Duration) (remain, t
 		}
 	}
 	return remain, total, expiring, earliestAt, earliestRemaining, nil
+}
+
+// personalAccountsFieldPresent 判断个人口径的 data 里**有没有 Accounts 列表**。
+//
+// 口径 = 字段存在性：空数组 `[]` 是合法态（这个号没有资源包 → 余额 0 是真的），
+// 而**字段缺失**（data 为 null、Accounts 缺失、Accounts 为 null）是上游没给数据
+// 的故障态。两者必须分开——否则一次空响应会把账号余额抹成 0。
+func personalAccountsFieldPresent(data json.RawMessage) bool {
+	trimmed := strings.TrimSpace(string(data))
+	if trimmed == "" || trimmed == "null" {
+		return false
+	}
+	var probe struct {
+		Response *struct {
+			Data *struct {
+				Accounts json.RawMessage `json:"Accounts"`
+			} `json:"Data"`
+		} `json:"Response"`
+	}
+	if json.Unmarshal(data, &probe) != nil {
+		return false
+	}
+	if probe.Response == nil || probe.Response.Data == nil {
+		return false
+	}
+	acc := strings.TrimSpace(string(probe.Response.Data.Accounts))
+	return acc != "" && acc != "null"
+}
+
+// enterpriseQuotaFieldsPresent 判断上游给的 data 里**有没有额度信息**。
+//
+// 口径 = **字段存在性**，不是数值大小：企业号额度真的用光时上游会返回
+// credit=0 / limitNum=0，那是个合法态；而「上游没给额度信息」（data 为 null、
+// 空对象、或只带 cycleEndTime 之类非额度字段）是**故障态**。两者必须分开，
+// 否则「额度 0 但账号健康」会继续伪装成真实余额，把一个空响应变成余额归零。
+//
+// 上游两套字段命名都要认（camelCase 与 snake_case，见 enterpriseResource）。
+func enterpriseQuotaFieldsPresent(data json.RawMessage) bool {
+	trimmed := strings.TrimSpace(string(data))
+	if trimmed == "" || trimmed == "null" || trimmed == "{}" {
+		return false
+	}
+	var probe map[string]json.RawMessage
+	if json.Unmarshal(data, &probe) != nil {
+		return false
+	}
+	for _, k := range []string{"credit", "limitNum", "limit_num", "used_num"} {
+		if _, ok := probe[k]; ok {
+			return true
+		}
+	}
+	return false
 }
 
 // UserResourceDetailedWithExpiry 在 UserResourceDetailed 基础上返回最早未来到期批次：
@@ -2456,6 +2514,18 @@ func (c *Client) UserResourceSnapshot(a *auth.Auth, soon time.Duration) (remain,
 	}
 	if err := json.Unmarshal(data, &resp); err != nil {
 		return 0, 0, 0, time.Time{}, 0, nil, fmt.Errorf("resource parse: %w", err)
+	}
+	// 个人口径的 data 判空（issue #222 建议 3 的同源现象）：上游偶发
+	// `data: {"Response":{"Data":{"Accounts":null}}}` 或 `data: null`。
+	// json.Unmarshal(null, &resp) 不报错且 resp 全零 → Accounts 为空 → remain=0、
+	// total=0，表现为「额度 0，但账号健康」——与「接口偶发失败」无法区分。
+	// 这里显式判空并返回 error：一次空响应不该把账号的余额抹成 0（那会让配了
+	// credit_floor 的部署把该号的收费模型全部挡掉），更不该被面板当成真实余额。
+	//
+	// 判空口径与个人口径的语义一致：**Accounts 字段压根没出现**（而不是
+	// 「数组长度为 0」——空数组是合法的「这个号没有资源包」）。
+	if !personalAccountsFieldPresent(data) {
+		return 0, 0, 0, time.Time{}, 0, nil, fmt.Errorf("resource: upstream returned empty accounts payload")
 	}
 	byDate := make(map[string]*ExpiryBucket)
 	for _, acct := range resp.Response.Data.Accounts {

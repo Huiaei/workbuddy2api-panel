@@ -26,6 +26,17 @@ assert.equal(ctx.taskRowPresentation({task_code:'',target:5},{accept:true,claim:
 assert.equal(ctx.checkinResultNote({checkin_done:false,checkin_error:'活动未开启',credits:350}).severity,'err');
 assert.notEqual(ctx.checkinResultNote({skipped:true,skip_reason:'国际区不适用'}).severity,'ok');
 assert.equal(ctx.checkinResultNote({checkin_done:true,credits:350}).severity,'ok');
+// balance_error 必须**优先于** checkin_done 展示：企业账号没有签到体系
+// （checkin_done 恒为 false、checkin_error 是固定解释性文案），若先判
+// checkin_done，用户永远看不到余额查询真正失败的原因（issue #222 建议 3
+// 引入判空后，失败原因变得重要起来）。
+const balErr=ctx.checkinResultNote({checkin_done:false,checkin_error:'企业账号无签到体系',balance_error:'upstream returned empty quota payload'});
+assert(balErr.message.includes('余额刷新失败'),'balance_error 优先展示，实际: '+balErr.message);
+assert(balErr.message.includes('empty quota payload'),'balance_error 原文要透出，实际: '+balErr.message);
+assert.equal(balErr.severity,'err');
+// 签到真的完成但余额刷新失败：仍要显示余额失败。
+const balErr2=ctx.checkinResultNote({checkin_done:true,balance_error:'upstream returned null data'});
+assert(balErr2.message.includes('余额刷新失败'),'签到完成+余额失败应显示余额失败，实际: '+balErr2.message);
 const summary=ctx.taskResultSummary([{status:'done'},{status:'awaiting_progress'},{status:'done',claim_error:'denied'},{status:'skipped'},{status:'error'}]);
 assert(summary.message.includes('已完成 1 项'));assert(summary.message.includes('等待计分 1 项'));assert(summary.message.includes('领奖待重试 1 项'));assert.equal(summary.severity,'err');
 const gs=src.indexOf('function groupItems(d)'),ge=src.indexOf('const ST_WORDS');

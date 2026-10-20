@@ -130,6 +130,53 @@ func TestEnterpriseResourceNullData(t *testing.T) {
 	}
 }
 
+// TestEnterpriseResourceEmptyQuotaPayload 判空口径 = **额度字段一个都不存在**
+// （而不是「数值都是 0」）。企业号额度真的用光时上游返回 credit=0/limitNum=0，
+// 那是合法态；「上游没给额度信息」是故障态。两者必须分开，否则「额度 0 但账号
+// 健康」会继续伪装成真实余额（issue #222 建议 3）。
+func TestEnterpriseResourceEmptyQuotaPayload(t *testing.T) {
+	for _, body := range []string{
+		`{"code":0,"msg":"OK","data":{}}`,                                        // 空对象
+		`{"code":0,"msg":"OK","data":{"cycleEndTime":"x"}}`,                      // 只有非额度字段
+		`{"code":0,"msg":"OK","data":{"cycleEndTime":"x","cycleResetTime":"y"}}`, // 同上
+	} {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Write([]byte(body))
+		}))
+
+		c := &Client{HTTP: srv.Client(), BillingBaseCN: srv.URL}
+		a := &auth.Auth{UID: "u1", AccessToken: "at", EnterpriseID: "ent-1"}
+
+		remain, total, _, _, _, err := c.UserResourceDetailedWithExpiry(a, 0)
+		srv.Close()
+		if err == nil {
+			t.Errorf("body=%s 期望返回 error，实际 remain=%d total=%d（会被误显示成「额度 0」）",
+				body, remain, total)
+		}
+	}
+}
+
+// TestEnterpriseResourceZeroQuotaIsLegitimate 额度真的为 0 是**合法态**：
+// credit=0 + limitNum=0 表示「额度用光」，不是上游没给数据 → 不该报错，
+// 也不该被当成故障。（这条钉住判空口径必须是字段存在性而不是数值。）
+func TestEnterpriseResourceZeroQuotaIsLegitimate(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"code":0,"msg":"OK","data":{"credit":0,"limitNum":0}}`))
+	}))
+	defer srv.Close()
+
+	c := &Client{HTTP: srv.Client(), BillingBaseCN: srv.URL}
+	a := &auth.Auth{UID: "u1", AccessToken: "at", EnterpriseID: "ent-1"}
+
+	remain, total, _, _, _, err := c.UserResourceDetailedWithExpiry(a, 0)
+	if err != nil {
+		t.Fatalf("err=%v（额度为 0 是合法态，不该报错）", err)
+	}
+	if remain != 0 || total != 0 {
+		t.Errorf("remain=%d total=%d want 0/0", remain, total)
+	}
+}
+
 // TestEnterpriseResourceUnlimited 上游 limitNum=-1 表示不限量：池内用大剩余量表示，
 // total 记 -1（面板显示「不限」），且不参与周期分桶（不限量没有"未用完作废"语义）。
 func TestEnterpriseResourceUnlimited(t *testing.T) {
