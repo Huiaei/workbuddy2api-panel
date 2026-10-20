@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 
 	"sync"
@@ -1028,6 +1029,12 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				msg := string(respBody)
 				if strings.TrimSpace(msg) == "" {
 					msg = "upstream capacity is full (queue.full); retry after a short wait"
+				}
+				// 上游若给了 Retry-After（秒 / retry-after-ms / x-ratelimit-reset），
+				// 原样带给客户端，让 SDK 用上游的真实等待窗口退避，而不是自己瞎猜。
+				// 上游没给就不编造（宁缺勿滥：臆造一个等待时长比不给更糟）。
+				if uerr != nil && uerr.RetryAfter > 0 {
+					w.Header().Set("Retry-After", strconv.Itoa(int((uerr.RetryAfter+time.Second-1)/time.Second)))
 				}
 				writeOpenAIErrorHint(w, http.StatusServiceUnavailable, "upstream_busy", msg,
 					h.hintOf(upstream.ErrUpstreamBusy, string(respBody), bareModel, reqHasImage, uerr))
