@@ -409,6 +409,15 @@ func cloneFrame(obj map[string]any) map[string]any {
 	for k, v := range obj {
 		out[k] = v
 	}
+	// error 子对象也要深拷：错误帧同样会被读方就地处理（补 code、改文案），
+	// 浅拷贝会让观察者与错误处理共享同一个 map。
+	if e, ok := obj["error"].(map[string]any); ok {
+		ne := make(map[string]any, len(e))
+		for k, v := range e {
+			ne[k] = v
+		}
+		out["error"] = ne
+	}
 	chs, ok := obj["choices"].([]any)
 	if !ok {
 		return out
@@ -641,8 +650,10 @@ func StreamHint(w http.ResponseWriter, r io.Reader, hintFn func(string) string, 
 					o.onErrorFrame(payload)
 				}
 				// 逐帧观察者（issue #149 停摆判定）：error 帧也是合法 JSON，一并观察。
+				// error 帧不走修复层，但仍传副本以保持「观察者拿到的是上游原样」
+				// 这一契约的一致性。
 				for _, obs := range o.frameObservers {
-					obs(obj)
+					obs(cloneFrame(obj))
 				}
 				if werr := writeRaw(payload); werr != nil {
 					return 0, werr
