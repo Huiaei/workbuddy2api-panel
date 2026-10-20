@@ -490,9 +490,15 @@ func (a *Auth) SaveAtomic() error {
 		return errors.New(msg)
 	}
 	if err := os.Rename(tmp, a.FilePath); err != nil {
-		// rename 失败（单文件 bind mount 的 EBUSY / 跨设备 EXDEV）：退化为原地覆盖。
-		// 目标文件本身通常可写（能读到它就能写它），而 tmp 里是完整新内容。
-		if !atomicfile.IsReplaceableErr(err) {
+		// rename 失败 → 退化为原地覆盖。目标文件本身通常可写（能读到它就能写它），
+		// 而 tmp 里是完整新内容。
+		//
+		// 判据必须用 atomicfile.CanFallbackToInPlace（按平台补齐错误码），不能用
+		// IsReplaceableErr：Windows 上 rename 失败的原因是 ERROR_NOT_SAME_DEVICE
+		// （跨卷）与 ERROR_ACCESS_DENIED（目标被占用/只读），而 Windows 的
+		// syscall.EXDEV 是臆造占位值（0x20000000）→ 旧判据在 Windows 上恒为 false
+		// → 这里直接报错 → **刷新后的 accessToken 不落盘**，下次启动继续用旧 token。
+		if !atomicfile.CanFallbackToInPlace(err) {
 			return fmt.Errorf("replace %s: %w", a.FilePath, err)
 		}
 		f, openErr := os.OpenFile(a.FilePath, os.O_WRONLY|os.O_TRUNC, 0o600)
