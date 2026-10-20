@@ -151,6 +151,83 @@ func (c *Client) Search(ctx context.Context, a *auth.Auth, query string, maxResu
 	return c.doSearch(req)
 }
 
+// SearchRaw 与 Search 同一条上游端点，但**回程原文透传**（返回上游 JSON 字节）。
+//
+// 为什么需要第二个入口：Search 返回结构化的 *SearchOutcome（多了 min-length 校验、
+// max_results 收敛、results 恒为数组、total_results 兜底等加工）；而官方 agenttool
+// 透传端点要的是「上游给什么就回什么」——多一个字段、少一个字段都会让按官方契约
+// 解析的调用方错位。故这里只共用请求构造与错误分类，解析侧不加工。
+//
+// 与 Search 的**有意差异**（两条）：
+//  1. 不做 min-length 校验：官方 zod schema 的 query.min(2) 是**客户端**约束，
+//     服务端未必照拦。透传端点的语义是「把调用方的检索词原样送上去」，
+//     过短由上游裁决并把它的 400 原文带回（本地拦截会变成没有上游状态的 502）。
+//  2. doSearchRaw 保留 ErrNone（不兜底成 ErrClient）：见 doSearchRaw 的注释。
+//
+// 错误口径与 Search 完全一致（同一个 *Error 分类路径），故 fail-fast / 换号语义可直接复用。
+func (c *Client) SearchRaw(ctx context.Context, a *auth.Auth, query string, maxResults int) (json.RawMessage, error) {
+	query = strings.TrimSpace(query)
+	body, err := json.Marshal(searchRequestBody{
+		Query:      query,
+		Type:       "text2text",
+		MaxResults: ClampSearchMaxResults(maxResults),
+	})
+	if err != nil {
+		return nil, err
+	}
+	ctx, cancel := context.WithTimeout(ctx, searchTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.chatBase(a)+searchPath, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	c.SearchHeaders(req, a, "", ChatMeta{})
+	raw, err := c.doSearchRaw(req)
+	if err != nil {
+		return nil, err
+	}
+	return json.RawMessage(raw), nil
+}
+
+// doSearchRaw 发搜索请求并返回**未加工**的响应体。
+//
+// 与 doSearch 同口径的错误处理（HTTP >= 400 → Classify；2xx 但 code != 0 → 业务错误），
+// 差别只在于不回传解析后的结构。
+//
+// 一处与 doSearch 的**有意差异**：doSearch 在 Classify 给出 ErrNone 时兜底成
+// ErrClient（响应体里没有可判的标记），而这里必须**保留 ErrNone**——因为
+// /v1/search 要把上游的业务错误（如 15003 unsupported search provider）**原文透传**
+// 给调用方，若在此改成 ErrClient，上层会按「通用 4xx」换号并改写消息体
+// （实测会把 15003 变成 "upstream client (http 0)" 之类的含糊文案，调用方看不到真因）。
+// ErrNone 表示「这是请求级错误，换号无意义」→ 上层直接原文透传。
+func (c *Client) doSearchRaw(req *http.Request) ([]byte, error) {
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return nil, fmt.Errorf("read body: %w", err)
+	}
+	if resp.StatusCode >= 400 {
+		kind := Classify(resp.StatusCode, string(raw))
+		return nil, &Error{Kind: kind, Status: resp.StatusCode, Msg: truncate(string(raw), 200)}
+	}
+	// 200 也可以是业务错误（信封外确有 code 字段：15003/15013 实测走 400，
+	// 但服务端若改用 200 返 code，这里必须拦住，否则把错误当结果透传）。
+	var env struct {
+		Code int    `json:"code"`
+		Msg  string `json:"msg"`
+	}
+	if err := json.Unmarshal(raw, &env); err == nil && env.Code != 0 {
+		kind := Classify(resp.StatusCode, env.Msg)
+		return nil, &Error{Kind: kind, Status: resp.StatusCode,
+			Msg: fmt.Sprintf("code=%d msg=%s", env.Code, truncate(env.Msg, 160))}
+	}
+	return raw, nil
+}
+
 // doSearch 发搜索请求并解析扁平响应。
 //
 // 错误处理与 doJSON 同口径：

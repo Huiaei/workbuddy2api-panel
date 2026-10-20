@@ -152,9 +152,20 @@ func NewHandler(cfg Config) *Handler {
 	}
 	h := &Handler{cfg: cfg, mux: http.NewServeMux()}
 	h.mux.HandleFunc("POST /v1/chat/completions", h.withAuth(h.chatCompletions))
-	// 联网搜索（Anthropic Messages 兼容形态，见 messages.go）。路径刻意不占用
-	// /v1/messages——那是 Anthropic 模型对话的标准路径，留给未来的 chat 转发。
-	h.mux.HandleFunc("POST /v1/search/messages", h.withAuth(h.messages))
+	// Codex Responses 协议入站（见 responses.go）：与 /v1/chat/completions 共用同一个
+	// chatCompletions 内核，只是入站/回程的协议外壳不同。
+	h.mux.HandleFunc("POST /v1/responses", h.withAuth(h.responses))
+	// Codex 的 WS 升级探测：明确回 426，让客户端立刻粘性回落 HTTPS（不空转重试）。
+	h.mux.HandleFunc("GET /v1/responses", h.withAuth(h.responsesWebsocketUnsupported))
+	// Anthropic Messages 原生入站（见 messages.go）：官方 SDK 用 x-api-key 而非
+	// Bearer，故走 withAnthropicAuth（提升 x-api-key → Bearer 后同一套比较）。
+	h.mux.HandleFunc("POST /v1/messages", h.withAnthropicAuth(h.messages))
+	h.mux.HandleFunc("POST /messages", h.withAnthropicAuth(h.messages))
+	// 联网搜索（Anthropic Messages 兼容形态，见 search_messages.go）。路径刻意不占用
+	// /v1/messages——那是 Anthropic 模型对话的标准路径，与上面的原生入站同用。
+	h.mux.HandleFunc("POST /v1/search/messages", h.withAuth(h.searchMessages))
+	// 官方 agenttool 联网检索透传（见 search.go）：回程原样透出上游 JSON。
+	h.mux.HandleFunc("POST /v1/search", h.withAuth(h.search))
 	h.mux.HandleFunc("GET /v1/models", h.withAuth(h.models))
 	h.mux.HandleFunc("GET /status", h.withAuth(h.status))
 	h.mux.HandleFunc("GET /healthz", h.healthz)
@@ -197,16 +208,35 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // 搜索与 chat 共用同一份账本：搜索同样消耗账号额度、同样会因上游/账号问题失败，
 // 不记账等于在面板「请求记录」里完全看不见搜索流量（此前正是如此——只挂
 // /v1/chat/completions 一个硬编码路径）。
+//
+// 四条入站协议路径一视同仁：/v1/chat/completions、/v1/responses（Codex）、
+// /v1/messages（Anthropic 原生）、/v1/search/messages（搜索壳）。
+// 此前只挂 chat + 搜索两条，Codex 走 /v1/responses 时整类请求无来源、不入归档
+// （请求日志里看不见、面板统计也不计）。
 func (h *Handler) tracedRequest(r *http.Request) bool {
 	if r.Method != http.MethodPost {
 		return false
 	}
-	return r.URL.Path == "/v1/chat/completions" || isSearchPath(r.URL.Path)
+	return isChatEntry(r.URL.Path) || isSearchPath(r.URL.Path)
+}
+
+// isChatEntry 四条入站协议路径：/v1/responses 与 /v1/messages（含 /messages 别名）
+// 经 r.Clone 转进 chatCompletions 内核，与直连的 /v1/chat/completions 共用同一套
+// 行日志/归档/来源采集/X-Request-Id——四者一视同仁，别再按单路径放行。
+func isChatEntry(path string) bool {
+	switch path {
+	case "/v1/chat/completions", "/v1/responses", "/v1/messages", "/messages":
+		return true
+	}
+	return false
 }
 
 // isSearchPath 判断是否为搜索端点。
+//
+// 两个：/v1/search/messages（Anthropic 兼容搜索壳）与 /v1/search（官方 agenttool
+// 透传）。两者都是真实消耗账号额度的检索流量，都该进请求日志。
 func isSearchPath(path string) bool {
-	return path == "/v1/search/messages"
+	return path == "/v1/search/messages" || path == "/v1/search"
 }
 
 func (h *Handler) withAuth(next http.HandlerFunc) http.HandlerFunc {
