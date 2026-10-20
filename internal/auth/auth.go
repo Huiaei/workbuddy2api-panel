@@ -232,16 +232,34 @@ func (a *Auth) IsAPIKey() bool {
 func (a *Auth) UsesEnterpriseBilling() bool { return a.IsEnterprise() || a.IsAPIKey() }
 
 // SupportsPersonalGrowth 报告账号是否具备个人成长体系（签到 / 成长任务 / 连登管家 /
-// 猫猫旅行 / 夜猫子）。以下三类账号都没有该体系：
+// 猫猫旅行 / 夜猫子）。以下两类账号都没有该体系：
 //   - 企业版（IsEnterprise）：上游一律拒绝（400 code 10001 / 403 growth-only）；
-//   - 静态 API Key 账号（IsAPIKey）：根本没有个人账号身份；
-//   - 企业切换会话（token_source=enterprise_switch，见 IsEnterpriseSession）：
-//     读端点照常但行为事件被上游静默丢弃（200 不计分）——同样是零收益白跑。
+//   - 静态 API Key 账号（IsAPIKey）：根本没有个人账号身份。
 //
 // scheduler 五类任务与 panel 成长入口据此并列门控，避免对注定失败的端点空发请求。
-// 注意：读端点（签到报错、任务列表扫描）不在此列——它们的失败是显式报错。
+//
+// 注意门控分两层：本方法只判「**硬**不成长」（企业版 / API Key）——对二者连
+// **读端点**（签到、任务列表扫描）都无意义。企业切换会话（token_source=enterprise_switch）
+// 不在此列：它的读端点照常可用、失败也是显式报错，只有**行为事件**会被上游静默
+// 丢弃（200 不计分），故由 SupportsBehaviorEvents 单独判，行为类任务用它、
+// 读端点与签到不在此列（见 SupportsBehaviorEvents 注释）。
 func (a *Auth) SupportsPersonalGrowth() bool {
-	return !a.IsEnterprise() && !a.IsAPIKey() && !a.IsEnterpriseSession()
+	return !a.IsEnterprise() && !a.IsAPIKey()
+}
+
+// SupportsBehaviorEvents 报告账号的**行为事件**（活跃上报 /v2/report、成长任务
+// 执行、连登、猫猫旅行、夜猫子）是否会被上游真正记账。
+//
+// 与 SupportsPersonalGrowth 的差别只在企业切换会话（token_source=enterprise_switch，
+// 见 IsEnterpriseSession）：这类凭证的**读端点**（签到、任务列表扫描、额度查询）照常
+// 可用，但行为事件返回 200 却被上游静默丢弃（实测 2026-10-12：15 个成长任务全部
+// 0/x，90 秒内逐 15s 回读进度从不跳动）——即「读得见、记不上账」。不跳过则队列
+// 每轮白跑全部任务（含真实对话配额）且无任何报错。
+//
+// 因此：行为类任务（活跃上报 / 连登 / 旅行 / 夜猫子 / 成长任务执行）用本方法门控；
+// 签到与任务列表扫描**不在**此列——签到失败是显式报错（不静默），列表扫描实测可用。
+func (a *Auth) SupportsBehaviorEvents() bool {
+	return a.SupportsPersonalGrowth() && !a.IsEnterpriseSession()
 }
 
 // IsEnterprise 报告账号是否为企业版（auth 文件带非空 enterpriseId）。

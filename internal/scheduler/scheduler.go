@@ -556,7 +556,7 @@ func (s *Scheduler) runActivity(ctx context.Context) {
 		// 企业切换会话（token_source=enterprise_switch）同跳：report 返回 200 却被
 		// 上游静默丢弃（连登不涨），同样是零收益（见 auth.IsEnterpriseSession）。
 		// 静态 API Key 账号同跳（无个人账号身份）。
-		if !a.SupportsPersonalGrowth() {
+		if !a.SupportsBehaviorEvents() {
 			continue
 		}
 		// global 账号同样上报（PR #45 实测国际版 /v2/report 在 workbuddy.ai 上 code=0 OK，

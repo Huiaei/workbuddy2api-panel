@@ -29,7 +29,7 @@ func (s *Scheduler) RunStreakBonusNow() {
 		if a.IsGlobal() {
 			continue // D4 门控：global 无 CN 任务体系，不发起任何上游调用
 		}
-		if !a.SupportsPersonalGrowth() {
+		if !a.SupportsBehaviorEvents() {
 			continue // 企业版 / 企业切换会话 / 静态 API Key 账号门控：无成长体系（/activity/growth/streak 上游一律 403；切换会话 200 但不计分）
 		}
 		s.streakBonusAccount(a)

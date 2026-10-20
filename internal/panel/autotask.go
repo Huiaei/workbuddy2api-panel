@@ -634,8 +634,8 @@ func (p *Panel) accountTaskAuto(w http.ResponseWriter, r *http.Request) {
 	// 企业上下文门控（企业版 / 企业切换会话 / 静态 API Key 账号）：行为事件会被上游
 	// 静默丢弃或直接 403，执行任何成长任务都是零收益白跑（含真实对话配额）——直接
 	// 拒绝并给出修复路径，不再让用户对着「已上报但进度 0/x」猜原因
-	// （见 auth.SupportsPersonalGrowth / auth.IsEnterpriseSession）。
-	if !a.SupportsPersonalGrowth() {
+	// （见 auth.SupportsBehaviorEvents / auth.IsEnterpriseSession）。
+	if !a.SupportsBehaviorEvents() {
 		writeErr(w, http.StatusUnprocessableEntity,
 			"该账号为企业版/企业切换会话（token_source=enterprise_switch）或 API Key 账号，无个人成长体系，成长任务行为事件会被上游忽略；请移除账号后以个人身份重新登录")
 		return
@@ -1277,7 +1277,7 @@ func (p *Panel) accountTaskAutoAll(w http.ResponseWriter, r *http.Request) {
 	// 企业上下文门控：与 accountTaskAuto 同口径（企业版 / 企业切换会话 / API Key
 	// 账号下成长任务行为事件被上游静默丢弃，跑全量只会白耗真实对话配额）。
 	// 「一键完成全部」与单任务入口共用同一套动作，必须一并挡上。
-	if !a.SupportsPersonalGrowth() {
+	if !a.SupportsBehaviorEvents() {
 		writeErr(w, http.StatusUnprocessableEntity,
 			"该账号为企业版/企业切换会话（token_source=enterprise_switch）或 API Key 账号，无个人成长体系，成长任务行为事件会被上游忽略；请移除账号后以个人身份重新登录")
 		return
