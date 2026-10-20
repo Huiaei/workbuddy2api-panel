@@ -98,18 +98,20 @@ func (h *Handler) search(w http.ResponseWriter, r *http.Request) {
 		if !h.cfg.Pool.Acquire(a.UID) {
 			continue
 		}
-		var data json.RawMessage
-		var err error
-		if req.Deep {
-			// 综述式单次 40~66s（实测），给它独立的上限而不是无界等待：
-			// 租约最多被占这么久，账号不会因为一次综述被长期扣住。
-			ctx, cancel := context.WithTimeout(r.Context(), agenticSearchBudget)
-			data, err = h.cfg.Upstream.AgenticSearch(ctx, a, query)
-			cancel()
-		} else {
-			data, err = h.cfg.Upstream.SearchRaw(r.Context(), a, query, req.MaxResults)
-		}
-		h.cfg.Pool.Release(a.UID)
+		// 租约作用域 = 单次尝试：闭包内的 defer 覆盖「传输失败 / 上游 ≥400 /
+		// ctx 取消 / 综述超时 / 写响应失败 / panic 展开」全部出口，
+		// 保证名额一定归还、不会把账号长期扣住。
+		data, err := func() (json.RawMessage, error) {
+			defer h.cfg.Pool.Release(a.UID)
+			if req.Deep {
+				// 综述式单次 40~66s（实测），给它独立的上限而不是无界等待：
+				// 租约最多被占这么久，账号不会因为一次综述被长期扣住。
+				ctx, cancel := context.WithTimeout(r.Context(), agenticSearchBudget)
+				defer cancel()
+				return h.cfg.Upstream.AgenticSearch(ctx, a, query)
+			}
+			return h.cfg.Upstream.SearchRaw(r.Context(), a, query, req.MaxResults)
+		}()
 		if err == nil {
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write(data)
