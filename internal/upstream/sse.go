@@ -482,6 +482,21 @@ type StreamOption func(*streamOptions)
 
 type streamOptions struct {
 	onErrorFrame func(payload string)
+	// frameObserver 旁路观察每个上游帧（原始 chunk 对象）。纯观测：不改任何
+	// 透传字节、不影响帧计数。用于「零 tool_calls 停摆」判定（issue #149）。
+	frameObserver func(obj map[string]any)
+}
+
+// WithFrameObserver 注册一个**逐帧旁路观察者**：每个解析成功的上游 chunk 对象
+// 交给它看一眼。透传字节逐字节不变（观察者只读不改对象）。
+//
+// 用途（issue #149）：判定「请求声明了 tools，但模型只回正文并以 stop 收尾」
+// 这种停摆形态。流式路径无法在整轮结束后再决定重试（帧已写给客户端），
+// 但观察者能给出统一的停摆判定口径，供请求日志与告警使用。
+//
+// 非 JSON 帧不会回调（无法解析成对象）。error 帧**会**回调（它也是合法 JSON）。
+func WithFrameObserver(fn func(obj map[string]any)) StreamOption {
+	return func(o *streamOptions) { o.frameObserver = fn }
 }
 
 // WithErrorFrameObserver 注册"上游以 error 帧报错"的观察者：透传该帧之前先用
@@ -573,6 +588,12 @@ func StreamHint(w http.ResponseWriter, r io.Reader, hintFn func(string) string, 
 			}
 			if raw, err := json.Marshal(normalizeFrame(obj)); err == nil {
 				payload = string(raw)
+			}
+			// 逐帧观察者（issue #149 停摆判定）：只看原始上游帧——判定口径必须是
+			// 「上游真的吐了 tool_calls 吗」，而不是「网关规范化之后有没有」。
+			// 纯观测，不改透传字节。非 JSON 帧不会走到这里（不回调）。
+			if o.frameObserver != nil {
+				o.frameObserver(obj)
 			}
 			valid = 1
 		}

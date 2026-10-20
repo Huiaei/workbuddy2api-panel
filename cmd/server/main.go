@@ -380,6 +380,9 @@ func main() {
 		// 模型黑名单原始条目；运行期以 livecfg 快照为准（热生效），此处供
 		// Live 为 nil 的裸用/测试路径。
 		ModelsHidden: cfg.Models.Hidden,
+		// 零 tool_calls 停摆重试（issue #149）：非流式请求声明了 tools 却收到
+		// 「只回正文 + stop 收尾」时换号再问一次。**不罚账号**（上游行为缺陷）。
+		ToolStallRetry: cfg.Upstream.ToolStallRetry,
 	})
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -626,6 +629,9 @@ func restartRequiredFields(current, next *Config) []string {
 	changed("upstream.device_token", current.Upstream.DeviceToken, next.Upstream.DeviceToken)
 	changed("upstream.device_token_file", current.Upstream.DeviceTokenFile, next.Upstream.DeviceTokenFile)
 	changed("upstream.passthrough_ip", current.Upstream.PassthroughIP, next.Upstream.PassthroughIP)
+	// 零 tool_calls 停摆重试（issue #149）：装配期读进 server.Config，进程内不再
+	// 读取——改了必须重启才生效（漏列会让面板显示「已保存」却不生效）。
+	changed("upstream.tool_stall_retry", current.Upstream.ToolStallRetry, next.Upstream.ToolStallRetry)
 	changed("global.enabled", current.Global.Enabled, next.Global.Enabled)
 	changed("global.chat_base", current.Global.ChatBase, next.Global.ChatBase)
 	changed("global.billing_base", current.Global.BillingBase, next.Global.BillingBase)

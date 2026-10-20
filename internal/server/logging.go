@@ -71,6 +71,12 @@ type chatStat struct {
 	clientIP  string
 	userAgent string
 
+	// 零 tool_calls 停摆观测（issue #149）：请求声明了 tools，模型却只回正文并
+	// 以 stop 收尾（工具一次没跑）。toolStall=true 表示本轮命中该形态；
+	// toolStallText 是当时的正文字数（仅观测，不参与判定）。
+	toolStall     bool
+	toolStallText int
+
 	logged bool
 }
 
@@ -497,6 +503,8 @@ func (t *requestTrace) event(status int) reqlog.Event {
 		e.HasCredit = s.hasCredit
 		e.CacheHitTokens = s.cacheHit
 		e.CacheMissTokens = s.cacheMiss
+		e.ToolStall = s.toolStall
+		e.ToolStallText = s.toolStallText
 	}
 	e.ClientIP = t.clientIP
 	e.UserAgent = t.userAgent

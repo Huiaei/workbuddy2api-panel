@@ -168,6 +168,18 @@ type Config struct {
 		DeviceTokenFile string `json:"device_token_file"`
 		// PassthroughIP 是否透传客户端 IP 给上游（默认 false，反代安全边界）。
 		PassthroughIP bool `json:"passthrough_ip"`
+		// ToolStallRetry 非流式请求命中「声明了 tools 却零 tool_calls 且 stop 收尾」
+		// 时的自动重试次数（issue #149）。0 = 关闭重试（仍记录观测）。
+		//
+		// 这是**上游行为缺陷**（模型只说了话就收尾，工具一次没跑），不是账号问题，
+		// 所以重试**不罚账号**：只换号再问一次。实测停摆率约 13%~25%（按模型不同），
+		// 一次重试通常能换到正常的一轮。
+		//
+		// 为什么默认 1 而不是 0：零重试等于把停摆原样交给客户端，客户端按
+		// 「正常完成」收尾 → 工具没跑、任务停在原地，用户必须手动催一句。
+		// 一次重试的成本是一次上游调用，换来的是这一轮真的把工具跑起来。
+		// 上限由 normalize() 钳到 3（再高会明显放大上游消耗）。
+		ToolStallRetry int `json:"tool_stall_retry"`
 	} `json:"upstream"`
 
 	Features struct {
@@ -323,6 +335,9 @@ func Default() *Config {
 	// HeaderTimeoutSeconds/IdleTimeoutSeconds 默认 0（未设置态），回落见 normalize()。
 	c.Upstream.HeaderTimeoutSeconds = 0
 	c.Upstream.IdleTimeoutSeconds = 0
+	// ToolStallRetry 缺省 1（issue #149）：非流式请求声明了 tools 却收到「只回正文
+	// + stop 收尾」时换号再问一次（不罚账号）。0 = 关闭重试（仍记录观测）。
+	c.Upstream.ToolStallRetry = 1
 	// Global.Enabled 缺省 true（纯 CN 行为不变：CN 账号恒判 cn，global base 不被使用）；
 	// ChatBase/BillingBase 缺省空（回落内置默认）。
 	c.Global.Enabled = true
@@ -634,6 +649,14 @@ func (c *Config) normalize() error {
 	// 积分保底：负值钳 0（= 关闭）。0 是合法默认（关闭），无需空值回落。
 	if c.Pool.CreditFloor < 0 {
 		c.Pool.CreditFloor = 0
+	}
+	// 零 tool_calls 停摆重试（issue #149）：负值钳 0（= 关闭）；上限 3（再高会
+	// 明显放大上游消耗，且实测一次重试通常就能换到正常的一轮）。
+	if c.Upstream.ToolStallRetry < 0 {
+		c.Upstream.ToolStallRetry = 0
+	}
+	if c.Upstream.ToolStallRetry > 3 {
+		c.Upstream.ToolStallRetry = 3
 	}
 	// 积分燃尽熔断（issue #229）：阈值 <= 0 = 关闭（默认，零回归）。
 	if c.Pool.BurnGuardLimit < 0 {

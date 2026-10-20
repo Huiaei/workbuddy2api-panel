@@ -84,6 +84,11 @@ type Event struct {
 	CacheMissTokens int64 `json:"cache_miss_tokens,omitempty"`
 	ClientIP         string    `json:"client_ip,omitempty"`
 	UserAgent        string    `json:"user_agent,omitempty"`
+	// ToolStall 标记本次请求命中「零 tool_calls 停摆」（issue #149）：请求声明了
+	// tools，模型却只回正文并以 stop 收尾（工具一次没跑）。true = 命中。
+	// ToolStallText 是当时的正文字数（仅观测，不参与判定）。
+	ToolStall     bool `json:"tool_stall,omitempty"`
+	ToolStallText int  `json:"tool_stall_text,omitempty"`
 }
 
 // Filter 用于从归档中筛选最近记录。字符串字段一律「包含」匹配（大小写不敏感），
