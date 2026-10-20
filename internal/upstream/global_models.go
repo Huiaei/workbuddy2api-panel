@@ -59,6 +59,46 @@ type fetchGlobalModelsCache struct {
 	infos    []ModelInfo // 成功缓存：对象形态的全字段条目（窄表/失败形态为 nil）
 	fetched  time.Time
 	lastFail time.Time
+	// source 本次成功探测的目录来源：globalCatalogSourceDesktop / ...Union /
+	// ...Enterprise。面板用它把「拿到的是窄目录/旧目录」直接摆给运维看
+	//（issue #216 现象 1 就是 v3 探测失败静默降级到企业端点，用户只看到
+	//「少了 11 个模型」，却不知道自己拿的是哪一套目录）。
+	source string
+}
+
+// 目录来源标识（fetchGlobalModelsCache.source）。
+const (
+	globalCatalogSourceDesktop    = "v3-desktop" // 桌面端 UA 族权威目录（官方 picker 口径）
+	globalCatalogSourceUnion      = "v3-union"   // 桌面族探测失败的回落：IDE+CLI 并集
+	globalCatalogSourceEnterprise = "enterprise" // v3 全失败，只剩企业端点（窄目录 + 旧倍率）
+)
+
+// GlobalCatalogSource 返回最近一次成功探测的目录来源（空 = 尚未探测）。
+func (c *Client) GlobalCatalogSource() string {
+	if c == nil {
+		return ""
+	}
+	c.globalModels.Lock()
+	defer c.globalModels.Unlock()
+	return c.globalModels.source
+}
+
+// InvalidateGlobalModelsCache 清空 global 目录探测缓存（names/infos/成功与失败
+// 时间戳/来源），使下一次 FetchGlobalModels/FetchGlobalModelInfos 立即重新探测上游。
+//
+// 存在理由：面板「模型与档位 → 重新获取」此前只是重读 1h 缓存，点了数量纹丝不动
+// （issue #216 现象 3）。上游目录变动后运维需要一个立即生效的按钮，而不是等 TTL。
+func (c *Client) InvalidateGlobalModelsCache() {
+	if c == nil {
+		return
+	}
+	c.globalModels.Lock()
+	defer c.globalModels.Unlock()
+	c.globalModels.names = nil
+	c.globalModels.infos = nil
+	c.globalModels.fetched = time.Time{}
+	c.globalModels.lastFail = time.Time{}
+	c.globalModels.source = ""
 }
 
 // globalModelsTTL / globalModelsFailCooldown 探测缓存时长：成功 1h，失败 5min 负缓存。
@@ -120,7 +160,7 @@ func (c *Client) fetchGlobalModelsOnce(a *auth.Auth) (names []string, infos []Mo
 	}
 	c.globalModels.Unlock()
 
-	names, infos, efforts, defaults, err := c.probeGlobalModels(a)
+	names, infos, efforts, defaults, source, err := c.probeGlobalModels(a)
 	if err != nil || len(names) == 0 {
 		// 探测失败：负缓存 + 返回 nil（effort 桶不写，prepareBody 走 globalEffortMap 静态兜底）。
 		c.globalModels.Lock()
@@ -155,11 +195,26 @@ func (c *Client) fetchGlobalModelsOnce(a *auth.Auth) (names []string, infos []Mo
 	c.globalModels.infos = infos
 	c.globalModels.fetched = time.Now()
 	c.globalModels.lastFail = time.Time{}
+	c.globalModels.source = source
 	c.globalModels.Unlock()
 	return merged, infos
 }
 
-// probeGlobalModels 发起一次 global 模型目录探测（v3-config-merge + desktop-ua）：
+// desktopProbeUA /v3/config 第三路（桌面端形态）探测用的 UA。
+//
+// 该端点按 UA 家族下发不同目录，三族各有独有模型（2026-10-03 实测，同一账号
+// 同一端点：CN IDE 19 / CLI 32 / 桌面端 54，global 13 / 22 / 29）。global 侧
+// gpt-6-luna 只在桌面端目录出现，但请求实测可正常返回 200——只探 IDE + CLI 时
+// 它永远进不了 /v1/models（用户侧表现为「模型列表不全」）。版本号升降不改结果
+// （IDE 4.12→5.0、CLI 2.63→2.80 目录条数一致），故只补家族。
+//
+// 平台段固定用 CN 形态（`WorkBuddy`，= defaultWorkBuddyUAFor(nil)）：本次实测即
+// 该形态、两个 base 都返回最大目录；global 形态未实测，不臆造。
+func (c *Client) desktopProbeUA() string {
+	return c.defaultWorkBuddyUAFor(nil)
+}
+
+// probeGlobalModels 发起一次 global 模型目录探测（v3-config-merge）：
 // /v3/config（三路 UA：桌面端主路 + IDE + CLI）与企业端点家族（/v2 → /console 兜底，
 // 补缺）**并发**探测后并集合并。返回模型名列表（已合并、未再去重——去重在
 // fetchGlobalModelsOnce）、全字段 ModelInfo（对象形态；窄表为 nil）及 effort
@@ -175,7 +230,7 @@ func (c *Client) fetchGlobalModelsOnce(a *auth.Auth) (names []string, infos []Mo
 // 合并口径：桌面端条目字段权威，IDE/CLI 只补桌面端缺失的模型 id；去重 key =
 // 模型 id，输出顺序稳定。全部 v3 路失败且企业端点也失败才返回错误；单路失败
 // 降级为其余路结果 + warn 日志，互不拖累。
-func (c *Client) probeGlobalModels(a *auth.Auth) (names []string, infos []ModelInfo, efforts map[string][]string, defaults map[string]string, err error) {
+func (c *Client) probeGlobalModels(a *auth.Auth) (names []string, infos []ModelInfo, efforts map[string][]string, defaults map[string]string, source string, err error) {
 	// probeV3 单次 /v3/config 探测（UA 参数化）。该端点对不同 UA 下发**不同模型集合**：
 	// 桌面端 / IDE / CLI 三路各有独有模型（见 probeGlobalModels 注释），故并发三路取并集。
 	probeV3 := func(ua string) chan probeResult {
@@ -201,11 +256,22 @@ func (c *Client) probeGlobalModels(a *auth.Auth) (names []string, infos []ModelI
 		}()
 		return ch
 	}
-	// 桌面端 UA（主路）：项目 chat 路径实际使用的 UA，与官方客户端看到的目录同源。
-	// 按账号 realm 生成（global → `WorkBuddy AI` 平台段），故必须传 a 而非用常量。
-	v3DesktopCh := probeV3(c.defaultWorkBuddyUAFor(a))
-	v3IDECh := probeV3(codeBuddyIDEUA)
-	v3CLICh := probeV3(codeBuddyCLIUA)
+	// 三路 UA 都必须是**官方真实出现过**的形态：旧实现在这里发
+	// `CodeBuddyIDE/4.12.0 CodeBuddy/4.12.0` 与 `CLI/2.63.2 CodeBuddy/2.63.2`
+	// 两套 CodeBuddy 家族串——那是旧版 IDE 客户端的 UA，WorkBuddy 分发包里根本
+	// 不存在，属于最显眼的非官方指纹（真机抓包对照：CN 5.8.3 全链路发
+	// `WorkBuddy/5.8.3 WorkBuddy/5.8.3 CLI/2.161.0`，global 5.8.4 发
+	// `workbuddy-ai/5.8.4 workbuddy-ai/5.8.4 CLI/2.161.0`）。
+	//
+	// 三路按「客户端形态」分工：IDE 族（v3ProbeUA）/ CLI 族（v3ProbeUALite）/
+	// 桌面端族（desktopProbeUA）。该端点按 UA 家族下发**不同模型集合**
+	// （实测同一账号同一端点：CN 19 / 32 / 54 条，global 13 / 22 / 29 条），
+	// 三族各有独有模型，缺一路就少一批模型（issue #216）。
+	v3IDECh := probeV3(c.v3ProbeUA(a))
+	v3CLICh := probeV3(c.v3ProbeUALite(a))
+	// 第三路：桌面端形态。缺它就会漏掉仅桌面端下发的模型——global 侧 gpt-6-luna
+	// 即此例（目录里没有、实际可调用），用户侧表现为「模型列表不全」。
+	v3DesktopCh := probeV3(c.desktopProbeUA())
 	enterpriseCh := make(chan probeResult, 1)
 	go func() {
 		// 企业端点家族：/v2 首选 → /console 兜底（既有探活序，零回归）。
@@ -225,32 +291,84 @@ func (c *Client) probeGlobalModels(a *auth.Auth) (names []string, infos []ModelI
 	v3IDE := <-v3IDECh
 	v3CLI := <-v3CLICh
 	enterprise := <-enterpriseCh
-	// v3 三路自合并：桌面端路字段权威（主路），IDE/CLI 只补主路缺失的模型 id
-	// （只补 id，字段仍取自各自条目——主路没有该 id 时才轮到它们）。
-	// 逐路容错：全失败才带 err 进入下游降级判断，部分失败 warn 后继续。
-	v3 := mergeV3Routes([]struct {
+	// v3 三路自合并：**桌面端 UA 族是目录权威**（issue #216）——官方桌面端 picker
+	// 就是这一族，2026-10-17 实测 global 侧桌面族 27 条与 picker 一一对应；而
+	// IDE/CLI 族的独有模型（o4-mini / auto-chat / deep-model）在同一 chat 端点回
+	// 11102「service info not found」——列出来只会让客户端选到死模型。
+	//
+	// 故：桌面族成功时**模型 id 只取桌面族**；IDE/CLI 族降级为元数据（context/
+	// efforts/credits 缺字段时补），不再贡献 id。桌面族探测失败时回落并集语义
+	// （宁可多列也不空表），来源标成 union，面板据此提示「拿到的是回落目录」。
+	var okProbes []probeResult
+	for _, p := range []struct {
 		label string
 		res   probeResult
 	}{
 		{"desktop-UA", v3Desktop},
 		{"IDE-UA", v3IDE},
 		{"CLI-UA", v3CLI},
-	})
+	} {
+		if p.res.err != nil {
+			log.Printf("WARN: [upstream] global models: v3/config %s probe failed: %v", p.label, p.res.err)
+			continue
+		}
+		okProbes = append(okProbes, p.res)
+	}
+	var v3 probeResult
+	// catalogSource 记录本次目录由哪一族给出（写入缓存供面板展示）。
+	catalogSource := globalCatalogSourceDesktop
+	switch {
+	case len(okProbes) == 0:
+		// 三路全失败：err 非空，下游按既有「v3 失败」分支降级或负缓存。
+		v3 = probeResult{err: v3Desktop.err}
+	case v3Desktop.err == nil:
+		v3 = probeResult{names: v3Desktop.names, infos: v3Desktop.infos}
+		var enrichSources [][]ModelInfo
+		if v3IDE.err == nil {
+			enrichSources = append(enrichSources, v3IDE.infos)
+		}
+		if v3CLI.err == nil {
+			enrichSources = append(enrichSources, v3CLI.infos)
+		}
+		if len(enrichSources) > 0 {
+			v3.infos = enrichModelInfos(v3.infos, enrichSources...)
+		}
+	case len(okProbes) == 1:
+		v3 = okProbes[0]
+		catalogSource = globalCatalogSourceUnion
+	default:
+		// 桌面族探测失败（或未返回）：回落既有并集语义。
+		vn, vi := okProbes[0].names, okProbes[0].infos
+		for _, p := range okProbes[1:] {
+			vn, vi = mergeGlobalCatalog(vn, vi, p.names, p.infos)
+		}
+		v3 = probeResult{names: vn, infos: vi}
+		catalogSource = globalCatalogSourceUnion
+	}
 
 	if v3.err != nil && enterprise.err != nil {
 		// 两路全失败 → 负缓存语义（等价原家族端点全非 2xx）。
-		return nil, nil, nil, nil, v3.err
+		return nil, nil, nil, nil, "", v3.err
 	}
 	if v3.err != nil {
 		// /v3 失败降级：不拖累企业端点结果（降级仅企业端点 + warn）。
+		// 这条路径就是 issue #216 的现场：企业端点只有 18 条旧目录，且 hy4-preview
+		// 的 credits 在那里是 x0.00（v3 是 x0.29）——来源必须能被面板看见，否则
+		// 用户只会看到「模型少了 11 个、倍率是 0」而不知道是降级。
 		log.Printf("WARN: [upstream] global models: v3/config probe failed (degraded to enterprise endpoint): %v", v3.err)
 		names, infos, efforts, defaults = extractEfforts(enterprise.infos)
-		return names, infos, efforts, defaults, nil
+		if len(names) == 0 {
+			names = enterprise.names
+		}
+		return names, infos, efforts, defaults, globalCatalogSourceEnterprise, nil
 	}
 	if enterprise.err != nil {
 		log.Printf("WARN: [upstream] global models: enterprise endpoint failed (v3/config only): %v", enterprise.err)
 		names, infos, efforts, defaults = extractEfforts(v3.infos)
-		return names, infos, efforts, defaults, nil
+		if len(names) == 0 {
+			names = v3.names
+		}
+		return names, infos, efforts, defaults, catalogSource, nil
 	}
 	// 两路皆成功：v3 为主、企业端点补缺合并（含 effort 桶合并，v3 权威）。
 	v3Names, v3Infos, v3Efforts, v3Defaults := extractEfforts(v3.infos)
@@ -261,10 +379,76 @@ func (c *Client) probeGlobalModels(a *auth.Auth) (names []string, infos []ModelI
 	if len(entNames) == 0 {
 		entNames = enterprise.names
 	}
-	names, infos = mergeGlobalCatalog(v3Names, v3Infos, entNames, entInfos)
+	if catalogSource == globalCatalogSourceDesktop {
+		// 桌面族权威：企业端点**不贡献 id**（它带着 deep-model / gpt-5.3-codex 这类
+		// 已下架或 11102 的旧条目），只按同 id 补元数据（它给的 credits 也可能过期，
+		// 故只补缺失字段，不覆盖桌面族已有值）。
+		names, infos = v3Names, enrichModelInfos(v3Infos, entInfos)
+	} else {
+		names, infos = mergeGlobalCatalog(v3Names, v3Infos, entNames, entInfos)
+	}
 	efforts = mergeEffortBuckets(v3Efforts, entEfforts)
 	defaults = mergeEffortDefaults(v3Defaults, entDefaults)
-	return names, infos, efforts, defaults, nil
+	return names, infos, efforts, defaults, catalogSource, nil
+}
+
+// enrichModelInfos 仅按同 id 补元数据：base 里已有非零值的字段一律保留（base 权威），
+// 缺字段才从后续来源取第一个非零值。**不新增 id**——这是与 mergeGlobalCatalog 的关键
+// 差别：issue #216 要求模型目录对齐官方桌面端 picker，别的 UA 族/企业端点只用来给
+// 同一批模型补 context/efforts/credits 等字段。
+func enrichModelInfos(base []ModelInfo, sources ...[]ModelInfo) []ModelInfo {
+	if len(base) == 0 || len(sources) == 0 {
+		return base
+	}
+	index := make(map[string]ModelInfo, len(sources[0]))
+	for _, src := range sources {
+		for _, mi := range src {
+			if mi.ID == "" {
+				continue
+			}
+			if _, ok := index[mi.ID]; !ok {
+				index[mi.ID] = mi
+			}
+		}
+	}
+	out := make([]ModelInfo, 0, len(base))
+	for _, mi := range base {
+		other, ok := index[mi.ID]
+		if !ok {
+			out = append(out, mi)
+			continue
+		}
+		merged := mi
+		if merged.MaxTokens == 0 {
+			merged.MaxTokens = other.MaxTokens
+		}
+		if merged.ContextWindow == 0 {
+			merged.ContextWindow = other.ContextWindow
+		}
+		if merged.MaxAllowedSize == 0 {
+			merged.MaxAllowedSize = other.MaxAllowedSize
+		}
+		if merged.Credits == "" {
+			merged.Credits = other.Credits
+		}
+		if len(merged.Efforts) == 0 {
+			merged.Efforts = other.Efforts
+		}
+		if merged.DefaultEffort == "" {
+			merged.DefaultEffort = other.DefaultEffort
+		}
+		if merged.Description == "" {
+			merged.Description = other.Description
+		}
+		if len(merged.Tags) == 0 {
+			merged.Tags = other.Tags
+		}
+		if merged.Vendor == "" {
+			merged.Vendor = other.Vendor
+		}
+		out = append(out, merged)
+	}
+	return out
 }
 
 // probeResult 单路模型目录探测结果（/v3/config 某 UA 路，或企业端点家族）。

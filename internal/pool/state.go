@@ -139,11 +139,12 @@ func (p *Pool) ReenableIfCredits(uid string, remain, total int64) {
 			e.credits = remain
 			e.creditsTotal = total
 		}
-		// ReenableIfCredits 只有聚合余额上下文；到期明细必须由 SetCreditsDetailed
+		// ReenableIfCredits 只有聚合余额上下文；到期明细必须由 SetCreditsSnapshot
 		// 重新写入，不能沿用旧窗口/旧批次的缓存。
 		e.creditsExpiring = 0
 		e.creditsEarliestExpiry = time.Time{}
 		e.creditsEarliestRemaining = 0
+		e.expiryBuckets = nil
 		p.dirty.Store(true)
 	}
 }
@@ -233,14 +234,7 @@ func (p *Pool) NoteModelCost(uid, model string, credit float64, tokens int) {
 				e.creditsExpiring -= d
 			}
 		}
-		if e.creditsEarliestRemaining > 0 {
-			if d >= e.creditsEarliestRemaining {
-				e.creditsEarliestRemaining = 0
-				e.creditsEarliestExpiry = time.Time{}
-			} else {
-				e.creditsEarliestRemaining -= d
-			}
-		}
+		p.deductExpiryLocked(e, d)
 	}
 	if e.modelCost == nil {
 		e.modelCost = make(map[string]modelCostEntry)
@@ -262,6 +256,58 @@ func (p *Pool) NoteModelCost(uid, model string, credit float64, tokens int) {
 		}
 	}
 	p.dirty.Store(true) // 账本已持久化：写入口统一置脏
+}
+
+// deductExpiryLocked 按 FEFO 近似扣减到期快照：先从最早的自然日桶扣，扣穿再顺延。
+// 有 buckets 时同步重算 earliestAt/earliestRemaining（下一桶的 ExpireAt 成为新最早批次），
+// 使两次余额刷新之间的首页快照仍随用量收敛；无 buckets（旧状态/测试只写了聚合字段）
+// 时退回只扣最早一批。调用方必须已持有 p.mu。
+func (p *Pool) deductExpiryLocked(e *entry, d int64) {
+	if d <= 0 {
+		return
+	}
+	if len(e.expiryBuckets) == 0 {
+		if e.creditsEarliestRemaining > 0 {
+			if d >= e.creditsEarliestRemaining {
+				e.creditsEarliestRemaining = 0
+				e.creditsEarliestExpiry = time.Time{}
+			} else {
+				e.creditsEarliestRemaining -= d
+			}
+		}
+		return
+	}
+	left := d
+	for i := range e.expiryBuckets {
+		if left == 0 {
+			break
+		}
+		b := &e.expiryBuckets[i]
+		if b.Remain <= 0 {
+			continue
+		}
+		take := b.Remain
+		if take > left {
+			take = left
+		}
+		b.Remain -= take
+		left -= take
+	}
+	// 清掉被扣穿的桶（保持升序；切片原地过滤）。
+	out := e.expiryBuckets[:0]
+	for _, b := range e.expiryBuckets {
+		if b.Remain > 0 {
+			out = append(out, b)
+		}
+	}
+	e.expiryBuckets = out
+	if len(e.expiryBuckets) > 0 {
+		e.creditsEarliestExpiry = e.expiryBuckets[0].ExpireAt
+		e.creditsEarliestRemaining = e.expiryBuckets[0].Remain
+	} else {
+		e.creditsEarliestExpiry = time.Time{}
+		e.creditsEarliestRemaining = 0
+	}
 }
 
 // RecordTokenUsage 记录一次实际发起的聊天账号尝试及上游返回的 usage 增量。
@@ -340,6 +386,10 @@ func (p *Pool) AvailableUIDs() []string {
 		if !e.healthy(now) {
 			continue
 		}
+		// 积分燃尽熔断（issue #229）：熔断号不参与选号。
+		if p.burnBlocked(e, now) {
+			continue
+		}
 		if p.inFlightFull(e) {
 			continue
 		}
@@ -359,6 +409,10 @@ func (p *Pool) AvailableUIDsForModel(model string) []string {
 	uids := make([]string, 0, len(p.byUID))
 	for uid, e := range p.byUID {
 		if !e.healthyForModel(now, model) {
+			continue
+		}
+		// 积分燃尽熔断（issue #229）：熔断号不参与选号。
+		if p.burnBlocked(e, now) {
 			continue
 		}
 		if p.inFlightFull(e) {
@@ -383,6 +437,13 @@ func (p *Pool) PickByUIDForModel(uid, model string) *auth.Auth {
 	}
 	now := time.Now()
 	if !e.healthyForModel(now, model) {
+		return nil
+	}
+	// 积分燃尽熔断（issue #229）：粘性号在熔断期内同样不可用 → 解绑走普通轮换，
+	// 让流量落到未熔断的账号上，而不是继续在一个已超阈值的号上烧。
+	if p.burnBlocked(e, now) {
+		log.Printf("WARN: [pool] burn guard: sticky acct=%s unbind (%s)",
+			logfmt.Label(e.a.UID, e.a.Nickname), p.burnReason(e.a.UID, now))
 		return nil
 	}
 	// 积分保底（粘性路径）：与 pick 的 floorBlocked 同判据——触底 + 收费即拦
@@ -416,6 +477,10 @@ func (p *Pool) PickByUID(uid string) *auth.Auth {
 	}
 	now := time.Now()
 	if !e.healthy(now) {
+		return nil
+	}
+	// 积分燃尽熔断（issue #229）：熔断号不可被直取（粘性快路径）。
+	if p.burnBlocked(e, now) {
 		return nil
 	}
 	if p.inFlightFull(e) {
@@ -512,6 +577,11 @@ func (p *Pool) ServableForRealm(realm string) bool {
 		if p.inFlightFull(e) {
 			continue
 		}
+		// 积分燃尽熔断（issue #229）：熔断号不可服务（与 pick 口径一致），
+		// 否则探活会误报「可服务」而 chat 实际选不出号。
+		if p.burnBlocked(e, now) {
+			continue
+		}
 		// 存在性语义：账号级 healthy，或处于模型级豁免形态（6004 单模型软冷却——
 		// 对触发模型不可用，对其他模型仍可选）。探活无请求模型上下文，取"存在可服务
 		// 模型"与 chat 实际可达性等价（issue #31 探活侧补齐）。
@@ -548,30 +618,41 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 		RateLimitedModels:        p.rateLimitedModelsLocked(e, now),
 		Realm:                    e.a.Realm(),
 		Enterprise:               e.a.IsEnterprise(),
+		APIKey:                   e.a.IsAPIKey(),
 		Nickname:                 e.a.Nickname,
 		Credits:                  e.credits,
 		CreditsTotal:             e.creditsTotal,
 		CreditsExpiring:          e.creditsExpiring,
 		CreditsEarliestExpiry:    e.creditsEarliestExpiry,
 		CreditsEarliestRemaining: e.creditsEarliestRemaining,
-		Cooling:                  now.Before(e.until) || now.Before(e.breakerUntil),
-		Reason:                   e.reason,
-		Disabled:                 e.disabled,
-		Paused:                   e.paused,
-		SuccessCount:             e.successCount,
-		ErrTotal:                 e.errTotal,
-		CheckinDone:              e.lastCheckinDay == now.Format("2006-01-02"),
-		TokenUsage:               e.tokenUsage,
-		LastSuccessTime:          e.lastSuccess,
-		LastErrTime:              e.lastErr,
-		Until:                    e.until,
-		SoftStreak:               e.softStreak,
-		ModelCosts:               p.modelCostsStatusLocked(e, now),
-		ConsecutiveFails:         e.consecutiveFails,
-		DegradeUntil:             e.degradeUntil,
-		InFlight:                 int(e.inFlight.Load()),
-		BreakerFails:             e.fails,
-		BreakerUntil:             e.breakerUntil,
+		// 拷贝一份：List 返回后 JSON 序列化在锁外进行，不能与 NoteModelCost 的
+		// 原地扣减共享底层数组（数据竞争）。
+		CreditsExpiryBuckets: append([]ExpiryBucket(nil), e.expiryBuckets...),
+		Cooling:              now.Before(e.until) || now.Before(e.breakerUntil),
+		Disabled:             e.disabled,
+		Paused:               e.paused,
+		SuccessCount:         e.successCount,
+		ErrTotal:             e.errTotal,
+		CheckinDone:          e.lastCheckinDay == now.Format("2006-01-02"),
+		TokenUsage:           e.tokenUsage,
+		LastSuccessTime:      e.lastSuccess,
+		LastErrTime:          e.lastErr,
+		Until:                e.until,
+		SoftStreak:           e.softStreak,
+		ModelCosts:           p.modelCostsStatusLocked(e, now),
+		ConsecutiveFails:     e.consecutiveFails,
+		DegradeUntil:         e.degradeUntil,
+		InFlight:             int(e.inFlight.Load()),
+		BreakerFails:         e.fails,
+		BreakerUntil:         e.breakerUntil,
+	}
+	// reason 仅在冷却/禁用中透出（issue #171）：软冷却按 until 到期恢复，
+	// 但 until/coolKind/reason 字段按设计不主动清理（NoteSuccess 注释：
+	// 「不碰 until/coolKind，那些是即时冷却，各自到期」）。无条件透出会让
+	// 面板把过期数天的「429 rate limit」与「可用」并排展示，运维无法判断
+	// 是历史残留还是当前限流。禁用原因仍由 DisabledReason 透出。
+	if st.Cooling || st.Disabled {
+		st.Reason = e.reason
 	}
 	if st.Disabled {
 		// 禁用账号透出禁用原因（运维看不到为什么死）。
@@ -596,6 +677,17 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 		st.CoolRemaining = remaining
 		if st.CoolKind == "" {
 			st.CoolKind = e.coolKind.String()
+		}
+	}
+	// 积分燃尽熔断（issue #229）：熔断中的账号同样「不可选」，但它不是
+	// 软/硬冷却（不会自动解除，也不进 cooldown 台账），故单独透出原因，
+	// 面板据此显示「积分燃尽熔断」而不是笼统的「不可用」。
+	if br := p.burnReason(uid, now); br != "" {
+		st.Cooling = true
+		st.CoolKind = "burn"
+		st.Reason = br
+		if r := int64(time.Until(p.burnGuard[uid].until).Seconds() + 0.999); r > 0 {
+			st.CoolRemaining = r
 		}
 	}
 	return st

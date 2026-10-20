@@ -6,12 +6,14 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/prompt"
 )
 
@@ -106,6 +108,13 @@ type Config struct {
 		// 解冻语义同签到（余额 > 0 的冷却账号自动解冻），但不做签到不刷 token。
 		BalanceRefreshEnabled bool `json:"balance_refresh_enabled"` // 缺省 true；false = 关闭
 		BalanceRefreshMinutes int  `json:"balance_refresh_minutes"` // 缺省 5；<=0 回落 5
+
+		// 任务补领清扫（issue #174）：周期把「已达标但未领奖」的成长任务领掉——
+		// 这条链路此前完全缺失（成长队列要求有自动动作、一键完成对达标任务直接跳过），
+		// 导致积分长期卡在 2000/2100/2300 上不去 4000。
+		// 只做 accept/claim 两条幂等请求，不跑任何行为链路；分钟级开销可忽略。
+		TaskSweepEnabled bool `json:"task_sweep_enabled"` // 缺省 true；false = 关闭
+		TaskSweepMinutes int  `json:"task_sweep_minutes"` // 缺省 15；<=0 回落 15
 	} `json:"schedule"`
 
 	Global struct {
@@ -120,6 +129,15 @@ type Config struct {
 		ChatBase    string `json:"chat_base"`
 		BillingBase string `json:"billing_base"`
 	} `json:"global"`
+
+	CN struct {
+		// ChatBase 国内版 chat/模型目录上游 base 覆盖；空 = 回落内置默认
+		// https://copilot.tencent.com（internal/upstream.New 的 ChatBaseCN）。
+		// copilot.tencent.com 对海外出口（如 Clash 全局 + TUN）的 TLS 握手直接复位，
+		// CN 模型目录与对话全部 EOF；官方 WorkBuddy 桌面端已改用 https://www.workbuddy.cn，
+		// 该域海外出口可达，/v2/chat/completions、/v3/config 与模型目录路径同构。
+		ChatBase string `json:"chat_base"`
+	} `json:"cn"`
 
 	Upstream struct {
 		// TimeoutSeconds 短 RPC（refresh/checkin/balance/FetchModels）总时长上限，默认 120。
@@ -154,6 +172,13 @@ type Config struct {
 		SanitizeBlacklistFingerprints bool `json:"sanitize_blacklist_fingerprints"`
 	} `json:"features"`
 
+	Models struct {
+		// Hidden 不对外暴露的模型黑名单。裸名=两域都藏；"cn:xxx"/"global:xxx"=只藏该域。
+		// 生效点：GET /v1/models 列表过滤 + POST /v1/chat/completions 点名拒绝。
+		// 面板保存后经 livecfg 热生效，无需重启。
+		Hidden []string `json:"hidden"`
+	} `json:"models"`
+
 	Prompt struct {
 		// Mode passthrough（默认）= 透传客户端原始 system（降级重试仍会切到 Degraded）；
 		// custom = 网关用自有系统提示词替换客户端 system/developer；
@@ -173,11 +198,13 @@ type Config struct {
 	} `json:"upstash"`
 
 	Pool struct {
-		MaxInFlight        int    `json:"max_in_flight"`        // 单账号最大在途请求数，0 = 不限
-		MaxInFlightGlobal  int    `json:"max_in_flight_global"` // global 域单账号在途上限（WAF 风控紧域压低并发），0 = 回落默认 2
-		BreakerThreshold   int    `json:"breaker_threshold"`    // 连续失败次数触发熔断，默认 3
-		BreakerCooldown    string `json:"breaker_cooldown"`     // 基础熔断时长，默认 "30m"
-		BreakerCooldownMax string `json:"breaker_cooldown_max"` // 指数退避封顶，默认 "6h"
+		Strategy           pool.RegionStrategies   `json:"strategy"`
+		AccountOrder       pool.RegionAccountOrder `json:"account_order,omitempty"`
+		MaxInFlight        int                     `json:"max_in_flight"`        // 单账号最大在途请求数，0 = 不限
+		MaxInFlightGlobal  int                     `json:"max_in_flight_global"` // global 域单账号在途上限（WAF 风控紧域压低并发），0 = 回落默认 2
+		BreakerThreshold   int                     `json:"breaker_threshold"`    // 连续失败次数触发熔断，默认 3
+		BreakerCooldown    string                  `json:"breaker_cooldown"`     // 基础熔断时长，默认 "30m"
+		BreakerCooldownMax string                  `json:"breaker_cooldown_max"` // 指数退避封顶，默认 "6h"
 		// 连败降权（issue #114）：ErrClient/传输层这类「不罚号」失败连续计数，达阈
 		// 临时出池。与冷却/熔断并存取更长者不叠加。默认 5 次 / 10m。
 		DegradeThreshold   int     `json:"degrade_threshold"`    // 连败次数触发降权，默认 5
@@ -205,6 +232,23 @@ type Config struct {
 		// tier 0（免费）/ tier 1（无观测）不受限；签到回血越过 floor 自动恢复。
 		// 默认 0 = 关闭；负值钳 0。
 		CreditFloor int64 `json:"credit_floor"`
+		// BurnGuardLimit 积分燃尽熔断阈值（issue #229）：窗口内单账号累计烧掉的
+		// 积分超过该值 → 该账号进入熔断（暂时不参与选号），避免高缓存 miss 的
+		// 模型（如 hy4-preview）一轮烧掉 20+ 积分而无人拦截。
+		// 0 = 关闭熔断（默认，零回归）。
+		BurnGuardLimit float64 `json:"burn_guard_limit"`
+		// BurnGuardWindow 燃尽计账窗口（如 "10m"）：窗口滑动重置计账。
+		BurnGuardWindow string `json:"burn_guard_window"`
+		// BurnGuardCooldown 熔断冷却时长（首次触发）；随连续触发次数递增。
+		BurnGuardCooldown string `json:"burn_guard_cooldown"`
+		// BurnGuardCooldownMax 熔断冷却时长上限。
+		BurnGuardCooldownMax string `json:"burn_guard_cooldown_max"`
+		// CrossDomainFallback 裸模型名跨域回退开关（issue #135），默认 false（零回归）。
+		// 开启后：请求模型名不带 realm 前缀时，首选域（cn）选不到可用账号（账号级冷却/
+		// 熔断/在途占满，或该域账号对这个模型 11102 后进入模型级负缓存）会自动改用
+		// 另一域再选一次；显式 cn:/global: 前缀不受影响，行为与引入前完全一致。
+		// 语义取舍：跨域会消耗另一个域的额度，属策略选择，故默认关闭、显式开启。
+		CrossDomainFallback bool `json:"cross_domain_fallback"`
 	} `json:"pool"`
 
 	SessionSticky struct {
@@ -223,9 +267,15 @@ type Config struct {
 	SessionTTL             time.Duration `json:"-"`
 	SessionGCInterval      time.Duration `json:"-"`
 	BalanceRefreshInterval time.Duration `json:"-"` // 0 = 不启动（enabled=false）
+	TaskSweepInterval      time.Duration `json:"-"` // 0 = 不启动（task_sweep_enabled=false）
 	ExpiringSoonDur        time.Duration `json:"-"`
 	// CostExploreIntervalDur 解析后的 costTier 探索窗口（issue #136）；0 = 关停。
 	CostExploreIntervalDur time.Duration `json:"-"`
+	// BurnGuardWindowDur / BurnGuardCooldownDur / BurnGuardCooldownMaxDur 解析后的
+	// 积分燃尽熔断参数（issue #229）；0 = 用默认。
+	BurnGuardWindowDur      time.Duration `json:"-"`
+	BurnGuardCooldownDur    time.Duration `json:"-"`
+	BurnGuardCooldownMaxDur time.Duration `json:"-"`
 	// ServerReadTimeoutDur 解析后的入站请求读取上限（issue #100）；0 = 不限制。
 	ServerReadTimeoutDur time.Duration `json:"-"`
 }
@@ -264,6 +314,8 @@ func Default() *Config {
 	c.Schedule.BlackcatEnabled = true
 	c.Schedule.BalanceRefreshEnabled = true
 	c.Schedule.BalanceRefreshMinutes = 5
+	c.Schedule.TaskSweepEnabled = true
+	c.Schedule.TaskSweepMinutes = 15
 	c.Upstream.TimeoutSeconds = 120
 	// HeaderTimeoutSeconds/IdleTimeoutSeconds 默认 0（未设置态），回落见 normalize()。
 	c.Upstream.HeaderTimeoutSeconds = 0
@@ -273,6 +325,7 @@ func Default() *Config {
 	c.Global.Enabled = true
 	c.Features.SanitizeBlacklistFingerprints = true
 	c.Prompt.Mode = "passthrough" // 缺省 passthrough：透传客户端原始 system（对齐上游；custom 由用户显式选择）
+	c.Pool.Strategy = pool.RegionStrategies{Domestic: pool.WeightedRandom, International: pool.WeightedRandom}
 	c.Pool.MaxInFlight = 3
 	// MaxInFlightGlobal 缺省 2：global 域 WAF 风控更紧，压低单号并发（WAF 403 修复
 	// P1-1）；0/负数 normalize 回落默认（与 max_in_flight 的 0=不限语义不同，分档键
@@ -290,6 +343,10 @@ func Default() *Config {
 	c.Pool.ExpiringSoon = "168h" // 快过期窗口默认 7 天：官方活动奖励积分多在两周内过期
 	// costTier 探索默认 30m（issue #136：垄断破除 + 搭车改道零新增请求）；"0" 关停。
 	c.Pool.CostExploreInterval = "30m"
+	// 积分燃尽熔断（issue #229）：默认关闭（阈值 0 = 不熔断，零回归）。
+	c.Pool.BurnGuardWindow = "10m"
+	c.Pool.BurnGuardCooldown = "10m"
+	c.Pool.BurnGuardCooldownMax = "2h"
 	c.SessionSticky.Enabled = true
 	c.SessionSticky.TTL = "30m"
 	c.SessionSticky.GCInterval = "5m"
@@ -378,6 +435,11 @@ func applyEnv(c *Config) {
 		c.Listen = v
 	}
 	if v := os.Getenv("WB2A_API_KEY"); v != "" {
+		// 环境变量优先于 config.json（既有语义），但**必须留痕**：此前是静默
+		// 覆盖，用户改完 config.json 重启后仍被旧 env key 挡住，而面板把
+		// 401 吞掉 → 表现为「改了密钥不生效、旧登录态还在」（issue #155）。
+		// 这里打一行 WARN 说明来源（只打来源与长度，绝不打明文）。
+		log.Printf("WARN: [config] api_key 来自环境变量 WB2A_API_KEY（%d 字符），已覆盖 config.json 中的 api_key", len(v))
 		c.APIKey = v
 	}
 	if v := os.Getenv("WB2A_AUTH_DIR"); v != "" {
@@ -453,6 +515,9 @@ func applyEnv(c *Config) {
 
 func (c *Config) normalize() error {
 	var err error
+	if c.Pool.Strategy, err = c.Pool.Strategy.Normalize(); err != nil {
+		return fmt.Errorf("pool.strategy: %w", err)
+	}
 	if c.Panel.PackageDetailLimit <= 0 {
 		c.Panel.PackageDetailLimit = 5
 	}
@@ -527,6 +592,37 @@ func (c *Config) normalize() error {
 	if c.Pool.CreditFloor < 0 {
 		c.Pool.CreditFloor = 0
 	}
+	// 积分燃尽熔断（issue #229）：阈值 <= 0 = 关闭（默认，零回归）。
+	if c.Pool.BurnGuardLimit < 0 {
+		c.Pool.BurnGuardLimit = 0
+	}
+	if c.Pool.BurnGuardWindow == "" {
+		c.Pool.BurnGuardWindow = "10m"
+	}
+	if c.BurnGuardWindowDur, err = time.ParseDuration(c.Pool.BurnGuardWindow); err != nil {
+		return fmt.Errorf("pool.burn_guard_window: %w", err)
+	}
+	if c.BurnGuardWindowDur < 0 {
+		c.BurnGuardWindowDur = 0
+	}
+	if c.Pool.BurnGuardCooldown == "" {
+		c.Pool.BurnGuardCooldown = "10m"
+	}
+	if c.BurnGuardCooldownDur, err = time.ParseDuration(c.Pool.BurnGuardCooldown); err != nil {
+		return fmt.Errorf("pool.burn_guard_cooldown: %w", err)
+	}
+	if c.BurnGuardCooldownDur < 0 {
+		c.BurnGuardCooldownDur = 0
+	}
+	if c.Pool.BurnGuardCooldownMax == "" {
+		c.Pool.BurnGuardCooldownMax = "2h"
+	}
+	if c.BurnGuardCooldownMaxDur, err = time.ParseDuration(c.Pool.BurnGuardCooldownMax); err != nil {
+		return fmt.Errorf("pool.burn_guard_cooldown_max: %w", err)
+	}
+	if c.BurnGuardCooldownMaxDur < 0 {
+		c.BurnGuardCooldownMaxDur = 0
+	}
 	if c.Pool.BreakerThreshold <= 0 {
 		c.Pool.BreakerThreshold = 3
 	}
@@ -590,6 +686,13 @@ func (c *Config) normalize() error {
 			c.Schedule.BalanceRefreshMinutes = 5
 		}
 		c.BalanceRefreshInterval = time.Duration(c.Schedule.BalanceRefreshMinutes) * time.Minute
+	}
+	// 任务补领清扫：启用时 minutes<=0 回落默认 15；关闭时 interval 保持 0（不启动）。
+	if c.Schedule.TaskSweepEnabled {
+		if c.Schedule.TaskSweepMinutes <= 0 {
+			c.Schedule.TaskSweepMinutes = 15
+		}
+		c.TaskSweepInterval = time.Duration(c.Schedule.TaskSweepMinutes) * time.Minute
 	}
 	if err := c.validateScheduleHours(); err != nil {
 		return err

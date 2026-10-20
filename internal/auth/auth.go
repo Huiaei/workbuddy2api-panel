@@ -3,6 +3,7 @@
 package auth
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -15,6 +16,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/linguo2625469/workbuddy2api-panel/internal/atomicfile"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/logfmt"
 )
 
@@ -190,6 +192,77 @@ func BackfillRealmFor(a *Auth, realm string) (bool, error) {
 // IsGlobal 报告账号是否属于 global realm（= Realm() == "global"）。
 func (a *Auth) IsGlobal() bool { return a.Realm() == "global" }
 
+// apiKeyPrefixes 静态 API Key 的前缀集合：ck_（CodeBuddy 控制台签发）与
+// pt_（官方 CLI @tencent-ai/codebuddy-code 另有该前缀）。
+// 官方 CLI 的判据是 tokenType === "ApiKey" 且 token 以这两个前缀之一开头；
+// auth 文件不持久化 tokenType（refresh 只认 OAuth 设备流，静态 Key 无法刷新），
+// 前缀是落盘形态里唯一稳定、跨进程一致的判据。
+var apiKeyPrefixes = []string{"ck_", "pt_"}
+
+// isAPIKeyToken 判 token 是否以静态 API Key 前缀开头。
+func isAPIKeyToken(at string) bool {
+	for _, p := range apiKeyPrefixes {
+		if strings.HasPrefix(at, p) {
+			return true
+		}
+	}
+	return false
+}
+
+// isAPIKeyLocked IsAPIKey 的无锁内部实现：仅限**已持 a.mu** 的调用方使用
+// （sync.Mutex 不可重入，锁内再调 AccessTokenValue 会自锁）。
+func (a *Auth) isAPIKeyLocked() bool { return isAPIKeyToken(a.AccessToken) }
+
+// IsAPIKey 报告账号是否为静态 API Key 账号（AccessToken 以 ck_/pt_ 开头）。
+// 经 AccessTokenValue() 加锁读取：RefreshToken 会在锁内改写 AccessToken。
+//
+// 语义：静态 Key 直接可用（Authorization: Bearer <key>），但**无个人成长体系**
+// （签到/成长任务/连登/旅行/夜猫子一律不适用），且额度只能走企业口径端点
+// （个人 get-user-resource 对静态 Key 返回空 Accounts），见 UsesEnterpriseBilling。
+func (a *Auth) IsAPIKey() bool {
+	if a == nil {
+		return false
+	}
+	return isAPIKeyToken(a.AccessTokenValue())
+}
+
+// UsesEnterpriseBilling 报告账号的额度查询是否走企业口径端点
+// （/v2/billing/meter/get-enterprise-user-usage）。
+// 企业版与静态 API Key 账号同属此列：个人 get-user-resource 对二者均返回空
+// Accounts（企业账号无个人资源包；静态 Key 无个人账号身份），额度必须走企业口径。
+func (a *Auth) UsesEnterpriseBilling() bool { return a.IsEnterprise() || a.IsAPIKey() }
+
+// SupportsPersonalGrowth 报告账号是否具备个人成长体系（签到 / 成长任务 / 连登管家 /
+// 猫猫旅行 / 夜猫子）。以下两类账号都没有该体系：
+//   - 企业版（IsEnterprise）：上游一律拒绝（400 code 10001 / 403 growth-only）；
+//   - 静态 API Key 账号（IsAPIKey）：根本没有个人账号身份。
+//
+// scheduler 五类任务与 panel 成长入口据此并列门控，避免对注定失败的端点空发请求。
+//
+// 注意门控分两层：本方法只判「**硬**不成长」（企业版 / API Key）——对二者连
+// **读端点**（签到、任务列表扫描）都无意义。企业切换会话（token_source=enterprise_switch）
+// 不在此列：它的读端点照常可用、失败也是显式报错，只有**行为事件**会被上游静默
+// 丢弃（200 不计分），故由 SupportsBehaviorEvents 单独判，行为类任务用它、
+// 读端点与签到不在此列（见 SupportsBehaviorEvents 注释）。
+func (a *Auth) SupportsPersonalGrowth() bool {
+	return !a.IsEnterprise() && !a.IsAPIKey()
+}
+
+// SupportsBehaviorEvents 报告账号的**行为事件**（活跃上报 /v2/report、成长任务
+// 执行、连登、猫猫旅行、夜猫子）是否会被上游真正记账。
+//
+// 与 SupportsPersonalGrowth 的差别只在企业切换会话（token_source=enterprise_switch，
+// 见 IsEnterpriseSession）：这类凭证的**读端点**（签到、任务列表扫描、额度查询）照常
+// 可用，但行为事件返回 200 却被上游静默丢弃（实测 2026-10-12：15 个成长任务全部
+// 0/x，90 秒内逐 15s 回读进度从不跳动）——即「读得见、记不上账」。不跳过则队列
+// 每轮白跑全部任务（含真实对话配额）且无任何报错。
+//
+// 因此：行为类任务（活跃上报 / 连登 / 旅行 / 夜猫子 / 成长任务执行）用本方法门控；
+// 签到与任务列表扫描**不在**此列——签到失败是显式报错（不静默），列表扫描实测可用。
+func (a *Auth) SupportsBehaviorEvents() bool {
+	return a.SupportsPersonalGrowth() && !a.IsEnterpriseSession()
+}
+
 // IsEnterprise 报告账号是否为企业版（auth 文件带非空 enterpriseId）。
 //
 // 企业版**没有个人成长体系**：签到 / 成长任务 / 连登管家 / 猫猫旅行 / 夜猫子
@@ -209,6 +282,66 @@ func (a *Auth) IsGlobal() bool { return a.Realm() == "global" }
 // 无需加锁——Realm() 加锁是因为 realm/Domain 会被 RefreshToken 在锁内改写。
 func (a *Auth) IsEnterprise() bool { return strings.TrimSpace(a.EnterpriseID) != "" }
 
+// IsEnterpriseSession 报告当前凭证是否处于「企业上下文」：
+// 账号本身是企业版（IsEnterprise），或 AccessToken 签发自**企业切换会话**
+// （JWT payload 带 token_source=enterprise_switch——浏览器在企业空间状态下
+// 完成 OAuth 授权时签发）。
+//
+// 为什么单独一站：企业切换会话与真企业版的上游表现**不同**（实测 2026-10-12，
+// 同一时刻与个人号 A/B 对照）——成长任务列表 / 额度查询 / 领养 Buddy 等**读端点
+// 与直连 API 照常**，但 /v2/report 行为事件**返回 200 却被静默丢弃**（15 个成长
+// 任务全部 0/x，重跑并 90s 内逐 15s 回读进度从不跳动），连登 / 签到同样无效。
+// 即「读得见、记不上账」：不跳过则队列每轮白跑全部任务（含真实对话配额）且
+// 无任何报错。因此行为类任务（活跃上报 / 连登 / 旅行 / 夜猫子 / 成长任务执行）
+// 的门控应使用本方法；签到与任务列表扫描不在此列（签到失败是显式报错，
+// 列表扫描实测可用）。额度查询 / 选号 / 保活照常（按 IsEnterprise 口径）。
+//
+// 每次现解码 JWT 而非 Parse 时缓存：RefreshToken 会整体换发 token，
+// 企业切换状态可能随重新授权翻转，缓存会读到过期形态。解码成本仅一次
+// base64 + 小 JSON（每调度轮每账号数次），可忽略。
+func (a *Auth) IsEnterpriseSession() bool {
+	if a.IsEnterprise() {
+		return true
+	}
+	return jwtTokenSource(a.AccessTokenValue()) == "enterprise_switch"
+}
+
+// jwtTokenSource 解出 JWT payload 中的 token_source 声明；非 JWT / 解码失败
+// 一律返回 ""（老 token 与非标准形态按无此声明处理，零回归）。先按无填充
+// base64url 解（JWT 标准），失败再试带填充形态（兼容非标准签发方）。
+func jwtTokenSource(token string) string {
+	parts := strings.Split(token, ".")
+	if len(parts) < 2 {
+		return ""
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		if raw, err = base64.URLEncoding.DecodeString(parts[1]); err != nil {
+			return ""
+		}
+	}
+	var payload struct {
+		TokenSource string `json:"token_source"`
+	}
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return ""
+	}
+	return payload.TokenSource
+}
+
+// TokenSource 从 AccessToken 的 JWT payload 里读 token_source 声明（官方客户端用它
+// 填出站 X-Auth-Method 与 X-Userinfo.token_source）。非 JWT / 无该声明 / 解码失败一律
+// 返回空串——空表示「这个账号没有该维度」，调用方随之不发对应头（不伪造）。
+//
+// 每次现解码而不缓存：RefreshToken 会整体换发 token，token_source 可能随重新授权翻转。
+// 成本是一次 base64 + 小 JSON，相对一次上游请求可忽略。
+func (a *Auth) TokenSource() string {
+	if a == nil {
+		return ""
+	}
+	return strings.TrimSpace(jwtTokenSource(a.AccessTokenValue()))
+}
+
 // isGlobalDomain 判定 domain 是否指向 www.workbuddy.ai 家族。
 // 同时接受裸域 workbuddy.ai 与任意子域（HasSuffix("www.workbuddy.ai") 或裸域本身）。
 func isGlobalDomain(d string) bool {
@@ -220,6 +353,11 @@ func isGlobalDomain(d string) bool {
 func (a *Auth) NeedsRefresh(within time.Duration) bool {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	// 静态 API Key 永不刷新（refresh 端点只认 OAuth 设备流）：恒 false，否则
+	// server 请求路径会先 refresh、失败后把该号当坏号冷却换号——Key 本身是好的。
+	if a.isAPIKeyLocked() {
+		return false
+	}
 	if a.ExpiresAt <= 0 {
 		return true
 	}
@@ -351,7 +489,32 @@ func (a *Auth) SaveAtomic() error {
 		}
 		return errors.New(msg)
 	}
-	return os.Rename(tmp, a.FilePath)
+	if err := os.Rename(tmp, a.FilePath); err != nil {
+		// rename 失败（单文件 bind mount 的 EBUSY / 跨设备 EXDEV）：退化为原地覆盖。
+		// 目标文件本身通常可写（能读到它就能写它），而 tmp 里是完整新内容。
+		if !atomicfile.IsReplaceableErr(err) {
+			return fmt.Errorf("replace %s: %w", a.FilePath, err)
+		}
+		f, openErr := os.OpenFile(a.FilePath, os.O_WRONLY|os.O_TRUNC, 0o600)
+		if openErr != nil {
+			_ = os.Remove(tmp)
+			return fmt.Errorf("replace %s (bind mount fallback): %w", a.FilePath, openErr)
+		}
+		_, writeErr := f.Write(raw)
+		if writeErr == nil {
+			writeErr = f.Sync()
+		}
+		closeErr := f.Close()
+		if writeErr != nil {
+			return fmt.Errorf("replace %s (bind mount fallback, 完整新内容保留在 %s): %w", a.FilePath, tmp, writeErr)
+		}
+		_ = os.Remove(tmp)
+		if closeErr != nil {
+			return fmt.Errorf("replace %s (bind mount fallback): %w", a.FilePath, closeErr)
+		}
+		return nil
+	}
+	return nil
 }
 
 // LoadDir 扫描并解析 dir 下 workbuddy*.json；解析失败的文件静默跳过（启动日志由调用方统计）。

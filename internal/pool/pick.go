@@ -47,9 +47,9 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
 	defer p.mu.Unlock()
 	now := time.Now()
 	realmOK := func(e *entry) bool { return realm == "" || e.a.Realm() == realm }
-	healthyOf := func(e *entry) bool { return realmOK(e) && e.healthy(now) }
+	healthyOf := func(e *entry) bool { return realmOK(e) && e.healthy(now) && !p.burnBlocked(e, now) }
 	if reqModel != "" {
-		healthyOf = func(e *entry) bool { return realmOK(e) && e.healthyForModel(now, reqModel) }
+		healthyOf = func(e *entry) bool { return realmOK(e) && e.healthyForModel(now, reqModel) && !p.burnBlocked(e, now) }
 	}
 	// floorBlocked 积分保底拦截判定（实现在 floorBlockedForRealmModel，与粘性路径共用）：
 	// 触底 + 收费（本地实测台账 或 上游目录倍率）即拦；免费/未知倍率不受限。
@@ -77,6 +77,9 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
 	if len(cands) == 0 {
 		// 全冷却兜底：无 healthy 候选时，从冷却账号里选 until 最早到期的一个
 		// （熔断/冷却共用 expiry 口径，取较早截止者）。禁用的账号永不参与兜底。
+		if p.strategyForRealmLocked(realm) != WeightedRandom {
+			return nil // 有序策略等待恢复，不提前试探仍在冷却中的账号。
+		}
 		return p.pickEarliestExpiryLocked(tried, now, realm, reqModel)
 	}
 	// top5 短名单按权重降序截断（而非 credits 单纯降序）：否则闲置补偿根本进不了
@@ -89,6 +92,14 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
 			maxCredits = e.credits
 		}
 	}
+	// 企业版「不限量」账号的 credits 是哨兵值 1<<40（上游 limitNum=-1，
+	// 见 upstream.enterpriseUnlimitedRemain）。它若参与 maxCredits 计算，
+	// 会把分母撑到 1e12 量级 → 其余账号的 credits 比例项被压成 ~0，
+	// 权重几乎只剩闲置补偿，不限账号则近乎垄断选号——与「不限量不构成
+	// 约束」的语义相反（issue #222）。故权重口径下把哨兵值从分母里剔除，
+	// 分母改用候选集里的次大真实余额；哨兵号自身按「不低于任何正常号」参与
+	// （见 weightOf）。
+	maxCredits = capUnlimitedCredits(cands)
 	// 成本分层（reqModel 非空时）：按该模型的实测扣费把候选分层，只保留最优层。
 	//   0 = 已实测免费（限免期/夜间免费的号，最强偏好）
 	//   1 = 无观测（含观测过期）
@@ -155,6 +166,20 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
 		if ti == bestTier {
 			ws = append(ws, weighted{e: e, w: p.routingWeightOf(e, maxCredits, now), tier: ti, cost1k: ci})
 		}
+	}
+	if strategy := p.strategyForRealmLocked(realm); strategy != WeightedRandom {
+		ordered := make([]*entry, 0, len(ws))
+		for _, w := range ws {
+			ordered = append(ordered, w.e)
+		}
+		e := p.pickOrderedLocked(ordered, tried, reqModel, realm, strategy, explored, now)
+		e.lastUsed = now
+		p.pickSeq++
+		e.usedSeq = p.pickSeq
+		if explored {
+			log.Printf("[pool] cost explore model=%s realm=%q acct=%s window=%s", reqModel, realm, logfmt.Label(e.a.UID, e.a.Nickname), p.costExploreInterval)
+		}
+		return e.a
 	}
 	// 等权重洗牌：仅当存在权重相等且候选数超过 top5 时，才对 ws 做 Fisher-Yates
 	// 洗牌（且**不消耗 p.randInt64N 注入源**，避免改变 pickWeighted 的确定性语义，
@@ -313,6 +338,12 @@ func (p *Pool) pickEarliestExpiryLocked(tried map[string]bool, now time.Time, re
 		if p.floorBlockedForRealmModel(e, model, realm, now) {
 			continue // 积分保底：触底号不接收费模型（兜底路径同判据）
 		}
+		// 积分燃尽熔断（issue #229）：熔断号不参与兜底——兜底是「没有健康号时
+		// 提前试探冷却号」，熔断的语义是「这个号在窗口内不要接流量」，两者
+		// 冲突时以熔断为准（宁可少一个号，也不要把流量推回正在烧钱的号）。
+		if p.burnBlocked(e, now) {
+			continue
+		}
 		if p.inFlightFull(e) {
 			continue
 		}
@@ -364,12 +395,7 @@ var minPickGap = 100 * time.Millisecond
 // 随机源优先用 p.randInt64N（仅供测试注入确定性），nil 时回退 math/rand/v2 全局源。
 func (p *Pool) pickWeighted(cands []*entry) *entry {
 	now := time.Now()
-	var maxCredits int64
-	for _, e := range cands {
-		if e.credits > maxCredits {
-			maxCredits = e.credits
-		}
-	}
+	maxCredits := capUnlimitedCredits(cands)
 	const scale = 1_000_000 // 定点放大：int64 累加权重大整数抽签
 	weights := make([]int64, len(cands))
 	var total int64
@@ -396,12 +422,58 @@ func (p *Pool) pickWeighted(cands []*entry) *entry {
 	return cands[len(cands)-1]
 }
 
+// unlimitedCreditsSentinel 企业版「不限量」在池内的剩余量哨兵值
+// （上游 limitNum == -1；见 upstream.enterpriseUnlimitedRemain）。
+// 该值是**展示/判定用的伪值**，不是真实额度——参与权重分母会把其余账号的
+// credits 比例项压成 ~0（issue #222）。
+const unlimitedCreditsSentinel int64 = 1 << 40
+
+// capUnlimitedCredits 把权重分母里的不限量哨兵值替换成候选集里的**次大真实
+// 余额**，使「不限量」不构成约束，同时不把其余账号的 credits 比例项压成 ~0
+// （issue #222 的建议 2）。
+//
+// 为什么不是简单封顶：封顶成 1<<40（= 哨兵本身）或任何固定大数，分母仍然远大于
+// 真实余额量级（真实余额通常在几百~几千），比例项照样被压到接近 0——那等于没改。
+// 正确口径是「哨兵号按候选集的次大值参与计算」：它仍拿到「不低于任何正常号」
+// 的比例待遇（1.0），但分母回到真实余额量级，其余账号的权重恢复正常。
+//
+// all 为候选集的全部账号；返回用于计算比例的分母。
+func capUnlimitedCredits(all []*entry) int64 {
+	maxReal := int64(0)
+	hasUnlimited := false
+	for _, e := range all {
+		if e.credits >= unlimitedCreditsSentinel {
+			hasUnlimited = true
+			continue
+		}
+		if e.credits > maxReal {
+			maxReal = e.credits
+		}
+	}
+	if !hasUnlimited {
+		return maxReal
+	}
+	// 全部候选都是不限量号（或没有正常余额号）→ 分母取哨兵值：此时比例项对
+	// 所有人都是 1.0（等价），用哨兵值不改变结果。
+	if maxReal <= 0 {
+		return unlimitedCreditsSentinel
+	}
+	return maxReal
+}
+
 // weightOf 计算单个账号的普通加权分值。
 func (p *Pool) weightOf(e *entry, maxCredits int64, now time.Time) float64 {
 	w := 1.0
 	// 1. credits 比例 ×10（会计入 mid-credit 锚点，避免全员 0 时 credits 项为 0）。
+	//    不限量哨兵号（credits == 1<<40）按「不低于任何正常号」参与：比例封 1，
+	//    既不撑大分母（分母已剔除哨兵值，见 capUnlimitedCredits），也不让它
+	//    在比例项上与真实余额号拉开差距（issue #222）。
 	if maxCredits > 0 {
-		w += float64(e.credits) / float64(maxCredits) * 10
+		own := e.credits
+		if own >= unlimitedCreditsSentinel {
+			own = maxCredits
+		}
+		w += float64(own) / float64(maxCredits) * 10
 	}
 	// 2. 闲置补偿。
 	if e.lastUsed.IsZero() {
@@ -431,12 +503,56 @@ func expiringNow(e *entry, now time.Time) bool {
 		e.creditsEarliestExpiry.After(now)
 }
 
-// routingWeightOf 在普通账号权重上叠加快过期虚拟实例数量。prefer_expiring=false
-// 或账号无有效快过期批次时，实例数恒为 1，结果与旧 weightOf 完全一致。
+// 快过期紧迫度梯度（issue #160）。
+//
+// 此前是**固定倍率** expiringVirtualSlots(=3)：只要账号有任意快过期余额，
+// 权重一律 ×3，与「还剩多久到期」无关——所以用户看到的是「负载均衡」而不是
+// 「优先消耗快到期的」。同时 ×3 的力度也远不足以对抗 credits 比例项
+// （weightOf 里 credits 比例 ×10，一个大余额号能把 ×3 轻易盖过去）。
+//
+// 现在改成**平滑梯度**：紧迫度 u = 1 - 剩余时间/窗口（越接近到期越接近 1），
+// 倍率 = M_base + (M_max - M_base) * u，窗口 = 快过期窗口（expiring_soon，
+// 默认 168h）。窗口外（剩余时间 > 窗口）不额外加权，与旧行为一致；
+// 刚好到期（剩余时间 ≈ 0）拿满 M_max。
+const (
+	// expiringBaseMultiplier 快过期账号的最小加权倍率（刚进入窗口时）。
+	expiringBaseMultiplier = 1.5
+	// expiringMaxMultiplier 快过期账号在临近到期时的最大加权倍率。
+	expiringMaxMultiplier = 5.0
+)
+
+// expiringUrgency 返回账号的快过期紧迫度 u∈[0,1]：1 = 恰好到期，0 = 不在窗口内。
+// 窗口未知（未配置 expiring_soon）时退化为固定倍率口径（u=1 → M_max）。
+func (p *Pool) expiringUrgency(e *entry, now time.Time) float64 {
+	if !expiringNow(e, now) {
+		return 0
+	}
+	win := p.expiringSoonWindow
+	if win <= 0 {
+		return 1 // 窗口未知：按最紧迫处理（等价于旧的固定倍率上限）
+	}
+	remain := e.creditsEarliestExpiry.Sub(now)
+	if remain <= 0 {
+		return 1
+	}
+	if remain >= win {
+		return 0 // 还在窗口外：不做额外加权
+	}
+	return 1 - float64(remain)/float64(win)
+}
+
+// expiringMultiplier 返回快过期账号的加权倍率（平滑梯度）。
+func (p *Pool) expiringMultiplier(e *entry, now time.Time) float64 {
+	u := p.expiringUrgency(e, now)
+	return expiringBaseMultiplier + (expiringMaxMultiplier-expiringBaseMultiplier)*u
+}
+
+// routingWeightOf 在普通账号权重上叠加快过期加权。prefer_expiring=false
+// 或账号无有效快过期批次时，倍率恒为 1，结果与旧 weightOf 完全一致。
 func (p *Pool) routingWeightOf(e *entry, maxCredits int64, now time.Time) float64 {
 	w := p.weightOf(e, maxCredits, now)
 	if p.preferExpiring && expiringNow(e, now) {
-		return w * expiringVirtualSlots
+		return w * p.expiringMultiplier(e, now)
 	}
 	return w
 }
