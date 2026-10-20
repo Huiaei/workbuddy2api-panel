@@ -80,6 +80,12 @@ type Config struct {
 	// 来自 logging.request_client_info（缺省 true）；关闭时 reqlog 事件的来源字段
 	// 保持为空，归档与面板都不出现来源信息。
 	RecordClientInfo bool
+
+	// ToolStallRetry 非流式请求命中「声明了 tools 却零 tool_calls 且 stop 收尾」
+	// 时的自动重试次数（issue #149）。0 = 不重试（仍记录观测）。
+	// 来自 upstream.tool_stall_retry（缺省 1）。**重试不罚账号**（上游行为缺陷，
+	// 不是账号问题）——只换号再问一次。
+	ToolStallRetry int
 }
 
 // loadLive 返回当前运行期快照；Live 为 nil 时用静态字段合成。
@@ -140,6 +146,9 @@ func NewHandler(cfg Config) *Handler {
 	}
 	if cfg.PromptMode == "" {
 		cfg.PromptMode = "custom" // 缺省 custom：网关自有提示词
+	}
+	if cfg.ToolStallRetry < 0 {
+		cfg.ToolStallRetry = 0
 	}
 	h := &Handler{cfg: cfg, mux: http.NewServeMux()}
 	h.mux.HandleFunc("POST /v1/chat/completions", h.withAuth(h.chatCompletions))
@@ -579,6 +588,17 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 在提示词/模型名改写之前取（那些改写不动 tools / messages[].tool_calls 子树）。
 	declaredTools := upstream.ToolNameAllowlist(body)
 
+	// 停摆判定用的工具名单：**只看本请求自己声明的** tools/functions，不含会话历史。
+	//
+	// 为什么不能用上面的合并名单：合并名单把「本请求声明的」和「历史里出现过的」
+	// 混在一起，对**标记修复**是对的（那段正文里的工具标记是不是我们认识的工具），
+	// 对**停摆判定**是错的——多轮会话里模型第 1 轮调了工具、第 2 轮给最终答案，
+	// 第 2 轮 finish_reason=stop + 零 tool_calls 是**完全正常**的收尾。拿合并名单
+	// 判，会把这种正常收尾误判成停摆 → 白白换号重试一次（多花一次上游调用 +
+	// 让客户端多等一轮）。停摆的语义是「本轮本该调工具却没调」，只有本请求自己
+	// 声明了 tools 才有「本该调」这回事。
+	stallDeclaredTools := upstream.DeclaredToolNames(body)
+
 	// realm 前缀解析（D6）：model 名可能带 "[realm:]" 前缀。剥出 realm + bareModel，
 	// bareModel 用于选号/粘性/出站 body 重写（前缀是网关侧路由协议，上游只认裸名）。
 	// 裸名 → ("cn", 原串)，CN 现状零回归。
@@ -615,6 +635,10 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	tried := map[string]bool{}
 	var lastErr error
+	// stallRetry 记录本次请求已因「零 tool_calls 停摆」重试了几次（issue #149）。
+	// 与 MaxRotate 独立：停摆重试消耗的是轮转名额（continue 会走下一轮），
+	// 但它有自己的上限（cfg.ToolStallRetry），避免一次请求连续撞上多个停摆号。
+	stallRetry := 0
 	// modelBlock 记录本次是否因「模型级冷却」而选不到号（下方 acct==nil 分支填充）。
 	// 默认零值 Blocked=false = 按既有的"没有可用账号"口径报错。
 	var modelBlock pool.ModelBlockStatus
@@ -1119,10 +1143,14 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// 第二个参数为 true = 名单为空时启用弱判定——tools 声明在链路上丢失是
 			// 实测最常见的泄漏成因，只做严格判定等于对主场景不设防。
 			repair := upstream.NewMarkupRepair(declaredTools, true)
+			// 零 tool_calls 停摆探测器（issue #149）：流式路径**不重试**（帧已写给
+			// 客户端收不回来），只做观测——判定口径与非流式一致（见 DetectToolStall）。
+			stallDetect := upstream.NewStreamToolStallDetector(stallDeclaredTools)
 			sErr := upstream.StreamHint(w, stats, upstream.FrameHintFunc(func() upstream.HintContext {
 				return h.hintContext(bareModel, reqHasImage)
 			}), upstream.WithErrorFrameObserver(func(payload string) { errFrame = payload }),
-				upstream.WithMarkupRepair(repair))
+				upstream.WithMarkupRepair(repair),
+				upstream.WithFrameObserver(stallDetect.Observe))
 			switch {
 			case upstream.IsEmptyStreamError(sErr):
 				// 上游 200 但空流（0 有效帧）：StreamHint 已写 error 帧 + [DONE]
@@ -1189,6 +1217,14 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				log.Printf("WARN: [server] stream acct=%s model=%s: saw %d native tool call block(s) but repaired none (tool names known=%d)",
 					logfmt.Label(acct.UID, acct.Nickname), bareModel, m, len(declaredTools))
 			}
+			// 零 tool_calls 停摆观测（issue #149）：流式**不重试**（帧已写给客户端），
+			// 只记录观测。判定口径与非流式一致：声明了 tools 却零 tool_calls 且 stop 收尾。
+			if si := stallDetect.Info(); si.Suspect {
+				st.toolStall = true
+				st.toolStallText = si.ContentLen
+				log.Printf("WARN: [server] stream acct=%s model=%s: zero-tool_call stall (declared tools=%d, text_len=%d, finish=%s) — upstream answered with text only, tools not invoked",
+					logfmt.Label(acct.UID, acct.Nickname), bareModel, si.DeclaredTools, si.ContentLen, si.FinishReason)
+			}
 			st.ttfb = stats.TTFB()
 			// usage 缺失时保留 chatStat.toks 的 -1 哨兵（观测缺失 → 显示 "-"），
 			// 不写入零值——否则「没观测到 usage」被伪造成「测得 0 token」，
@@ -1235,6 +1271,21 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			log.Printf("WARN: [server] non-stream model=%s: saw %d native tool call block(s) but repaired none (tool names known=%d)",
 				bareModel, m, len(declaredTools))
 		}
+		// 零 tool_calls 停摆检测（issue #149）：请求声明了 tools，模型却只回了正文
+		// 并以 stop 收尾——工具一次没跑，客户端会按「正常完成」收尾，任务停在原地。
+		//
+		// 判定口径只按「零 tool_calls」（+ stop 收尾），**绝不按正文长度**：报告方
+		// 的教训是按长度阈值判会把 glm-5.3 的停摆率算成 0%（它 3 次停摆的正文都是
+		// 1000+ 字符），实际按零 tool_calls 算是 13%。
+		//
+		// 这是**上游行为缺陷**，不是账号问题 → **绝不罚账号**（不冷却/不熔断/
+		// NoteFailures/NoteError），只换号再问一次。流式路径不做重试（帧已写给
+		// 客户端收不回来），只做观测。
+		stall := upstream.DetectToolStall(resp, stallDeclaredTools)
+		// 账本记账**必须在停摆重试之前**：这一跳的上游调用**真的花了钱**（token +
+		// 积分），重试只是再问一次，不会退回上一跳的消耗。若把记账放在重试之后，
+		// 停摆的那一跳在账本上凭空消失 → 账号余额被高估（选号会继续往它身上派，
+		// 实际上它已经在烧钱）+ 积分燃尽熔断（issue #229）漏计这一跳。
 		credit, total, hasCredit := usageCreditTotal(resp)
 		if usage, ok := resp["usage"].(map[string]any); ok {
 			if hit, miss, okC := cacheTokensFromUsage(usage); okC {
@@ -1245,6 +1296,33 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		if st.hasCache {
 			cacheMissWarn.noteCacheTokens(bareModel, st.promptTokens, st.cacheHit, st.cacheMiss)
 		}
+		// 成本账本（非流式）：从聚合响应的 usage 取 credit 与 token 总数。
+		if hasCredit {
+			st.credit = credit
+			st.hasCredit = true
+			h.cfg.Pool.NoteModelCost(acct.UID, bareModel, credit, total)
+			// 积分燃尽熔断计账（issue #229）：窗口内烧掉的积分超阈值 → 该号熔断。
+			h.cfg.Pool.NoteBurn(acct.UID, credit)
+		}
+		if stall.Suspect {
+			st.toolStall = true
+			st.toolStallText = stall.ContentLen
+			log.Printf("WARN: [server] non-stream model=%s acct=%s: zero-tool_call stall (declared tools=%d, text_len=%d, finish=%s) — upstream answered with text only, tools not invoked",
+				bareModel, logfmt.Label(acct.UID, acct.Nickname), stall.DeclaredTools, stall.ContentLen, stall.FinishReason)
+			// 重试预算：配置的重试次数（默认 1）。重试时**换号**（同号重问大概率
+			// 得到同样的停摆）。
+			if stallRetry < h.cfg.ToolStallRetry {
+				stallRetry++
+				// 不罚号：释放租约（它没做错什么，只是上游这一轮没调工具），
+				// 但把它标记为「已用过」让选号避开它 → 换号再问一次。
+				tried[acct.UID] = true
+				releaseHeld()
+				if !rotateBackoff(i, r.Context()) {
+					break
+				}
+				continue
+			}
+		}
 		writeJSON(w, http.StatusOK, resp)
 		st.status = http.StatusOK
 		st.outcome = reqlog.OutcomeSuccess
@@ -1254,14 +1332,6 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		h.cfg.Pool.BlockModelClear(acct.UID, bareModel)
 		if sessKey != "" && h.cfg.Session != nil {
 			h.cfg.Session.Bind(sessKey, acct.UID)
-		}
-		// 成本账本（非流式）：从聚合响应的 usage 取 credit 与 token 总数。
-		if hasCredit {
-			st.credit = credit
-			st.hasCredit = true
-			h.cfg.Pool.NoteModelCost(acct.UID, bareModel, credit, total)
-			// 积分燃尽熔断计账（issue #229）。
-			h.cfg.Pool.NoteBurn(acct.UID, credit)
 		}
 		return
 	}

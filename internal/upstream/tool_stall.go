@@ -1,0 +1,291 @@
+// tool_stall.go 检测「agentic 请求声明了 tools，但上游一轮回来零 tool_calls
+// 却以 stop 收尾」的停摆形态（issue #149）。
+//
+// 形态：请求里声明了 tools（客户端本意是要模型调工具），上游却只回了正文 +
+// finish_reason=stop，没有任何 tool_calls。两种实测正文形态都属此类：
+//   - 短正文（8~350 字符）：半句话预告，如「我这就去执行 X」；
+//   - 长正文（400~1700 字符）：给一段说明/总结就收尾，任务并未推进。
+//
+// 两种形态都会让客户端按「正常完成」收尾 → 工具一次没跑、任务停在原地，用户
+// 必须手动催一句才继续。已排除的假设（报告方实测）：不是客户端丢弃、不是网关
+// 丢弃（原始 SSE 里就没有 tool_calls 帧）、不是思考内容导致、不是历史回传导致、
+// 不是单一模型问题（cn 域四个模型都有，深seek 系比例最高）。
+//
+// 判定口径：**只按「零 tool_calls」判，绝不按正文长度判**。报告方自己的教训是
+// 按长度阈值判会把 glm-5.3 的停摆率算成 0%（它的 3 次停摆正文都是 1000+ 字符），
+// 实际按零 tool_calls 算是 13%。
+//
+// 重要前提：这是**上游行为缺陷**，不是账号问题。所以命中后**绝不罚账号**
+// （不冷却、不熔断、不 NoteFailures）——与 ErrChannelRefused 同一处置原则。
+package upstream
+
+import (
+	"encoding/json"
+	"strings"
+)
+
+// DeclaredToolNames 收集**本请求自己声明**的工具名集合（不含会话历史）。
+//
+// 返回 nil 表示「本请求不该有工具调用」，调用方据此**不判停摆**。三种情况
+// 返回 nil：
+//  1. 请求体解析失败（不编造名单，宁可漏判不可误判）；
+//  2. 本请求没声明任何 tools/functions；
+//  3. 本请求用 tool_choice="none" **显式禁止**了工具调用——此时模型只回正文
+//     并以 stop 收尾是**完全正确**的行为，把它当停摆是纯误判。
+//
+// 与 ToolNameAllowlist 的区别（这正是停摆判定必须用本函数的原因）：
+// ToolNameAllowlist 把「本请求声明的工具」和「会话历史里出现过的工具」合并。
+// 合并名单适合标记修复（判定「这段正文里的工具标记是不是我们认识的工具」），
+// 但**不适合**停摆判定——
+//
+// 历史里有 tool_calls ≠ 本轮该调工具。多轮会话里，模型在第 1 轮调了工具、
+// 第 2 轮给出最终答案，这第 2 轮是**完全正常**的收尾（finish_reason=stop +
+// 零 tool_calls）。若用合并名单判定，第 2 轮会被误判成「停摆」→ 触发无谓的
+// 换号重试（白花一次上游调用 + 让客户端多等一轮），把一个正常回答变成两次请求。
+//
+// 停摆的语义是「**本轮本该调工具却没调**」——只有本请求自己声明了 tools
+// 且没有禁止工具调用，才有「本该调」这回事。
+func DeclaredToolNames(body []byte) map[string]bool {
+	var req struct {
+		Tools []struct {
+			Name     string `json:"name"`
+			Function *struct {
+				Name string `json:"name"`
+			} `json:"function"`
+		} `json:"tools"`
+		Functions []struct {
+			Name string `json:"name"`
+		} `json:"functions"`
+		ToolChoice json.RawMessage `json:"tool_choice"`
+	}
+	if json.Unmarshal(body, &req) != nil {
+		return nil
+	}
+	// tool_choice="none"（或 {"type":"none"}）= 显式禁用工具调用 → 不判停摆。
+	if toolChoiceNone(req.ToolChoice) {
+		return nil
+	}
+	names := map[string]bool{}
+	for _, t := range req.Tools {
+		if t.Function != nil && t.Function.Name != "" {
+			names[t.Function.Name] = true
+			continue
+		}
+		if t.Name != "" {
+			names[t.Name] = true
+		}
+	}
+	for _, f := range req.Functions {
+		if f.Name != "" {
+			names[f.Name] = true
+		}
+	}
+	if len(names) == 0 {
+		return nil
+	}
+	return names
+}
+
+// toolChoiceNone 判断 tool_choice 是否显式禁用了工具调用。
+//
+// 形态：字符串 "none"（大小写不敏感、可带空白）或对象 {"type":"none"}。
+// 与 internal/upstream/payload.go 的 normalizeToolChoice 保持同一口径——
+// 那里在 "none" 时会把 tools/functions 从出站 body 里删掉（上游根本收不到工具
+// 声明），所以停摆判定也必须把这一路排除，否则会对一次刻意禁用工具的请求
+// 报「本该调工具却没调」。
+func toolChoiceNone(raw json.RawMessage) bool {
+	if len(raw) == 0 {
+		return false
+	}
+	var s string
+	if json.Unmarshal(raw, &s) == nil {
+		return strings.EqualFold(strings.TrimSpace(s), "none")
+	}
+	var obj map[string]any
+	if json.Unmarshal(raw, &obj) == nil {
+		typ, _ := obj["type"].(string)
+		return strings.EqualFold(strings.TrimSpace(typ), "none")
+	}
+	return false
+}
+
+// ToolStallInfo 描述一次「零 tool_calls 停摆」的判定结果。
+type ToolStallInfo struct {
+	// Suspect 为 true 表示本轮疑似停摆（声明了 tools 却零 tool_calls 且 stop 收尾）。
+	Suspect bool
+	// FinishReason 本轮的收尾原因（通常为 "stop"）。
+	FinishReason string
+	// ContentLen 本轮正文长度（仅供日志观测，**不参与判定**）。
+	ContentLen int
+	// HasText 本轮是否有正文（空正文 + 零 tool_calls 同样是停摆）。
+	HasText bool
+	// DeclaredTools 本次请求声明的工具名数量（观测用）。
+	DeclaredTools int
+}
+
+// DetectToolStall 判断一个**聚合后的**非流式响应是否是「零 tool_calls 停摆」。
+//
+// declaredTools 是**本请求自己声明**的工具名集合（见 DeclaredToolNames）——为空
+// 表示本请求没有声明任何工具，此时不存在「本该调工具却没调」的问题，一律不判停摆。
+//
+// resp 是 upstream.Aggregate 的输出（choices[].message + choices[].finish_reason）。
+//
+// 判定条件（三条全满足才算停摆）：
+//  1. 本请求声明了 tools（declaredTools 非空）；
+//  2. 本轮响应**没有任何** tool_calls（message.tool_calls 为空或缺失）；
+//  3. 收尾原因是 "stop"（其他收尾原因如 length / tool_calls / content_filter
+//     各自有别的语义，不算停摆）。
+//
+// 第 3 条是关键的收敛条件：「模型只说了话就收尾」在**没有** tools 声明的普通
+// 对话里是完全正常的行为；有 tools 声明时它才是异常信号。
+func DetectToolStall(resp map[string]any, declaredTools map[string]bool) ToolStallInfo {
+	info := ToolStallInfo{DeclaredTools: len(declaredTools)}
+	if len(declaredTools) == 0 || resp == nil {
+		return info
+	}
+	choices, ok := resp["choices"].([]any)
+	if !ok {
+		return info
+	}
+	for _, ci := range choices {
+		c, _ := ci.(map[string]any)
+		if c == nil {
+			continue
+		}
+		fr, _ := c["finish_reason"].(string)
+		msg, _ := c["message"].(map[string]any)
+		if msg == nil {
+			// 没有 message 段（异常形状）→ 不判停摆（宁可漏判不可误判）。
+			continue
+		}
+		if hasToolCalls(msg) {
+			// 本轮有工具调用 → 正常，不算停摆。
+			info.FinishReason = fr
+			return info
+		}
+		if fr != "stop" {
+			// 非 stop 收尾：length（截断）/ tool_calls（走了工具但被上游换形态）
+			// / content_filter 等，各有别的语义，不算停摆。
+			info.FinishReason = fr
+			return info
+		}
+		// 到这里：本轮零 tool_calls 且以 stop 收尾。
+		info.FinishReason = fr
+		if txt, ok := msg["content"].(string); ok {
+			info.ContentLen = len(txt)
+			info.HasText = strings.TrimSpace(txt) != ""
+		}
+		info.Suspect = true
+		return info
+	}
+	return info
+}
+
+// hasToolCalls 判断聚合响应的 message 段里是否带了 tool_calls。
+//
+// 兼容三种形态：
+//   - OpenAI 标准：message.tool_calls 是数组；
+//   - 上游偶发用对象：message.tool_calls 是单个对象；
+//   - Responses 风格：message.function_call 是对象。
+func hasToolCalls(msg map[string]any) bool {
+	switch v := msg["tool_calls"].(type) {
+	case []any:
+		return len(v) > 0
+	case map[string]any:
+		return len(v) > 0
+	}
+	switch v := msg["function_call"].(type) {
+	case map[string]any:
+		return len(v) > 0
+	case []any:
+		return len(v) > 0
+	}
+	return false
+}
+
+// StreamToolStallDetector 在**流式**路径上做同样的判定。
+//
+// 用途：流式响应一旦把帧写给客户端就收不回来了，无法在「整轮结束后」再决定是否
+// 重试。但它仍然有两个价值：
+//  1. **观测**：给出「本轮疑似停摆」的结论，写进请求日志与 stdout，让运维一眼
+//     看到停摆率与模型分布（而不是只能靠客户端侧统计）。
+//  2. **兜底判定**：流式与非流式的停摆定义一致，同一套观测口径。
+//
+// 它不改变任何透传字节（纯旁路），也不重试（重试决策放在非流式路径与客户端侧）。
+type StreamToolStallDetector struct {
+	// declaredTools 本请求声明的工具名集合。
+	declaredTools map[string]bool
+	// toolCallSeen 记录是否见过任何 tool_calls delta。
+	toolCallSeen bool
+	// finishReason 记录见到的收尾原因。
+	finishReason string
+	// contentLen 累计正文长度。
+	contentLen int
+}
+
+// NewStreamToolStallDetector 构造流式停摆探测器。
+func NewStreamToolStallDetector(declaredTools map[string]bool) *StreamToolStallDetector {
+	return &StreamToolStallDetector{declaredTools: declaredTools}
+}
+
+// Observe 观察一个上游帧（透传前的原始 chunk 对象）。只读不改。
+//
+// 帧形态：{"choices":[{"delta":{"tool_calls":[...]},"finish_reason":"stop"}]}
+func (d *StreamToolStallDetector) Observe(obj map[string]any) {
+	if d == nil || obj == nil {
+		return
+	}
+	choices, ok := obj["choices"].([]any)
+	if !ok {
+		return
+	}
+	for _, ci := range choices {
+		c, _ := ci.(map[string]any)
+		if c == nil {
+			continue
+		}
+		if fr, ok := c["finish_reason"].(string); ok && fr != "" {
+			d.finishReason = fr
+		}
+		delta, _ := c["delta"].(map[string]any)
+		if delta == nil {
+			continue
+		}
+		if tcs, ok := delta["tool_calls"].([]any); ok && len(tcs) > 0 {
+			d.toolCallSeen = true
+		}
+		if fc, ok := delta["function_call"].(map[string]any); ok && len(fc) > 0 {
+			d.toolCallSeen = true
+		}
+		if txt, ok := delta["content"].(string); ok {
+			d.contentLen += len(txt)
+		}
+	}
+}
+
+// Info 返回当前的停摆判定结果。
+func (d *StreamToolStallDetector) Info() ToolStallInfo {
+	if d == nil {
+		return ToolStallInfo{}
+	}
+	info := ToolStallInfo{
+		FinishReason:  d.finishReason,
+		ContentLen:    d.contentLen,
+		HasText:       d.contentLen > 0,
+		DeclaredTools: len(d.declaredTools),
+	}
+	if len(d.declaredTools) == 0 || d.toolCallSeen {
+		return info
+	}
+	if d.finishReason != "stop" {
+		return info
+	}
+	info.Suspect = true
+	return info
+}
+
+// MarshalJSON 让 ToolStallInfo 能直接进请求日志（字段名与其它观测字段一致风格）。
+func (t ToolStallInfo) MarshalJSON() ([]byte, error) {
+	type alias ToolStallInfo
+	return json.Marshal(alias(t))
+}

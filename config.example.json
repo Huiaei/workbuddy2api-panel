@@ -55,7 +55,9 @@
     "client_name": "",
     "device_token": "",
     "device_token_file": "",
-    "passthrough_ip": false
+    "passthrough_ip": false,
+    "_comment_tool_stall": "tool_stall_retry: 非流式请求声明了 tools 却收到「只回正文 + stop 收尾」时的自动重试次数（issue #149）。0 = 关闭重试（仍记录观测）。重试换号进行，不罚账号（上游行为缺陷，不是账号问题）。缺省 1。",
+    "tool_stall_retry": 1
   },
   "features": {
     "sanitize_blacklist_fingerprints": true
