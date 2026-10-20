@@ -88,6 +88,8 @@ func (p *Pool) resumeLocked(e *entry) {
 func (p *Pool) reviveCoolingLocked(e *entry, credits, total int64) {
 	e.credits = credits
 	e.creditsTotal = total
+	// 余额恢复是权威余额 ⇒ 「额度已知」。
+	e.creditsKnown = true
 	if e.coolKind == CoolHard {
 		e.until = time.Time{}
 		e.coolKind = 0

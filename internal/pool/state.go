@@ -146,6 +146,8 @@ func (p *Pool) ReenableIfCredits(uid string, remain, total int64) {
 			e.creditsTotal = total
 		}
 		e.creditsRemainder = 0
+		// 余额刷新拿到权威余额 ⇒ 「额度已知」（含读到 0 的情形）。
+		e.creditsKnown = true
 		// ReenableIfCredits 只有聚合余额上下文；到期明细必须由 SetCreditsSnapshot
 		// 重新写入，不能沿用旧窗口/旧批次的缓存。
 		e.creditsExpiring = 0
@@ -638,6 +640,7 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 		Nickname:                 e.a.Nickname,
 		Credits:                  e.credits,
 		CreditsTotal:             e.creditsTotal,
+		CreditsKnown:             e.creditsKnown,
 		CreditsExpiring:          e.creditsExpiring,
 		CreditsEarliestExpiry:    e.creditsEarliestExpiry,
 		CreditsEarliestRemaining: e.creditsEarliestRemaining,
