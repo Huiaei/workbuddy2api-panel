@@ -221,6 +221,26 @@ curl -s http://localhost:7863/healthz
 > 镜像 tag 规则：`main` 分支推送 `latest` / `main` / `sha-xxxxxx`；打 `v*` tag 额外发布
 > `1.2.3` / `1.2` / `1` 语义化版本；PR 仅构建验证、不推送。
 
+### 方式〇之二：本地构建（本 fork 的修复版镜像）
+
+上游 GHCR 镜像仍是**未修复**的版本（`11-128` 会被误判为账号封禁而永久禁用好号、
+`6021` 队列满被当限流冷却等）。要部署本 fork 的修复版，从源码构建：
+
+```bash
+git clone https://github.com/Huiaei/workbuddy2api-panel.git
+cd workbuddy2api-panel
+git checkout release/v1.13.0-fixed    # 以 1.13.0 发行版为基线的修复版
+docker build -t workbuddy2api-fixed:latest .
+docker run -d --name workbuddy2api \
+  -p 7863:7863 -e TZ=Asia/Shanghai \
+  -v ./auths:/app/auths -v ./data:/app/data -v ./config.json:/app/config.json \
+  workbuddy2api-fixed:latest
+```
+
+> `release/v1.13.0-fixed` = **精确的 1.13.0 发行版**（tag `d66384d`）+ 全部已知问题修复，
+> 不携带 1.13.0 之后的上游改动；`fix/all-known-issues-v1.13.0` = 上游 `main` + 同一套修复。
+> 两条分支的修复集相同，区别只在基线。
+
 ### 方式一：Docker Compose（推荐服务器部署）
 
 ```bash
