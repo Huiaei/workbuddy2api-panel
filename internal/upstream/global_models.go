@@ -59,6 +59,46 @@ type fetchGlobalModelsCache struct {
 	infos    []ModelInfo // 成功缓存：对象形态的全字段条目（窄表/失败形态为 nil）
 	fetched  time.Time
 	lastFail time.Time
+	// source 本次成功探测的目录来源：globalCatalogSourceDesktop / ...Union /
+	// ...Enterprise。面板用它把「拿到的是窄目录/旧目录」直接摆给运维看
+	//（issue #216 现象 1 就是 v3 探测失败静默降级到企业端点，用户只看到
+	//「少了 11 个模型」，却不知道自己拿的是哪一套目录）。
+	source string
+}
+
+// 目录来源标识（fetchGlobalModelsCache.source）。
+const (
+	globalCatalogSourceDesktop    = "v3-desktop"   // 桌面端 UA 族权威目录（官方 picker 口径）
+	globalCatalogSourceUnion      = "v3-union"     // 桌面族探测失败的回落：IDE+CLI 并集
+	globalCatalogSourceEnterprise = "enterprise"   // v3 全失败，只剩企业端点（窄目录 + 旧倍率）
+)
+
+// GlobalCatalogSource 返回最近一次成功探测的目录来源（空 = 尚未探测）。
+func (c *Client) GlobalCatalogSource() string {
+	if c == nil {
+		return ""
+	}
+	c.globalModels.Lock()
+	defer c.globalModels.Unlock()
+	return c.globalModels.source
+}
+
+// InvalidateGlobalModelsCache 清空 global 目录探测缓存（names/infos/成功与失败
+// 时间戳/来源），使下一次 FetchGlobalModels/FetchGlobalModelInfos 立即重新探测上游。
+//
+// 存在理由：面板「模型与档位 → 重新获取」此前只是重读 1h 缓存，点了数量纹丝不动
+//（issue #216 现象 3）。上游目录变动后运维需要一个立即生效的按钮，而不是等 TTL。
+func (c *Client) InvalidateGlobalModelsCache() {
+	if c == nil {
+		return
+	}
+	c.globalModels.Lock()
+	defer c.globalModels.Unlock()
+	c.globalModels.names = nil
+	c.globalModels.infos = nil
+	c.globalModels.fetched = time.Time{}
+	c.globalModels.lastFail = time.Time{}
+	c.globalModels.source = ""
 }
 
 // globalModelsTTL / globalModelsFailCooldown 探测缓存时长：成功 1h，失败 5min 负缓存。
@@ -120,7 +160,7 @@ func (c *Client) fetchGlobalModelsOnce(a *auth.Auth) (names []string, infos []Mo
 	}
 	c.globalModels.Unlock()
 
-	names, infos, efforts, defaults, err := c.probeGlobalModels(a)
+	names, infos, efforts, defaults, source, err := c.probeGlobalModels(a)
 	if err != nil || len(names) == 0 {
 		// 探测失败：负缓存 + 返回 nil（effort 桶不写，prepareBody 走 globalEffortMap 静态兜底）。
 		c.globalModels.Lock()
@@ -155,6 +195,7 @@ func (c *Client) fetchGlobalModelsOnce(a *auth.Auth) (names []string, infos []Mo
 	c.globalModels.infos = infos
 	c.globalModels.fetched = time.Now()
 	c.globalModels.lastFail = time.Time{}
+	c.globalModels.source = source
 	c.globalModels.Unlock()
 	return merged, infos
 }
@@ -175,7 +216,7 @@ func (c *Client) fetchGlobalModelsOnce(a *auth.Auth) (names []string, infos []Mo
 // 合并口径：桌面端条目字段权威，IDE/CLI 只补桌面端缺失的模型 id；去重 key =
 // 模型 id，输出顺序稳定。全部 v3 路失败且企业端点也失败才返回错误；单路失败
 // 降级为其余路结果 + warn 日志，互不拖累。
-func (c *Client) probeGlobalModels(a *auth.Auth) (names []string, infos []ModelInfo, efforts map[string][]string, defaults map[string]string, err error) {
+func (c *Client) probeGlobalModels(a *auth.Auth) (names []string, infos []ModelInfo, efforts map[string][]string, defaults map[string]string, source string, err error) {
 	// probeV3 单次 /v3/config 探测（UA 参数化）。该端点对不同 UA 下发**不同模型集合**：
 	// 桌面端 / IDE / CLI 三路各有独有模型（见 probeGlobalModels 注释），故并发三路取并集。
 	probeV3 := func(ua string) chan probeResult {
@@ -239,18 +280,18 @@ func (c *Client) probeGlobalModels(a *auth.Auth) (names []string, infos []ModelI
 
 	if v3.err != nil && enterprise.err != nil {
 		// 两路全失败 → 负缓存语义（等价原家族端点全非 2xx）。
-		return nil, nil, nil, nil, v3.err
+		return nil, nil, nil, nil, "", v3.err
 	}
 	if v3.err != nil {
 		// /v3 失败降级：不拖累企业端点结果（降级仅企业端点 + warn）。
 		log.Printf("WARN: [upstream] global models: v3/config probe failed (degraded to enterprise endpoint): %v", v3.err)
 		names, infos, efforts, defaults = extractEfforts(enterprise.infos)
-		return names, infos, efforts, defaults, nil
+		return names, infos, efforts, defaults, globalCatalogSourceEnterprise, nil
 	}
 	if enterprise.err != nil {
 		log.Printf("WARN: [upstream] global models: enterprise endpoint failed (v3/config only): %v", enterprise.err)
 		names, infos, efforts, defaults = extractEfforts(v3.infos)
-		return names, infos, efforts, defaults, nil
+		return names, infos, efforts, defaults, globalCatalogSourceDesktop, nil
 	}
 	// 两路皆成功：v3 为主、企业端点补缺合并（含 effort 桶合并，v3 权威）。
 	v3Names, v3Infos, v3Efforts, v3Defaults := extractEfforts(v3.infos)
@@ -264,7 +305,7 @@ func (c *Client) probeGlobalModels(a *auth.Auth) (names []string, infos []ModelI
 	names, infos = mergeGlobalCatalog(v3Names, v3Infos, entNames, entInfos)
 	efforts = mergeEffortBuckets(v3Efforts, entEfforts)
 	defaults = mergeEffortDefaults(v3Defaults, entDefaults)
-	return names, infos, efforts, defaults, nil
+	return names, infos, efforts, defaults, globalCatalogSourceDesktop, nil
 }
 
 // probeResult 单路模型目录探测结果（/v3/config 某 UA 路，或企业端点家族）。
