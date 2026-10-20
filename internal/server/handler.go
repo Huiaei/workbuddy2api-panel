@@ -1757,7 +1757,22 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 		}
 		h.cfg.Pool.CooldownSoftRate(uid, jitterDur(wafCooldownBase), time.Time{}, "waf 403 block")
 	case upstream.ErrSessionDead:
-		h.cfg.Pool.Disable(uid, "12153 session dead")
+		// 12153（session 失效）**连续 3 次**才禁用，与 scheduler 的 keepalive
+		// 口径一致（此前是「chat 里遇到 1 次就 Disable」）。
+		//
+		// 为什么统一成 3 次：12153 会在**上游偶发**地出现（token 刚好被别的
+		// 客户端用掉、并发刷新撞车、上游瞬时风控），单次就杀号是历史误判的
+		// 主要来源（13 个 disabled 号全是这么来的）。而 keepalive 侧早已是
+		// 「连续 3 次才禁用」——两套策略并存意味着：同一个账号在 chat 里
+		// 撞一次 12153 就被永久禁用（**且不自动恢复**，只能面板手动解冻），
+		// 在 keepalive 里撞三次才禁用。口径必须一致。
+		//
+		// 连续计数由 Pool.NoteSessionDead 维护；任何一次成功（NoteSuccess）
+		// 或 refresh 成功（ClearSessionDead）都会清零。
+		if h.cfg.Pool.NoteSessionDead(uid) {
+			log.Printf("WARN: [server] acct=%s: 连续 %d 次 12153 session dead — 禁用（需在面板解冻或重登）",
+				logfmt.Label(uid, ""), pool.SessionDeadThreshold())
+		}
 	case upstream.ErrNotFound:
 		// 404 短冷却（软冷却），防雪崩。固定 notFoundCooldown，不随 soft_rate 退避：
 		// 偶发路径缺失不是限流信号，不该按限流惩罚升级。
