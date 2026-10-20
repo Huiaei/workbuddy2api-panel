@@ -175,7 +175,13 @@ func IsChannelVerificationBlocked(body string) bool {
 	if hasBusinessCode(body, "11-128") || hasBusinessCode(body, "11128") {
 		return true
 	}
-	// 2) 文案特征：只有明确写着「渠道校验失败 / 不是官方客户端发出」才是请求级
+	// 2) 11140 = 账号级授权封禁，业务码是权威判据：即使信封里夹带渠道校验的
+	//    displayTips/displayMsg 文案，也不得降级成软冷却（两种形态共用同一句
+	//    msg、同一套信封字段，只有业务码能区分）。
+	if hasBusinessCode(body, "11140") {
+		return false
+	}
+	// 3) 文案特征：只有明确写着「渠道校验失败 / 不是官方客户端发出」才是请求级
 	//    拦截。裸 "request illegal"（无渠道校验特征）归账号级 11140 处置。
 	lower := strings.ToLower(body)
 	for _, m := range channelVerificationMarkers {

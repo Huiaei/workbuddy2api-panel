@@ -93,7 +93,9 @@ func TestIsChannelVerificationBlocked(t *testing.T) {
 		{"嵌套业务码", `{"error":{"data":{"code":"11-128","msg":"request illegal"}}}`, true},
 		{"渠道校验文案（无业务码）", `{"msg":"request illegal","displayTips":{"en":"This call failed channel verification, possibly because it was not sent from an official client."}}`, true},
 		{"11140 账号封禁", `{"code":11140,"msg":"request illegal"}`, false},
-		{"裸 request illegal（无特征）", `{"code":11140,"msg":"request illegal"}`, false},
+		{"11140 + 渠道校验文案（业务码优先，不得降级）", `{"code":11140,"msg":"request illegal","displayTips":{"en":"This call failed channel verification, possibly because it was not sent from an official client."}}`, false},
+		{"11140 + 中文拦截文案（业务码优先，不得降级）", `{"code":11140,"msg":"request illegal","displayMsg":{"zh":"请求被拦截，请重新发送","en":"Request blocked. Please send it again"}}`, false},
+		{"裸 request illegal（无业务码、无特征）", `{"msg":"request illegal"}`, false},
 		{"无关 body", `{"code":0,"msg":"ok"}`, false},
 		{"空 body", ``, false},
 	}
