@@ -518,6 +518,7 @@ func WithFrameObserver(fn func(obj map[string]any)) StreamOption {
 func WithStreamEndObserver(fn func(truncated bool)) StreamOption {
 	return func(o *streamOptions) { o.streamEndObserver = fn }
 }
+
 // WithErrorFrameObserver 注册"上游以 error 帧报错"的观察者：透传该帧之前先用
 // payload（原始 data 内容）回调一次。给调用方一个**账号处置**的挂载点——
 // 上游「200 + error 帧」是真实形态（6004 限流、内容拦截、审核），此前网关在读
