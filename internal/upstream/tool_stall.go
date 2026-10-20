@@ -260,11 +260,51 @@ func DetectToolStall(resp map[string]any, declaredTools map[string]bool, history
 		if txt, ok := msg["content"].(string); ok {
 			info.ContentLen = len(txt)
 			info.HasText = strings.TrimSpace(txt) != ""
+			// 自防御：正文里含**模型原生工具调用标记** ⇒ 上游其实调了工具，
+			// 只是把调用吐成了文本标记（见 dsml.go 的背景说明）。
+			// 这种形态**绝不能**判停摆，否则会：
+			//   - 白白换号重试一次（多花一次上游调用、客户端多等一轮）；
+			//   - 在没有标记修复层的分支上把「工具其实调了」的回合误报成停摆，
+			//     污染停摆率统计（issue #149 的可观测性会失真）。
+			//
+			// 正常路径上标记已在修复层被还原成结构化 tool_calls（此时
+			// hasToolCalls 已在上方返回 true），这条自防御是**兜底**：
+			// 任何未来新增的调用方忘了先跑修复层，也不会把误判带进来。
+			if containsMarkupCall(txt) {
+				info.FinishReason = fr
+				return info
+			}
 		}
 		info.Suspect = true
 		return info
 	}
 	return info
+}
+
+// markupCallOpenTag 是模型原生工具调用标记的**开始标记**。
+//
+// 与 dsml.go 的 markupOpen 同值（main 分支里 markupOpen 直接由本常量派生，
+// 保证「修复层认的标记」与「停摆检测认的标记」永远一致，不会各自漂移）。
+//
+// 这里刻意**不引用** dsml.go 的常量：v1.13.0 基线分支（release/v1.13.0-fixed）
+// 不含 dsml.go（那是上游 v1.13.0 之后的 9 个提交之一引入的），引用它会让
+// 基线分支编译不过。
+const markupCallOpenTag = "<\uFF5C\uFF5C" + "DSML" + "\uFF5C\uFF5C calls>"
+
+// containsMarkupCall 判断文本里是否含模型原生工具调用标记的**开始标记**。
+//
+// 用开始标记（markupCallOpenTag）而不是完整的块：开始标记已经足以说明「上游在
+// 正文里写了工具调用」，而完整块可能因分片边界不完整（增量到达时块被切成两片）。
+//
+// 标记块被修复层处理过时，会从正文里被**移走**（dsml.go 的 Feed 会把块内容
+// 替换成空串），所以修复后这里读不到标记 —— 这正是我们要的：
+// 「修复过 → 有结构化 tool_calls → 不是停摆」与「没修复 → 正文含标记 → 也不是
+// 停摆」两条路径口径一致。
+func containsMarkupCall(text string) bool {
+	if text == "" {
+		return false
+	}
+	return strings.Contains(text, markupCallOpenTag)
 }
 
 // hasToolCalls 判断聚合响应的 message 段里是否带了 tool_calls。
