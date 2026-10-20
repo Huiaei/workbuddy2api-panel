@@ -1490,6 +1490,12 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 		ctx = context.Background()
 	}
 	prepared := c.prepareBody(body, a.Realm(), a.UID, meta.ConversationID)
+	if os.Getenv("WB2A_DUMP_BODY") != "" {
+		// 调试开关：打印入站与出站请求体，便于定位上游 11-128/11140 这类
+		// 「按请求体判定」的错误。上线不需要，长会话请自行截断。
+		log.Printf("[dbg-body] inbound  : %s", string(body))
+		log.Printf("[dbg-body] prepared: %s", string(prepared))
+	}
 	if c.globalOn(a) {
 		prepared = ensureConsoleSystem(prepared)
 	}
