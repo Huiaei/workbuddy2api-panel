@@ -648,9 +648,10 @@ func TestChatHardCreditCooldownUntilNextDay4AM(t *testing.T) {
 	if st.Reason != "余额不足" {
 		t.Errorf("reason=%q", st.Reason)
 	}
-	// 硬信贷冷却必须是次日 04:00，而不是固定 12h/配置时长。
-	if st.Until.Hour() != 4 {
-		t.Errorf("until hour=%d want 4 (next-day 04:00)", st.Until.Hour())
+	// 硬信贷冷却必须是**上游时区**（CST=UTC+8）的次日 04:00，而不是固定
+	// 12h/配置时长，也不是部署机器的本地 04:00 —— 上游额度重置的墙钟由上游决定。
+	if st.Until.In(pool.UpstreamCSTZone()).Hour() != 4 {
+		t.Errorf("until hour=%d (CST) want 4 (next-day 04:00); until=%v", st.Until.In(pool.UpstreamCSTZone()).Hour(), st.Until)
 	}
 	// 距次日 04:00 最长 28h（凌晨 00:00~04:00 间运行时 now→次日 04:00 跨度 > 24h，属正常）。
 	if d := time.Until(st.Until); d <= 0 || d > 28*time.Hour {
@@ -686,7 +687,7 @@ func TestChat429Code14018UsesHardCreditCooldown(t *testing.T) {
 	if !ok || !st.Cooling {
 		t.Fatalf("14018 account should be cooling: %+v ok=%v", st, ok)
 	}
-	if st.Reason != "余额不足" || st.Until.Hour() != 4 {
+	if st.Reason != "余额不足" || st.Until.In(pool.UpstreamCSTZone()).Hour() != 4 {
 		t.Fatalf("14018 should use hard-credit cooldown, got reason=%q until=%v", st.Reason, st.Until)
 	}
 	if got := p.Pick(); got == nil || got.UID != "good" {
