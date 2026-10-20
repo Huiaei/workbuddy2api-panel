@@ -169,10 +169,10 @@ func TestDetectToolStallUnit(t *testing.T) {
 			"finish_reason": "stop",
 		}},
 	}
-	if got := upstream.DetectToolStall(body, tools); !got.Suspect {
+	if got := upstream.DetectToolStall(body, tools, false, false); !got.Suspect {
 		t.Errorf("long text + zero tool_calls + stop must be suspect, got %+v", got)
 	}
-	if got := upstream.DetectToolStall(body, tools); got.ContentLen != 1200 {
+	if got := upstream.DetectToolStall(body, tools, false, false); got.ContentLen != 1200 {
 		t.Errorf("ContentLen=%d want 1200", got.ContentLen)
 	}
 
@@ -183,12 +183,12 @@ func TestDetectToolStallUnit(t *testing.T) {
 			"finish_reason": "tool_calls",
 		}},
 	}
-	if got := upstream.DetectToolStall(withCall, tools); got.Suspect {
+	if got := upstream.DetectToolStall(withCall, tools, false, false); got.Suspect {
 		t.Errorf("response with tool_calls must not be suspect: %+v", got)
 	}
 
 	// 没有声明 tools → 不是停摆（普通对话回正文是正常的）。
-	if got := upstream.DetectToolStall(body, nil); got.Suspect {
+	if got := upstream.DetectToolStall(body, nil, false, false); got.Suspect {
 		t.Errorf("no tools declared must not be suspect: %+v", got)
 	}
 
@@ -199,7 +199,7 @@ func TestDetectToolStallUnit(t *testing.T) {
 			"finish_reason": "length",
 		}},
 	}
-	if got := upstream.DetectToolStall(trunc, tools); got.Suspect {
+	if got := upstream.DetectToolStall(trunc, tools, false, false); got.Suspect {
 		t.Errorf("finish_reason=length must not be suspect: %+v", got)
 	}
 
@@ -210,7 +210,7 @@ func TestDetectToolStallUnit(t *testing.T) {
 			"finish_reason": "stop",
 		}},
 	}
-	if got := upstream.DetectToolStall(short, tools); !got.Suspect {
+	if got := upstream.DetectToolStall(short, tools, false, false); !got.Suspect {
 		t.Errorf("short text + zero tool_calls + stop must be suspect: %+v", got)
 	}
 }
@@ -220,7 +220,7 @@ func TestStreamToolStallDetector(t *testing.T) {
 	tools := map[string]bool{"get_weather": true}
 
 	// 只有正文 + stop → 停摆。
-	d := upstream.NewStreamToolStallDetector(tools)
+	d := upstream.NewStreamToolStallDetector(tools, false, false)
 	d.Observe(map[string]any{"choices": []any{map[string]any{
 		"delta": map[string]any{"content": "我这就去查"},
 	}}})
@@ -232,7 +232,7 @@ func TestStreamToolStallDetector(t *testing.T) {
 	}
 
 	// 有 tool_calls → 不停摆。
-	d2 := upstream.NewStreamToolStallDetector(tools)
+	d2 := upstream.NewStreamToolStallDetector(tools, false, false)
 	d2.Observe(map[string]any{"choices": []any{map[string]any{
 		"delta": map[string]any{"tool_calls": []any{map[string]any{"index": 0, "id": "c1"}}},
 	}}})
@@ -244,7 +244,7 @@ func TestStreamToolStallDetector(t *testing.T) {
 	}
 
 	// 没声明 tools → 不停摆。
-	d3 := upstream.NewStreamToolStallDetector(nil)
+	d3 := upstream.NewStreamToolStallDetector(nil, false, false)
 	d3.Observe(map[string]any{"choices": []any{map[string]any{
 		"delta": map[string]any{"content": "你好"},
 	}}})

@@ -86,6 +86,73 @@ func DeclaredToolNames(body []byte) map[string]bool {
 	return names
 }
 
+// HistoryHasToolResult 判断**会话历史**里是否已经出现过「工具结果」。
+//
+// 为什么停摆判定需要它：真实 agentic 客户端（DSH、Codex、Cline…）**每一轮都会
+// 重发同一份 tools 声明**。于是多轮会话的**正常收尾轮**（模型给出最终答案、
+// finish_reason=stop、零 tool_calls）也满足「本请求声明了 tools」的表面条件——
+// 若只看这一条，每一轮正常收尾都会被误判成停摆，触发一次无谓的换号重试
+// （多花一次上游调用 + 一次计费），把一个正常回答变成两次请求。
+//
+// 判据取「历史里出现过 role=tool 的结果消息」而不是「出现过 tool_calls」：
+//   - 历史里有 tool_calls 但**还没有**工具结果 → 说明上一轮刚要调工具，本轮
+//     拿到的正文就停住了 → **正是**停摆的典型现场，必须判停摆；
+//   - 历史里已经有工具结果 → 说明工具**跑过了**，本轮的正文是最终答案 → 不是停摆。
+//
+// 解析失败一律返回 false（= 允许判停摆）：宁可多判一次（多一次重试），
+// 也不要把真停摆放过（放过 = 工具永远不跑，任务卡死）。
+func HistoryHasToolResult(body []byte) bool {
+	var req struct {
+		Messages []struct {
+			Role string `json:"role"`
+		} `json:"messages"`
+	}
+	if json.Unmarshal(body, &req) != nil {
+		return false
+	}
+	for _, m := range req.Messages {
+		if m.Role == "tool" || m.Role == "function" {
+			return true
+		}
+	}
+	return false
+}
+
+// ToolChoiceForcesTool 判断 tool_choice 是否**点名要求**调某个具体函数。
+//
+// 形态：{"type":"function","function":{"name":"get_weather"}}（OpenAI 规范）。
+//
+// 意义：客户端点名要调哪个函数时，「零 tool_calls」是**确定**的停摆——模型被明确
+// 要求调这个函数却只回了正文，工具一定没跑。这条比「声明了 tools」精确得多，
+// 不受「模型选择直接回答」这类合理行为干扰。
+//
+// 返回 true 时，停摆判定不再需要「历史里没有工具结果」这一条辅助条件。
+func ToolChoiceForcesTool(body []byte) bool {
+	var req struct {
+		ToolChoice json.RawMessage `json:"tool_choice"`
+	}
+	if json.Unmarshal(body, &req) != nil {
+		return false
+	}
+	raw := req.ToolChoice
+	if len(raw) == 0 {
+		return false
+	}
+	var obj struct {
+		Type     string `json:"type"`
+		Function *struct {
+			Name string `json:"name"`
+		} `json:"function"`
+	}
+	if json.Unmarshal(raw, &obj) != nil {
+		return false
+	}
+	if !strings.EqualFold(strings.TrimSpace(obj.Type), "function") {
+		return false
+	}
+	return obj.Function != nil && strings.TrimSpace(obj.Function.Name) != ""
+}
+
 // toolChoiceNone 判断 tool_choice 是否显式禁用了工具调用。
 //
 // 形态：字符串 "none"（大小写不敏感、可带空白）或对象 {"type":"none"}。
@@ -128,19 +195,38 @@ type ToolStallInfo struct {
 // declaredTools 是**本请求自己声明**的工具名集合（见 DeclaredToolNames）——为空
 // 表示本请求没有声明任何工具，此时不存在「本该调工具却没调」的问题，一律不判停摆。
 //
+// historyHasToolResult 表示**会话历史里已经出现过工具结果**（见
+// HistoryHasToolResult）。为 true 时**不判停摆**：工具已经跑过了，本轮的正文
+// 就是最终答案——真实 agentic 客户端每轮都重发同一份 tools 声明，不加这一条就会
+// 把每一次正常收尾都误判成停摆。
+//
 // resp 是 upstream.Aggregate 的输出（choices[].message + choices[].finish_reason）。
 //
-// 判定条件（三条全满足才算停摆）：
+// 判定条件（四条全满足才算停摆）：
 //  1. 本请求声明了 tools（declaredTools 非空）；
-//  2. 本轮响应**没有任何** tool_calls（message.tool_calls 为空或缺失）；
-//  3. 收尾原因是 "stop"（其他收尾原因如 length / tool_calls / content_filter
+//  2. 会话历史里还没有工具结果（historyHasToolResult=false）；
+//  3. 本轮响应**没有任何** tool_calls（message.tool_calls 为空或缺失）；
+//  4. 收尾原因是 "stop"（其他收尾原因如 length / tool_calls / content_filter
 //     各自有别的语义，不算停摆）。
 //
-// 第 3 条是关键的收敛条件：「模型只说了话就收尾」在**没有** tools 声明的普通
+// 第 4 条是关键的收敛条件：「模型只说了话就收尾」在**没有** tools 声明的普通
 // 对话里是完全正常的行为；有 tools 声明时它才是异常信号。
-func DetectToolStall(resp map[string]any, declaredTools map[string]bool) ToolStallInfo {
+func DetectToolStall(resp map[string]any, declaredTools map[string]bool, historyHasToolResult bool, forcedTool bool) ToolStallInfo {
 	info := ToolStallInfo{DeclaredTools: len(declaredTools)}
 	if len(declaredTools) == 0 || resp == nil {
+		return info
+	}
+	if historyHasToolResult && !forcedTool {
+		// 历史里已经有工具结果 → 工具跑过了，本轮是最终答案 → 不是停摆。
+		//
+		// 例外：客户端用 tool_choice 点名了要调某个函数 → 「零 tool_calls」是确定
+		// 的停摆（模型被明确要求调它却只回正文），此时历史判定不适用。
+		return info
+	}
+	// 截断排除：上游流被截断（没发 [DONE] 就 EOF）时，本轮的零 tool_calls 可能是
+	// 「工具调用帧还没到就被切断」，不是「模型决定不调工具」。传输层截断是另一
+	// 类问题，不能记成上游行为缺陷（issue #149 的停摆率统计会被污染）。
+	if trunc, _ := resp["_truncated"].(bool); trunc {
 		return info
 	}
 	choices, ok := resp["choices"].([]any)
@@ -221,11 +307,47 @@ type StreamToolStallDetector struct {
 	finishReason string
 	// contentLen 累计正文长度。
 	contentLen int
+	// truncated 记录上游流是否被截断（没发 [DONE] 就 EOF）。截断时的零
+	// tool_calls 是「帧没到齐」，不是停摆。
+	truncated bool
+	// repaired 记录本流是否由标记修复器还原出过工具调用（上游吐的是标记文本
+	// 而不是结构化 tool_calls）。还原过 = 上游**确实调了工具** → 不是停摆。
+	// 没有这个信号时流式与非流式会给出相反结论（非流式先修复再判定 → 不停摆；
+	// 流式观测原始帧 → 停摆），同一形态两种口径，统计不可用。
+	repaired bool
+	// historyHasToolResult 会话历史里已经出现过工具结果 → 不判停摆
+	// （与 DetectToolStall 同口径：工具跑过了，本轮是最终答案）。
+	historyHasToolResult bool
+	// forcedTool 客户端用 tool_choice 点名了要调某个函数 → 「零 tool_calls」是
+	// 确定的停摆（模型被明确要求调它却只回正文），历史判定不适用。
+	forcedTool bool
 }
 
 // NewStreamToolStallDetector 构造流式停摆探测器。
-func NewStreamToolStallDetector(declaredTools map[string]bool) *StreamToolStallDetector {
-	return &StreamToolStallDetector{declaredTools: declaredTools}
+//
+// historyHasToolResult 表示会话历史里已经出现过工具结果；为 true 时**不判停摆**
+// （与 DetectToolStall 同口径）。
+func NewStreamToolStallDetector(declaredTools map[string]bool, historyHasToolResult bool, forcedTool bool) *StreamToolStallDetector {
+	return &StreamToolStallDetector{declaredTools: declaredTools, historyHasToolResult: historyHasToolResult, forcedTool: forcedTool}
+}
+
+// MarkTruncated 标记本流被截断（上游没发 [DONE] 就 EOF 收尾）。
+// 截断的零 tool_calls 不算停摆。
+//
+// 签名与 WithStreamEndObserver 的回调一致（func(truncated bool)）：回调收到
+// truncated=true 时才置位，truncated=false 什么都不做。
+func (d *StreamToolStallDetector) MarkTruncated(truncated bool) {
+	if d != nil && truncated {
+		d.truncated = true
+	}
+}
+
+// MarkRepaired 标记本流由标记修复器还原出过工具调用（上游吐的是原生标记文本）。
+// 还原过 → 上游确实调了工具 → 不算停摆（与非流式口径对齐）。
+func (d *StreamToolStallDetector) MarkRepaired(n int) {
+	if d != nil && n > 0 {
+		d.repaired = true
+	}
 }
 
 // Observe 观察一个上游帧（透传前的原始 chunk 对象）。只读不改。
@@ -275,6 +397,18 @@ func (d *StreamToolStallDetector) Info() ToolStallInfo {
 		DeclaredTools: len(d.declaredTools),
 	}
 	if len(d.declaredTools) == 0 || d.toolCallSeen {
+		return info
+	}
+	if d.historyHasToolResult && !d.forcedTool {
+		// 历史里已经有工具结果 → 工具跑过了，本轮是最终答案 → 不是停摆。
+		return info
+	}
+	if d.truncated {
+		// 截断：工具调用帧可能还没到就被切断，不是「模型决定不调工具」。
+		return info
+	}
+	if d.repaired {
+		// 标记修复器还原出过调用 → 上游确实调了工具（只是吐成了文本标记）。
 		return info
 	}
 	if d.finishReason != "stop" {
