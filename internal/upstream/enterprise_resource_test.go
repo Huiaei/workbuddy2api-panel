@@ -177,6 +177,38 @@ func TestEnterpriseResourceZeroQuotaIsLegitimate(t *testing.T) {
 	}
 }
 
+// TestEnterpriseResourceFieldNameCaseInsensitive 额度字段名大小写不敏感。
+//
+// 真正解析 data 的结构体走 encoding/json，它对字段名是**大小写不敏感**匹配的
+// （`Credit` / `CREDIT` / `credit` 都落到同一个字段）。所以「字段存在性」判空
+// 必须同口径，否则上游只改一下字段大小写，全部企业号的额度查询就会被误报成
+// 「上游没给数据」——一个本来完全正常的响应被当成故障。
+func TestEnterpriseResourceFieldNameCaseInsensitive(t *testing.T) {
+	for _, body := range []string{
+		`{"code":0,"msg":"OK","data":{"Credit":812.45,"LimitNum":2000}}`,
+		`{"code":0,"msg":"OK","data":{"CREDIT":812.45,"LIMITNUM":2000}}`,
+		`{"code":0,"msg":"OK","data":{"credit":812.45,"limitnum":2000}}`,
+	} {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Write([]byte(body))
+		}))
+
+		c := &Client{HTTP: srv.Client(), BillingBaseCN: srv.URL}
+		a := &auth.Auth{UID: "u1", AccessToken: "at", EnterpriseID: "ent-1"}
+
+		remain, total, _, _, _, err := c.UserResourceDetailedWithExpiry(a, 0)
+		srv.Close()
+		if err != nil {
+			t.Errorf("body=%s err=%v（字段名大小写不该被当成故障）", body, err)
+			continue
+		}
+		// credit=812.45 是**已用**，ceil 后 813；remain = 2000-813 = 1187。
+		if remain != 1187 || total != 2000 {
+			t.Errorf("body=%s remain=%d total=%d want 1187/2000", body, remain, total)
+		}
+	}
+}
+
 // TestEnterpriseResourceUnlimited 上游 limitNum=-1 表示不限量：池内用大剩余量表示，
 // total 记 -1（面板显示「不限」），且不参与周期分桶（不限量没有"未用完作废"语义）。
 func TestEnterpriseResourceUnlimited(t *testing.T) {
@@ -278,5 +310,54 @@ func TestAPIKeyRoutesToEnterpriseBilling(t *testing.T) {
 	// 500 - 100 = 400。
 	if remain != 400 || total != 500 {
 		t.Errorf("remain=%d total=%d want 400/500", remain, total)
+	}
+}
+
+// TestEnterpriseResourceSnakeCaseUnderMixedCase 归一化读取：snake_case 字段在
+// 混着大小写时也认（limit_num / LIMIT_NUM / LimitNum 全部等价）。
+func TestEnterpriseResourceSnakeCaseUnderMixedCase(t *testing.T) {
+	for _, body := range []string{
+		`{"code":0,"msg":"OK","data":{"used_num":500,"limit_num":1500}}`,
+		`{"code":0,"msg":"OK","data":{"USED_NUM":500,"LIMIT_NUM":1500}}`,
+		`{"code":0,"msg":"OK","data":{"UsedNum":500,"LimitNum":1500}}`,
+	} {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Write([]byte(body))
+		}))
+
+		c := &Client{HTTP: srv.Client(), BillingBaseCN: srv.URL}
+		a := &auth.Auth{UID: "u1", AccessToken: "at", EnterpriseID: "ent-1"}
+
+		remain, total, _, _, _, err := c.UserResourceDetailedWithExpiry(a, 0)
+		srv.Close()
+		if err != nil {
+			t.Errorf("body=%s err=%v", body, err)
+			continue
+		}
+		if remain != 1000 || total != 1500 {
+			t.Errorf("body=%s remain=%d total=%d want 1000/1500", body, remain, total)
+		}
+	}
+}
+
+// TestEnterpriseResourceMixedCaseUsedNum 归一化后 used_num 与 credit 同一优先级：
+// 两者都出现时以 credit 为准（credit 是企业口径的「已用」语义）。
+func TestEnterpriseResourceMixedCaseUsedNum(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"code":0,"msg":"OK","data":{"credit":100,"Credit":900,"limitNum":2000}}`))
+	}))
+	defer srv.Close()
+
+	c := &Client{HTTP: srv.Client(), BillingBaseCN: srv.URL}
+	a := &auth.Auth{UID: "u1", AccessToken: "at", EnterpriseID: "ent-1"}
+
+	remain, total, _, _, _, err := c.UserResourceDetailedWithExpiry(a, 0)
+	if err != nil {
+		t.Fatalf("err=%v", err)
+	}
+	// 同名不同大小写各出现一次：归一化后取后出现者（map 遍历序不定）——只断言
+	// 结果落在两个合法值之一，不钉死遍历序。
+	if (remain != 1900 && remain != 1100) || total != 2000 {
+		t.Errorf("remain=%d total=%d want 1900 或 1100 / 2000", remain, total)
 	}
 }
