@@ -1509,6 +1509,24 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 			return nil, 0, nil, err
 		}
 		c.ChatHeaders(req, a, clientIP, meta)
+		if os.Getenv("WB2A_DUMP_BODY") != "" {
+			// 出站头快照：上游风控按头族判定「是否官方客户端」，出问题时
+			// 不看到实际头就只能猜。与 body dump 共用同一个开关。
+			keys := make([]string, 0, len(req.Header))
+			for k := range req.Header {
+				keys = append(keys, k)
+			}
+			sort.Strings(keys)
+			lines := make([]string, 0, len(keys))
+			for _, k := range keys {
+				v := strings.Join(req.Header[k], ",")
+				if k == "Authorization" || k == "X-Api-Key" {
+					v = "<redacted len=" + strconv.Itoa(len(v)) + ">"
+				}
+				lines = append(lines, k+": "+v)
+			}
+			log.Printf("[dbg-headers] %s %s\n%s", req.Method, endpoint, strings.Join(lines, "\n"))
+		}
 		// 从调用方 ctx 派生：保留取消传播（父 ctx 取消 → 本 ctx 取消），
 		// 同时 monitorBody.Close 仍能独立 cancel 本分支（空闲掐流）。
 		reqCtx, cancel := context.WithCancel(ctx)
