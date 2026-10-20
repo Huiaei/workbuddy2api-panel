@@ -125,10 +125,16 @@ func TestIsChannelRefused(t *testing.T) {
 		// 11140 = 真封禁，不得降级成通道校验。
 		{"11140 账号封禁", `{"code":11140,"msg":"request illegal"}`, false},
 		{"11140 + 渠道校验文案", `{"code":11140,"msg":"request illegal","displayTips":{"en":"This call failed channel verification, possibly because it was not sent from an official client."}}`, false},
-		// 内容审核变体属 ErrContentBlocked 域（已有降级重试通道），不得被通道
-		// 校验语义吞掉。
-		{"11128 内容审核变体", `{"code":11128,"msg":"blocked by security policy"}`, false},
-		{"11128 unapproved channel", `{"code":11128,"msg":"Illegal API invocation from an unapproved channel"}`, false},
+		// 真内容拦截（"blocked by security policy"）仍归审核域：它不带 11-128
+		// 业务码（实测录像是纯文案），是**内容**问题，不是请求形状问题。
+		{"11128 真内容审核变体", `{"code":11128,"msg":"blocked by security policy"}`, false},
+		// 但 11-128 + "unapproved channel"/"illegal api invocation" 是**渠道校验**
+		// 变体（2026-10-20 真机实录：首条 developer → 400 11-128 Illegal API
+		// invocation from an unapproved channel），不得归审核域：归审核域会触发
+		// 全局降级门（降级到次日 00:00 CST），一次请求级形状问题被放大成整网关
+		// 整天的降级。
+		{"11128 unapproved channel", `{"code":11128,"msg":"Illegal API invocation from an unapproved channel"}`, true},
+		{"11128 unapproved channel（短文案）", `{"code":11128,"msg":"unapproved channel"}`, true},
 		// 无业务码 → 不认（宁可通用兜底，不可凭文案硬禁用）。
 		{"裸 request illegal（无业务码）", `{"msg":"request illegal"}`, false},
 		{"无关 body", `{"code":0,"msg":"ok"}`, false},

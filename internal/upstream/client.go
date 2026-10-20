@@ -196,20 +196,24 @@ func IsAccountRestricted(body string) bool {
 // 写的是「这次调用没通过渠道校验，可能不是官方客户端发出的」。
 //
 // 业务码是权威判据（11-128 与 11128 是同一码的两种书写：带连字符的字符串
-// "11-128" / 数字 11128），但**必须与文案合取**：11128 还承载内容审核变体
-// （"blocked by security policy" / "unapproved channel" / "illegal api
-// invocation" → ErrContentBlocked 域，非渠道校验），按 code 一刀切会把内容审核
-// 误报改成渠道校验。
+// "11-128" / 数字 11128）。文案只作**补充**，不参与否决——上游在同一个渠道
+// 校验业务码下有多个 msg 变体（见下），文案判据覆盖不全。
 //
 // 已知 msg 变体（同一业务码，语义都是「请求形状」）：
 //   - "request illegal"（issue #197 抓包实录）
 //   - "conversation id missing"（issue #188 实录：出站缺 X-Conversation-ID）
 //   - "first message is not system prompt"（issue #231 实录：首条消息非 system）
-//
-// 判定顺序：内容审核文案优先（那是另一个域，且已有降级重试通道）→ 渠道文案 →
-// 业务码兜底（11-128 本身就是渠道校验业务码）。
+//   - "Illegal API invocation from an unapproved channel"（issue #231 实录：首条
+//     消息是 developer）
 //
 // 11140 优先：真封禁不得被渠道文案降级（只有业务码能区分二者）。
+//
+// 内容审核域的边界：真正的内容拦截（"blocked by security policy"）**不带**
+// 11-128/11128 业务码；一旦带了该业务码，它就是渠道校验——哪怕文案里出现
+// "unapproved channel" / "illegal api invocation" 这两个与审核词表重叠的短语。
+// 早期实现按文案把 11-128 判成 ErrContentBlocked，后果是**触发全局降级门**
+// （h.degrade.Trigger()，降级到次日 00:00 CST）：一次形状不对的请求就让整个
+// 网关对所有账号、所有模型进入降级提示词模式，代价远大于问题本身。
 func IsChannelRefused(body string) bool {
 	if !hasBusinessCode(body, "11-128") && !hasBusinessCode(body, "11128") {
 		return false
@@ -218,12 +222,20 @@ func IsChannelRefused(body string) bool {
 		return false
 	}
 	lower := strings.ToLower(body)
-	// 内容审核变体优先：11128 + 审核文案属 ErrContentBlocked 域（已有降级重试
-	// 通道），不能被渠道校验语义吞掉。
-	for _, m := range contentBlockedMarkers {
-		if strings.Contains(lower, strings.ToLower(m)) {
-			return false
-		}
+	// 内容审核文案：只有**真正的内容拦截**才否决渠道校验判定。
+	//
+	// contentBlockedMarkers 里的 "unapproved channel" / "illegal api invocation"
+	// 与渠道校验文案**逐字重叠**（2026-10-20 真机实录：首条 developer →
+	// 400 11-128 "Illegal API invocation from an unapproved channel"），但它是
+	// **渠道校验**变体（请求形状），不是内容审核。按文案否决会把一次请求级
+	// 形状问题变成 ErrContentBlocked → 触发全局降级门（h.degrade.Trigger()，
+	// 降级到次日 00:00 CST）：整个网关对所有账号、所有模型进入降级提示词模式，
+	// 代价远大于问题本身。
+	//
+	// 故此处只让真内容拦截（"blocked by security policy"）否决；它不带
+	// 11-128/11128 业务码（实测录像是纯文案），故正常情况下根本走不到这里。
+	if strings.Contains(lower, "blocked by security policy") {
+		return false
 	}
 	for _, m := range channelRefusedMarkers {
 		if strings.Contains(lower, m) {

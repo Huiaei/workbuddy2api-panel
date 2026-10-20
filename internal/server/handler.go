@@ -965,39 +965,25 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// 的问题——账号本身健康（官方客户端可正常使用同一账号），故 applyErrorPolicy
 			// 对 ErrChannelRefused **零动作**（不冷却/不熔断/不 NoteFailures）。
 			//
-			// 为什么不轮转：通道指纹是**出口 IP + 出站头部 + 请求体形状**的组合，换号
-			// 不改变它——同一个号换出去还是同一个出口、同样的头。轮转只会把无效请求
-			// 放大 MaxRotate 倍、每号各交一次上游配额，最后末端落成
-			// 「其余保持 503 no_healthy_account」，把一个**确定性的客户端侧问题**伪装
-			// 成「服务端暂时过载」，客户端于是对必然失败的请求无限重试。故立即透传
-			// 上游原文回 400 + 可操作的 gateway_hint（排查 UA/头部/拦截代理）。
+			// **必须继续轮转**：上游的 11-128/11128 判定并非只看出口 IP——issue #197
+			// 的实测（用与网关完全一致的出站头部直连上游）显示：同一时刻，被记成
+			// 「禁用」的号稳定 400 11-128，而**另一个健康号稳定 200**。上游风控是
+			// **按账号**判定的（账号自身的历史风险画像），换号确实可能换到能过的号。
+			// 另有出站头部本身按账号不同（企业号带 X-Userinfo，个人号不带），
+			// 故「所有号出站头一致」的前提也不成立。
 			//
-			// 例外：跨域回退开启（pool.cross_domain_fallback，默认关）且**另一域还有
-			// 能服务该模型的号**时，换域确实可能换到另一条通道（CN 域与国际域的端点
-			// 与校验链不同）——此时值得再试一次，故不终止轮转。
+			// 因此这里**不 fail-fast**：只换号、绝不罚号，让轮转去找那个能过的号。
+			// 轮转耗尽后由末端映射给 400 + channel_refused（不是 503
+			// no_healthy_account——后者把确定失败的请求伪装成「服务端过载」，客户端
+			// 会无限重试）。
 			if kind == upstream.ErrChannelRefused {
-				otherHasAccount := crossRealm && h.cfg.Pool.ServableForModelRealm(bareModel, otherRealm(acct.Realm())) > 0
-				if otherHasAccount {
-					// 换域可能换到另一条通道：让轮转继续试另一域的号（仍不罚号）。
-					h.applyErrorPolicy(acct.UID, kind, string(respBody), bareModel, uerr)
-					fail(acct.UID)
-					lastErr = &upstream.Error{Kind: kind, Status: status, Msg: string(respBody), RetryAfter: uerr.RetryAfter}
-					if !rotateBackoff(i, r.Context()) {
-						break
-					}
-					continue
-				}
 				h.applyErrorPolicy(acct.UID, kind, string(respBody), bareModel, uerr)
 				fail(acct.UID)
-				msg := string(respBody)
-				if strings.TrimSpace(msg) == "" {
-					msg = "upstream rejected the request channel (it may not look like the official client)"
+				lastErr = &upstream.Error{Kind: kind, Status: status, Msg: string(respBody), RetryAfter: uerr.RetryAfter}
+				if !rotateBackoff(i, r.Context()) {
+					break
 				}
-				writeOpenAIErrorHint(w, http.StatusBadRequest, "channel_refused", msg,
-					h.hintOf(upstream.ErrChannelRefused, string(respBody), bareModel, reqHasImage, uerr))
-				st.status = http.StatusBadRequest
-				st.outcome = reqlog.OutcomeHTTPError
-				return
+				continue
 			}
 			// 11115「prompt is too long」：立即透传上游原文回客户端，**不罚号不轮转**
 			// ——上下文超限是请求的问题（同一 body 换任何号都超限，白扔健康号配额；
