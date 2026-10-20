@@ -37,8 +37,23 @@ jobs:
       # ubuntu runner 自带 node → panel 包的 JS 运行时冒烟测试（TestAppJSTopLevelSmoke）会真实执行
       - run: go test ./...
 
+  # Windows 专项测试：Windows 与 POSIX 的错误码语义不同（ERROR_ACCESS_DENIED /
+  # ERROR_NOT_SAME_DEVICE vs EXDEV / EBUSY），而仓库发布**包含 Windows 二进制**
+  # → 只在 ubuntu 上跑测试会让 Windows 专属分支永远不被执行到。
+  # 实测教训：internal/auth 的 rename 降级判据在 Windows 上恒为 false
+  # → 刷新后的 accessToken 不落盘（issue #226 修复的 Windows 侧缺口）。
+  test-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: go vet ./...
+      - run: go test ./...
+
   build:
-    needs: test
+    needs: [test, test-windows]
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
