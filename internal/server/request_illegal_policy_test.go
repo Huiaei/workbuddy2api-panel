@@ -95,9 +95,15 @@ func TestClassifyRequestIllegalSplitsByBusinessCode(t *testing.T) {
 		{"11140 账号封禁", accountBannedBody, upstream.ErrAccountFault},
 		// 11140 的模型级限流变体：必须仍是软限流，不能被误判成账号封禁。
 		{"11140 限流变体", `{"code":11140,"msg":"The model provider is rate-limiting requests. Please wait a moment and try again."}`, upstream.ErrSoftRate},
-		// 裸 "request illegal"（无业务码）：宁可走通用 4xx 兜底，也不能凭一句
-		// 文案硬禁用账号。
-		{"裸 request illegal", `{"msg":"request illegal"}`, upstream.ErrClient},
+		// 裸 "request illegal"（**无业务码**）：判不准是通道校验还是账号封禁 ——
+		// 归 ErrChannelRefused（**不罚号**、继续轮转）。
+		//
+		// 旧口径落 ErrClient，而 ErrClient 是**唯一会喂连败计数**的分支 ⇒
+		// 5 次连败就把健康号降权出池 10 分钟（审计 D13）。三个可选口径里
+		// （通道校验零惩罚 / 账号封禁永久禁用 / ErrClient 降权出池），最轻且
+		// 最可自愈的是通道校验；且上游后来把同一句文案升级成带 11-128 业务码
+		// 的形态 ⇒ 无码形态极可能是 11-128 的旧版。
+		{"裸 request illegal", `{"msg":"request illegal"}`, upstream.ErrChannelRefused},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

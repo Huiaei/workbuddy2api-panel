@@ -1786,10 +1786,39 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 		// 注意 11-128/11128 的 msg 同为 "request illegal"，但那是通道校验失败，已在
 		// Classify 分流到 ErrChannelRefused，走不到这里。
 		if upstream.IsAccountRestricted(body) {
+			// **惩罚强度按上游状态码分级**：
+			//   - 429（瞬时限流）⇒ 只软冷却，**不永久禁用**。上游既然给了 429，
+			//     语义就是「限流、几分钟自愈」；把它解释成「账号封禁」⇒ 一次
+			//     限流高峰就永久 Disable 一个健康号（不可自愈、需人工申诉）——
+			//     与 issue #197 要避免的「好号被误禁」同类，只是形态不同。
+			//   - 其它状态码（400/403 等）⇒ 硬禁用：账号级风控，解除只能由
+			//     用户在 WorkBuddy 官方渠道申诉，重登无效。
+			//
+			// 代价权衡：若上游真用 429+11140 表示封禁，本分级会把它降级成
+			// 软冷却（账号恢复后再次撞同一错误并再被冷却）——可自愈；反之永久
+			// 误禁不可自愈。两者不对称，故取软冷却。
+			if uerr != nil && uerr.Status == http.StatusTooManyRequests {
+				h.cfg.Pool.CooldownSoftRate(uid, h.softCooldown(), time.Time{}, "upstream 429 with account-restricted code (11140): soft cooldown, not a permanent ban")
+				return
+			}
 			h.cfg.Pool.Disable(uid, "account restricted by upstream (11140 request illegal); appeal in WorkBuddy (submit feedback) to lift the restriction")
 			return
 		}
-		h.cfg.Pool.Cooldown(uid, pool.CoolSoft, h.softCooldown(), "account fault (14017)")
+		// reason 里带上**实际业务码**（旧口径写死 "14017"）。
+		//
+		// 进入本分支的非封禁账号级故障有两个来源：(a) accountFaultMarkers
+		// 命中（"trial not activated" / "trial version is not yet activated"），
+		// (b) 其它账号级标记。它们的业务码**不一定是 14017**（例如
+		// `{"code":11140,"msg":"trial not activated"}` 的码是 11140）。写死
+		// 14017 会让运维按错误方向排查（去查「试用未激活」，而实际是 11140
+		// 账号级限制）。
+		reason := "account fault"
+		if code := upstream.BusinessCodeOf(body); code != "" {
+			reason = "account fault (code=" + code + ")"
+		} else {
+			reason = "account fault (code=unknown)"
+		}
+		h.cfg.Pool.Cooldown(uid, pool.CoolSoft, h.softCooldown(), reason)
 	case upstream.ErrChannelRefused:
 		// 11-128 / 11128 通道校验失败（上游判定请求可能不是官方客户端发出，displayMsg
 		// 就是「请求被拦截，请重新发送」）。账号本身健康——官方客户端可正常使用同一账号，
