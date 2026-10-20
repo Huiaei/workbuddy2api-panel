@@ -391,6 +391,52 @@ func stripToolCallNames(obj map[string]any, seen map[int]bool) {
 	}
 }
 
+// cloneFrame 深拷贝一帧上游 chunk 对象，供旁路观察者使用。
+//
+// 为什么需要：repairFrame（标记还原）拿到的就是**同一个 map 引用**，它会就地
+// 改写 delta.content 与 finish_reason（stop → tool_calls）。观察者若持有原
+// 对象引用，**同步读取**时看到的是修复前状态（正确），**事后**再读看到的却是
+// 修复后状态（错误）——「观察者只读不改对象」这条承诺就只对同步读取成立。
+// 传深拷贝 ⇒ 观察者拿到的永远是「上游原样」，任何时候读都对。
+//
+// 拷贝深度：只深拷 choices[].delta 与 choices[].finish_reason（这正是被就地
+// 改写的两处），其余字段按值拷贝即可（字符串/数字/布尔是不可变值）。
+func cloneFrame(obj map[string]any) map[string]any {
+	if obj == nil {
+		return nil
+	}
+	out := make(map[string]any, len(obj))
+	for k, v := range obj {
+		out[k] = v
+	}
+	chs, ok := obj["choices"].([]any)
+	if !ok {
+		return out
+	}
+	nchs := make([]any, 0, len(chs))
+	for _, ci := range chs {
+		c, ok := ci.(map[string]any)
+		if !ok {
+			nchs = append(nchs, ci)
+			continue
+		}
+		nc := make(map[string]any, len(c))
+		for k, v := range c {
+			nc[k] = v
+		}
+		if d, ok := c["delta"].(map[string]any); ok {
+			nd := make(map[string]any, len(d))
+			for k, v := range d {
+				nd[k] = v
+			}
+			nc["delta"] = nd
+		}
+		nchs = append(nchs, nc)
+	}
+	out["choices"] = nchs
+	return out
+}
+
 // normalizeFrame 以 OpenAI 流式规范白名单重建帧：仅保留标准字段，
 // 剔除上游噪声（finish_reason:"" → null、空 content/refusal、空 tool_calls 列表、
 // 空占位 function_call、顶层未知字段），空 delta 键一律省略，
@@ -736,8 +782,10 @@ func StreamHint(w http.ResponseWriter, r io.Reader, hintFn func(string) string, 
 				o.onErrorFrame(payload)
 			}
 			// 逐帧观察者（issue #149 停摆判定）：error 帧也是合法 JSON，一并观察。
+			// error 帧不走 repairFrame（不会被就地改写），但仍传副本以保持
+			// 「观察者拿到的是上游原样」这一契约的一致性。
 			for _, obs := range o.frameObservers {
-				obs(obj)
+				obs(cloneFrame(obj))
 			}
 			if werr := writeRaw(payload); werr != nil {
 				return 0, werr
@@ -747,8 +795,16 @@ func StreamHint(w http.ResponseWriter, r io.Reader, hintFn func(string) string, 
 		// 逐帧观察者（issue #149 停摆判定）：只看原始上游帧，**不观察修复/规范化
 		// 之后的帧**——判定口径必须是「上游真的吐了 tool_calls 吗」，而不是
 		// 「网关还原之后有没有」。纯观测，不改透传字节。
+		//
+		// **必须传副本**：repairFrame 拿到的就是**同一个 map 引用**，它会就地
+		// 改写 delta.content 与 finish_reason（把 stop 改成 tool_calls）。若把
+		// 原对象交给观察者，观察者**同步读取**时看到的是修复前的状态（正确），
+		// 但**事后**再读这个对象看到的却是修复后的状态（错误）——即「观察者只
+		// 读不改对象」这条承诺只对同步读取成立，任何把帧对象存下来的观察者都
+		// 会被坑（实测：保留引用后末帧 finish_reason 从 stop 变成 tool_calls）。
+		// 传深拷贝 ⇒ 观察者拿到的永远是「上游原样」，任何时候读都对。
 		for _, obs := range o.frameObservers {
-			obs(obj)
+			obs(cloneFrame(obj))
 		}
 		for _, ch := range repairFrame(obj) {
 			if werr := writeChunk(ch, payload); werr != nil {
