@@ -1294,11 +1294,12 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// 「流式判停摆 / 非流式不判停摆」的两种口径差异在本分支不存在。
 			// 零 tool_calls 停摆观测（issue #149）：流式**不重试**（帧已写给客户端），
 			// 只记录观测。判定口径与非流式一致：声明了 tools 却零 tool_calls 且 stop 收尾。
-			if si := stallDetect.Info(); si.Suspect {
+			streamStall := stallDetect.Info()
+			if streamStall.Suspect {
 				st.toolStall = true
-				st.toolStallText = si.ContentLen
+				st.toolStallText = streamStall.ContentLen
 				log.Printf("WARN: [server] stream acct=%s model=%s: zero-tool_call stall (declared tools=%d, text_len=%d, finish=%s) — upstream answered with text only, tools not invoked",
-					logfmt.Label(acct.UID, acct.Nickname), bareModel, si.DeclaredTools, si.ContentLen, si.FinishReason)
+					logfmt.Label(acct.UID, acct.Nickname), bareModel, streamStall.DeclaredTools, streamStall.ContentLen, streamStall.FinishReason)
 			}
 
 			st.ttfb = stats.TTFB()
@@ -1321,7 +1322,18 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 					h.cfg.Pool.NoteModelCost(acct.UID, bareModel, credit, total)
 				}
 				// 积分燃尽熔断计账（issue #229）：窗口内烧掉的积分超阈值 → 该号熔断。
-				h.cfg.Pool.NoteBurn(acct.UID, credit)
+				//
+				// 与非流式同口径：**停摆的那一跳不能喂燃尽熔断**。停摆是上游行为
+				// 缺陷，不是账号烧钱的证据——把「模型这一轮没调工具」记成「这个号在
+				// 烧积分」会让熔断器误伤健康号（熔断开启的部署会中招）。停摆跳仍然
+				// 记账（余额要准），只是不参与燃尽熔断的计账。
+				//
+				// 这里必须用 streamStall.Suspect 判定：与非流式保持一致，否则
+				// 「同一形态两种口径」——非流式不喂、流式喂，熔断结果随请求模式
+				// 漂移，统计与排障都失去意义。
+				if !streamStall.Suspect {
+					h.cfg.Pool.NoteBurn(acct.UID, credit)
+				}
 			}
 			rc.Close()
 			return
