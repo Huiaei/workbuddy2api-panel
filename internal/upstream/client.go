@@ -2305,15 +2305,14 @@ func (c *Client) enterpriseResource(a *auth.Auth, soon time.Duration) (remain, t
 		return 0, 0, 0, time.Time{}, 0, err
 	}
 	// 兼容上游两套字段命名（桌面端两条解析路径分别读 camelCase 与 snake_case）。
-	var resp struct {
-		Credit         float64 `json:"credit"`
-		LimitNum       int64   `json:"limitNum"`
-		LimitNumSnake  int64   `json:"limit_num"`
-		UsedNum        float64 `json:"used_num"`
-		CycleEndTime   string  `json:"cycleEndTime"`
-		CycleResetTime string  `json:"cycleResetTime"`
-	}
-	if uerr := json.Unmarshal(data, &resp); uerr != nil {
+	//
+	// **统一按归一化键读取**（去下划线 + 小写）：上游换字段大小写或分隔符时不能
+	// 让「能读出额度」和「判定有额度」两处走不同的口径——否则会出现
+	// 「判定说没额度 → 报故障」或「判定说有额度 → 数值读成 0」的自相矛盾。
+	// 归一化后：credit/Credit/CREDIT/credit_ 全部等价，limitNum/limit_num/
+	// LIMITNUM 全部等价，usedNum/used_num 同理。
+	quota, uerr := parseEnterpriseQuota(data)
+	if uerr != nil {
 		return 0, 0, 0, time.Time{}, 0, fmt.Errorf("enterprise resource parse: %w", uerr)
 	}
 	// data 判空：上游偶发 `data: null`（个人接口 Accounts: null 是同源现象）。
@@ -2323,19 +2322,16 @@ func (c *Client) enterpriseResource(a *auth.Auth, soon time.Duration) (remain, t
 	//
 	// 判空口径 = **额度字段一个都不存在**（而不是「数值都是 0」）：
 	// 「额度确实是 0」是合法态（企业号用光了），和「上游没给额度信息」必须分开。
-	// 所以按**字段存在性**判定：data 为 null/空对象，或四个额度字段
-	// （credit/limitNum/limit_num/used_num）一个都没出现 → 判为「上游没给数据」。
+	// 所以按**字段存在性**判定：data 为 null/空对象，或额度字段（credit /
+	// limitNum / usedNum 三族，归一化后）一个都没出现 → 判为「上游没给数据」。
 	// 只出现其中一个（比如只有 cycleEndTime）同样判空——那不是额度响应。
-	if !enterpriseQuotaFieldsPresent(data) {
+	if !quota.hasQuotaField {
 		return 0, 0, 0, time.Time{}, 0, fmt.Errorf("enterprise resource: upstream returned empty quota payload")
 	}
-	limit := resp.LimitNum
-	if limit == 0 && resp.LimitNumSnake != 0 {
-		limit = resp.LimitNumSnake
-	}
-	used := resp.Credit
-	if used == 0 && resp.UsedNum != 0 {
-		used = resp.UsedNum
+	limit := quota.limitNum
+	used := quota.credit
+	if used == 0 && quota.usedNum != 0 {
+		used = quota.usedNum
 	}
 	// 不限量：池内无对应状态位，用大剩余量让路由权重与 credit_floor 都不构成限制。
 	if limit < 0 {
@@ -2364,9 +2360,9 @@ func (c *Client) enterpriseResource(a *auth.Auth, soon time.Duration) (remain, t
 	total = limit
 	// 周期到期批次：cycleEndTime 优先，缺失回落 cycleResetTime。
 	now := time.Now()
-	end, ok := parsePackageEndTime(resp.CycleEndTime)
+	end, ok := parsePackageEndTime(quota.cycleEndTime)
 	if !ok {
-		end, ok = parsePackageEndTime(resp.CycleResetTime)
+		end, ok = parsePackageEndTime(quota.cycleResetTime)
 	}
 	if ok && remain > 0 && end.After(now) {
 		earliestAt, earliestRemaining = end, remain
@@ -2404,29 +2400,77 @@ func personalAccountsFieldPresent(data json.RawMessage) bool {
 	return acc != "" && acc != "null"
 }
 
-// enterpriseQuotaFieldsPresent 判断上游给的 data 里**有没有额度信息**。
+// enterpriseQuota 是企业口径额度响应的解析结果。
 //
-// 口径 = **字段存在性**，不是数值大小：企业号额度真的用光时上游会返回
-// credit=0 / limitNum=0，那是个合法态；而「上游没给额度信息」（data 为 null、
-// 空对象、或只带 cycleEndTime 之类非额度字段）是**故障态**。两者必须分开，
-// 否则「额度 0 但账号健康」会继续伪装成真实余额，把一个空响应变成余额归零。
+// hasQuotaField = **有没有额度字段**（字段存在性），不是数值大小：企业号额度
+// 真的用光时上游会返回 credit=0 / limitNum=0，那是个合法态；而「上游没给额度
+// 信息」（data 为 null、空对象、或只带 cycleEndTime 之类非额度字段）是**故障态**。
+// 两者必须分开，否则「额度 0 但账号健康」会继续伪装成真实余额，把一个空响应
+// 变成余额归零。
+type enterpriseQuota struct {
+	hasQuotaField  bool
+	credit         float64
+	limitNum       int64
+	usedNum        float64
+	cycleEndTime   string
+	cycleResetTime string
+}
+
+// parseEnterpriseQuota 解析企业口径额度响应。
 //
-// 上游两套字段命名都要认（camelCase 与 snake_case，见 enterpriseResource）。
-func enterpriseQuotaFieldsPresent(data json.RawMessage) bool {
+// **键归一化**（去下划线 + 小写）后读值：上游有两套字段命名（camelCase 与
+// snake_case），encoding/json 本身对字段名大小写不敏感，而「判定有额度」和
+// 「读出额度数值」必须用**同一套口径**——否则会出现自相矛盾：判定说「有额度」
+// 但数值被读成 0（上游把 credit 改成 Credit 时），或判定说「没额度」而其实
+// 结构体能读出来（上游改大小写时，把一个正常响应误报成故障）。
+//
+// 归一化后等价族：credit / Credit / CREDIT、limitNum / limit_num / LIMITNUM、
+// usedNum / used_num。
+func parseEnterpriseQuota(data json.RawMessage) (enterpriseQuota, error) {
+	var q enterpriseQuota
 	trimmed := strings.TrimSpace(string(data))
 	if trimmed == "" || trimmed == "null" || trimmed == "{}" {
-		return false
+		return q, nil
 	}
 	var probe map[string]json.RawMessage
-	if json.Unmarshal(data, &probe) != nil {
-		return false
+	if err := json.Unmarshal(data, &probe); err != nil {
+		return q, err
 	}
-	for _, k := range []string{"credit", "limitNum", "limit_num", "used_num"} {
-		if _, ok := probe[k]; ok {
-			return true
+	for key, raw := range probe {
+		norm := strings.ToLower(strings.ReplaceAll(key, "_", ""))
+		switch norm {
+		case "credit", "limitnum", "usednum":
+			q.hasQuotaField = true
+		}
+		switch norm {
+		case "credit":
+			var f float64
+			if json.Unmarshal(raw, &f) == nil {
+				q.credit = f
+			}
+		case "limitnum":
+			var f float64
+			if json.Unmarshal(raw, &f) == nil {
+				q.limitNum = int64(f)
+			}
+		case "usednum":
+			var f float64
+			if json.Unmarshal(raw, &f) == nil {
+				q.usedNum = f
+			}
+		case "cycleendtime":
+			var s string
+			if json.Unmarshal(raw, &s) == nil {
+				q.cycleEndTime = s
+			}
+		case "cycleresettime":
+			var s string
+			if json.Unmarshal(raw, &s) == nil {
+				q.cycleResetTime = s
+			}
 		}
 	}
-	return false
+	return q, nil
 }
 
 // UserResourceDetailedWithExpiry 在 UserResourceDetailed 基础上返回最早未来到期批次：
