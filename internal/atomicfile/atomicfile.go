@@ -115,6 +115,13 @@ func writeInPlace(path string, data []byte) error {
 
 // IsReplaceableErr 报告 rename 失败是否属于「应当降级为原地覆盖」的情形：
 // EXDEV（跨设备）与 EBUSY（单文件 bind mount 挂载点）。
+//
+// ⚠️ **这是 POSIX 口径**。Windows 上 rename 的失败原因是 ERROR_NOT_SAME_DEVICE
+// （跨卷）与 ERROR_ACCESS_DENIED（目标被占用/只读），而 Windows 的
+// syscall.EXDEV 是臆造占位值（0x20000000，永远匹配不上真实 errno）
+// → 这个函数在 Windows 上**认不出**跨卷与占用两种情况。
+// **跨平台的调用方请用包内的 CanFallbackToInPlace**
+// （见 atomicfile_windows.go / atomicfile_other.go），它按平台补齐了错误码。
 func IsReplaceableErr(err error) bool {
 	return errors.Is(err, syscall.EXDEV) || errors.Is(err, syscall.EBUSY)
 }
