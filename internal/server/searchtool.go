@@ -246,25 +246,32 @@ func (h *Handler) probeOnce(ctx context.Context, realm, model string, body []byt
 		if !h.cfg.Pool.Acquire(a.UID) {
 			continue
 		}
-		rc, _, _, err := h.cfg.Upstream.ChatStreamContext(ctx, a, body, "", upstream.ChatMeta{})
-		if err != nil {
-			h.cfg.Pool.Release(a.UID)
-			lastErr = err
-			var ue *upstream.Error
-			if errors.As(err, &ue) {
-				h.applyErrorPolicy(a.UID, ue.Kind, ue.Msg, model, ue)
+		// 租约作用域 = 单次尝试：闭包内的 defer 覆盖「传输失败 / 上游 ≥400 /
+		// ctx 取消 / 超时 / Aggregate 出错 / 命中提前 return / panic 展开」
+		// 全部出口，保证名额一定归还、不会永久扣在账号上。
+		obj, err := func() (map[string]any, error) {
+			defer h.cfg.Pool.Release(a.UID)
+			rc, _, _, cerr := h.cfg.Upstream.ChatStreamContext(ctx, a, body, "", upstream.ChatMeta{})
+			if cerr != nil {
+				var ue *upstream.Error
+				if errors.As(cerr, &ue) {
+					h.applyErrorPolicy(a.UID, ue.Kind, ue.Msg, model, ue)
+				}
+				return nil, cerr
 			}
+			o, aerr := upstream.Aggregate(rc)
+			_ = rc.Close()
+			if aerr != nil {
+				return nil, aerr
+			}
+			return firstChoiceMessage(o), nil
+		}()
+		if err != nil {
+			lastErr = err
 			continue
 		}
-		obj, aerr := upstream.Aggregate(rc)
-		_ = rc.Close()
-		h.cfg.Pool.Release(a.UID)
-		if aerr != nil {
-			lastErr = aerr
-			continue
-		}
-		if m := firstChoiceMessage(obj); m != nil {
-			return m, nil
+		if obj != nil {
+			return obj, nil
 		}
 		lastErr = errors.New("上游响应无 choices[0].message")
 	}
@@ -294,11 +301,14 @@ func (h *Handler) searchText(ctx context.Context, realm, model, query string) (s
 		}
 		tried[a.UID] = true
 		// 在途租约：检索也是真实上游调用（见 probeOnce 的同一条理由）。
+		// 租约作用域 = 单次尝试，defer 覆盖全部出口（含 ctx 取消 / 超时 / panic）。
 		if !h.cfg.Pool.Acquire(a.UID) {
 			continue
 		}
-		out, err := h.cfg.Upstream.Search(ctx, a, query, upstream.SearchDefaultMaxResults, upstream.ChatMeta{})
-		h.cfg.Pool.Release(a.UID)
+		out, err := func() (*upstream.SearchOutcome, error) {
+			defer h.cfg.Pool.Release(a.UID)
+			return h.cfg.Upstream.Search(ctx, a, query, upstream.SearchDefaultMaxResults, upstream.ChatMeta{})
+		}()
 		if err != nil {
 			var ue *upstream.Error
 			if errors.As(err, &ue) {

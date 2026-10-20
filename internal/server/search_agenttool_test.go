@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -178,4 +179,72 @@ func TestSearchUsesInFlightLease(t *testing.T) {
 		t.Fatal("检索结束后在途租约未归还")
 	}
 	p.Release("c1")
+}
+
+// TestSearchReleasesLeaseOnErrorPath 回归：上游报错/连接失败这条出口也必须归还租约。
+//
+// 断言的是**在途计数归零**（不是"还能 Acquire"）：上游返回 500 时 handler 会走
+// applyErrorPolicy + 换号，若租约没归还，账号的 in-flight 计数会单调上涨，
+// 直到把该账号的 MaxInFlight 名额永久占满。
+func TestSearchReleasesLeaseOnErrorPath(t *testing.T) {
+	p := testPoolWith(&auth.Auth{UID: "c1", AccessToken: "at", ExpiresAt: 9999999999, Domain: "www.codebuddy.cn"})
+	inner := &upstream.Client{
+		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: 500,
+				Header:     http.Header{"Content-Type": []string{"application/json"}},
+				Body:       io.NopCloser(strings.NewReader(`{"code":500,"msg":"boom"}`)),
+			}, nil
+		})},
+		ChatBaseCN:    "https://cn.example",
+		BillingBaseCN: "https://cn.example",
+	}
+	h := NewHandler(Config{Pool: p, Upstream: inner})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/search", strings.NewReader(`{"query":"x"}`)))
+	if rec.Code == 200 {
+		t.Fatalf("上游 500 时不应 200，body=%s", rec.Body.String())
+	}
+	st, ok := p.Status("c1")
+	if !ok {
+		t.Fatal("账号状态缺失")
+	}
+	if st.InFlight != 0 {
+		t.Fatalf("上游报错后 in-flight 计数=%d，应归 0（租约未归还）", st.InFlight)
+	}
+}
+
+// TestSearchReleasesLeaseOnContextCancel 回归：客户端中途断开（ctx 取消）这条出口
+// 也必须归还租约 —— 上游调用会因 ctx 取消而返回错误，若租约被扣住，账号名额泄漏。
+func TestSearchReleasesLeaseOnContextCancel(t *testing.T) {
+	p := testPoolWith(&auth.Auth{UID: "c1", AccessToken: "at", ExpiresAt: 9999999999, Domain: "www.codebuddy.cn"})
+	started := make(chan struct{})
+	inner := &upstream.Client{
+		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			close(started)
+			<-r.Context().Done() // 客户端断开 → 请求 ctx 取消
+			return nil, r.Context().Err()
+		})},
+		ChatBaseCN:    "https://cn.example",
+		BillingBaseCN: "https://cn.example",
+	}
+	h := NewHandler(Config{Pool: p, Upstream: inner})
+	ctx, cancel := context.WithCancel(context.Background())
+	req := httptest.NewRequest("POST", "/v1/search", strings.NewReader(`{"query":"x"}`)).WithContext(ctx)
+	rec := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		h.ServeHTTP(rec, req)
+	}()
+	<-started
+	cancel()
+	<-done
+	st, ok := p.Status("c1")
+	if !ok {
+		t.Fatal("账号状态缺失")
+	}
+	if st.InFlight != 0 {
+		t.Fatalf("ctx 取消后 in-flight 计数=%d，应归 0（租约未归还）", st.InFlight)
+	}
 }
