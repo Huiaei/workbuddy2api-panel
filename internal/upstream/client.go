@@ -158,55 +158,91 @@ var accountFaultMarkers = []string{
 	"trial version is not yet activated",
 }
 
-// accountRestrictedMsg 是 WorkBuddy 11140 账号限制的正文关键词。
+// accountRestrictedMsg 是 WorkBuddy 11140 账号限制的正文关键词（英文原句）。
 const accountRestrictedMsg = "request illegal"
 
-// IsAccountRestricted 报告上游 body 是否为 WorkBuddy 的**账号级限制**（11140
-// "request illegal"）。必须 code + 文案**双条件**：
+// accountRestrictedMsgFamily 是 11140 账号限制的**文案家族**（大小写不敏感）。
+//
+// 为什么需要家族而不是逐字：上游会把封禁文案本地化、或换同义句
+// （"Your account has been restricted." / "账号已被限制" / "请求非法" …）。
+// 若只认英文原句 "request illegal"，真封禁账号就**永不被禁用** —— 它会一直
+// 带病留在池里被选中、每次都失败，面板只显示「可用」，用户**无从申诉**
+// （面板只显示「可用」）。那比误封更糟。
+//
+// 收窄原则：只收**明确说「账号被限制/封禁」**的措辞，不收「限流 / 用量」
+// 类的宽词（"rate limit" / "too many" / "usage limit"）—— 那些是真封禁与
+// 模型侧限流共用的词，按宽词表归封禁会把可自愈的限流永久禁用掉。
+var accountRestrictedMsgFamily = []string{
+	"request illegal",
+	"请求非法",
+	"账号已被限制",
+	"账号被限制",
+	"account was restricted",
+	"account has been restricted",
+	"account is restricted",
+	"account banned",
+	"account has been banned",
+	"account is banned",
+	"this account was restricted",
+}
+
+// modelRateLimitFamily 是 11140 信封里**模型侧限流**的文案家族（大小写不敏感）。
+//
+// 命中即放弃「账号封禁」判定，让分类链继续走到 softRateMarkers 归 ErrSoftRate
+// —— 模型侧限流几分钟自愈，永久禁用一个健康号是白扔号 + 用户无从申诉。
+//
+// 覆盖中英文与常见变体（上游改一个字就翻转的教训）：判据必须是**语义家族**
+// 而不是逐字句。早先只认三条逐字句，于是「模型提供方限流中」这种只差一个
+// 字的变体被翻转成永久禁用。
+var modelRateLimitFamily = []string{
+	"the model provider is rate-limiting requests",
+	"the model provider is rate limiting requests",
+	"model provider is rate-limiting",
+	"model provider is rate limiting",
+	"provider is rate-limiting requests",
+	"provider is rate limiting requests",
+	"模型提供方正在限流",
+	"模型提供方限流中",
+	"模型服务方正在限流",
+	"模型服务方限流中",
+	"模型提供方限流",
+	"模型服务方限流",
+}
+
+// IsAccountRestricted 报告上游 body 是否为 WorkBuddy 的**账号级限制**（11140）。
+//
+// 判据 = **业务码 11140**（权威）+ 文案家族（确认语义是「账号级风控」）：
 //   - 只看文案："request illegal" 也出现在 11-128/11128 通道校验失败里（账号
 //     健康，issue #197），按文案一刀切会把可用账号误判成封禁并永久禁用；
-//   - 只看 code：11140 也承载模型级限流文案（"The model provider is
-//     rate-limiting requests."），那种场景必须保持 ErrSoftRate。
+//   - 只看 code：11140 也承载模型级限流文案，那种场景必须保持 ErrSoftRate。
 //
-// 第三条排除项（限流文案）：11140 的信封里 msg 与 displayMsg 是两个字段，上游
-// 可能给出 msg="request illegal" 而 displayMsg 带模型级限流说明。此时**不能**
-// 永久禁用账号——那是模型侧限流，等几分钟自愈。命中**上游那一句固定限流句**
-// 即放弃封禁判定，让分类链继续走到 softRateMarkers 归 ErrSoftRate。
+// 第三条排除项（模型侧限流）：11140 的信封里 msg 与 displayMsg 是两个字段，
+// 上游可能给出 msg="request illegal" 而 displayMsg 带模型级限流说明。此时
+// **不能**永久禁用账号 —— 那是模型侧限流，等几分钟自愈，永久禁用是不可自愈
+// 的重罚（且用户无从申诉）。
 //
 // 注意：排除项刻意**不**复用 softRateMarkers 整张词表（宽口径，含 "rate
 // limit" / "too many" / "usage limit"），因为那些词同样出现在真封禁文案里
 // （"Too many login attempts…" / "Your usage limit has been reached."），
 // 按宽词表否决会让真封禁账号永不禁用。
 func IsAccountRestricted(body string) bool {
-	lower := strings.ToLower(body)
-	if !strings.Contains(lower, accountRestrictedMsg) {
-		return false
-	}
 	if !hasBusinessCode(body, "11140") {
 		return false
 	}
-	// 模型级限流句优先：**只认上游那一句固定文案**（及其中文对应句）。上游的
-	// 11140 信封里 msg 与 displayMsg 是两个字段，可能给出 msg="request illegal"
-	// 而 displayMsg 带模型级限流说明；那种场景是模型侧限流，等几分钟自愈，
-	// 不得永久禁用账号（重登对限流无效）。
-	//
-	// 这里**不能**复用 softRateMarkers 整张词表（它含 "rate limit" / "too many"
-	// / "usage limit" / "限流" 等宽口径）：那些词同样出现在真封禁文案里
-	// （"Too many login attempts, please try again later." /
-	// "Your usage limit has been reached." /
-	// "This account was restricted. Rate limit abuse detected."），
-	// 一旦按宽词表否决，真封禁账号就**永不禁用**——它会一直带病服务，用户也
-	// 无从申诉（面板只显示「可用」）。那比误封更糟。
-	for _, m := range []string{
-		"the model provider is rate-limiting requests",
-		"模型提供方正在限流",
-		"模型服务方正在限流",
-	} {
+	lower := strings.ToLower(body)
+	// 模型侧限流优先：语义上它比「封禁」更具体，且可自愈。
+	for _, m := range modelRateLimitFamily {
 		if strings.Contains(lower, m) {
 			return false
 		}
 	}
-	return true
+	// 文案家族命中即确认是账号级风控。
+	for _, m := range accountRestrictedMsgFamily {
+		if strings.Contains(lower, m) {
+			return true
+		}
+	}
+	return false
 }
 
 // IsChannelRefused 报告上游 body 是否为 WorkBuddy 的**通道校验失败**
@@ -227,12 +263,30 @@ func IsAccountRestricted(body string) bool {
 //
 // 11140 优先：真封禁不得被渠道文案降级（只有业务码能区分二者）。
 //
-// 内容审核域的边界：真正的内容拦截（"blocked by security policy"）**不带**
-// 11-128/11128 业务码；一旦带了该业务码，它就是渠道校验——哪怕文案里出现
-// "unapproved channel" / "illegal api invocation" 这两个与审核词表重叠的短语。
-// 早期实现按文案把 11-128 判成 ErrContentBlocked，后果是**触发全局降级门**
-// （h.degrade.Trigger()，降级到次日 00:00 CST）：一次形状不对的请求就让整个
-// 网关对所有账号、所有模型进入降级提示词模式，代价远大于问题本身。
+// 内容审核域的边界：**主文案优先 + 业务码兜底**。
+//
+// 上游把两种语义塞进**同一个业务码**（11-128/11128），只有「主文案字段」
+// 能区分：
+//   - 主 msg = "blocked by security policy" ⇒ 真正的内容审核误报（上游自带
+//     用例的形态），归 ErrContentBlocked（网关降级重试换中性提示词）。
+//   - 主 msg = "request illegal" / "conversation id missing" / "first message
+//     is not system prompt" / "Illegal API invocation from an unapproved
+//     channel" ⇒ 通道校验失败（请求形状没过渠道校验），账号健康，归
+//     ErrChannelRefused 不罚号。
+//
+// **只认主文案字段**（body.msg / error.message），不扫 displayMsg/displayTips：
+// displayMsg/displayTips 是给人看的补充说明，上游会把审核词塞进那里（实测
+// 形态 `{"code":11128,"msg":"request illegal","displayMsg":{"en":"Blocked by
+// security policy"}}`）。若按整 body 扫文案，一次请求级的形状问题会被归成
+// 内容审核 ⇒ handler 执行 h.degrade.Trigger() ⇒ **整个网关对所有账号、所有
+// 模型**降级到次日 00:00 CST（一次请求放大成整网关整夜的降级）。
+//
+// 早先的实现正是按整 body 扫文案，且断言「真内容拦截不带 11-128 业务码」——
+// 该断言已被实测推翻。
+//
+// 兜底方向：判不准时**偏向通道校验**（ErrChannelRefused）。理由是代价不对称：
+//   - 误判成通道校验：换号重试（次数有界），账号零惩罚，最坏是 400。
+//   - 误判成内容审核：可能触发全局降级门，代价是整网关整夜。
 func IsChannelRefused(body string) bool {
 	if !hasBusinessCode(body, "11-128") && !hasBusinessCode(body, "11128") {
 		return false
@@ -240,29 +294,89 @@ func IsChannelRefused(body string) bool {
 	if hasBusinessCode(body, "11140") {
 		return false
 	}
-	lower := strings.ToLower(body)
-	// 内容审核文案：只有**真正的内容拦截**才否决渠道校验判定。
-	//
-	// contentBlockedMarkers 里的 "unapproved channel" / "illegal api invocation"
-	// 与渠道校验文案**逐字重叠**（2026-10-20 真机实录：首条 developer →
-	// 400 11-128 "Illegal API invocation from an unapproved channel"），但它是
-	// **渠道校验**变体（请求形状），不是内容审核。按文案否决会把一次请求级
-	// 形状问题变成 ErrContentBlocked → 触发全局降级门（h.degrade.Trigger()，
-	// 降级到次日 00:00 CST）：整个网关对所有账号、所有模型进入降级提示词模式，
-	// 代价远大于问题本身。
-	//
-	// 故此处只让真内容拦截（"blocked by security policy"）否决；它不带
-	// 11-128/11128 业务码（实测录像是纯文案），故正常情况下根本走不到这里。
-	if strings.Contains(lower, "blocked by security policy") {
+	// 主文案声明内容审核 ⇒ 真内容拦截（保留上游自带用例的语义）。
+	if msg, ok := primaryMessage(body); ok && strings.Contains(strings.ToLower(msg), "blocked by security policy") {
 		return false
-	}
-	for _, m := range channelRefusedMarkers {
-		if strings.Contains(lower, m) {
-			return true
-		}
 	}
 	// 业务码兜底：11-128 本身就是渠道校验业务码。
 	return true
+}
+
+// ambiguousRequestIllegalFamily 是**通道校验与账号封禁共用**的那一句文案
+// （大小写不敏感）。
+//
+// 只有这一句在无业务码时是**判不准**的：上游把两种语义塞进同一句文案
+// （"request illegal"），既可能是通道校验（账号健康），也可能是账号封禁。
+//
+// 刻意**不**包含 accountRestrictedMsgFamily 里的其它措辞（"account banned"
+// / "账号已被限制" …）：那些措辞只出现在封禁语义里，无业务码时也应按
+// 封禁方向处理，不能一并降级成「不罚号」。
+var ambiguousRequestIllegalFamily = []string{
+	"request illegal",
+	"请求非法",
+}
+
+// IsUncodedRequestIllegal 报告 body 是否是**无业务码**的 "request illegal"。
+//
+// 即：文案命中账号限制/通道校验的共用句，但 11-128 / 11128 / 11140 三个
+// 业务码**一个都没有**（含别名键名，见 businessCodeKeys）。
+//
+// 命中即「判不准」：上游把通道校验与账号封禁塞进同一句文案（"request
+// illegal"），只有业务码能区分。此时**不罚号**（见 Classify 里的注释）。
+func IsUncodedRequestIllegal(body string) bool {
+	lower := strings.ToLower(body)
+	hit := false
+	for _, m := range ambiguousRequestIllegalFamily {
+		if strings.Contains(lower, m) {
+			hit = true
+			break
+		}
+	}
+	if !hit {
+		return false
+	}
+	// 任一已知业务码在 ⇒ 不是「无码」形态，交给各自的精确判定。
+	for _, c := range []string{"11-128", "11128", "11140"} {
+		if hasBusinessCode(body, c) {
+			return false
+		}
+	}
+	return true
+}
+
+// primaryMessage 取上游 body 的**主文案**字段（不含 displayMsg/displayTips）。
+//
+// 取值顺序：body.msg → body.error.message → body.error.msg → body.message。
+// 缺失或不是字符串时返回 ("", false) —— 调用方据此走「按业务码兜底」。
+//
+// 只认这些**顶层/信封内**的字段：displayMsg / displayTips 是给人看的补充
+// 说明，上游会把审核词塞进那里，用它们做判据会把通道校验误判成内容审核
+// （见 IsChannelRefused 注释）。
+func primaryMessage(body string) (string, bool) {
+	var root map[string]any
+	if json.Unmarshal([]byte(body), &root) != nil {
+		return "", false
+	}
+	pick := func(m map[string]any, keys ...string) (string, bool) {
+		for _, k := range keys {
+			if s, ok := m[k].(string); ok && s != "" {
+				return s, true
+			}
+		}
+		return "", false
+	}
+	if s, ok := pick(root, "msg"); ok {
+		return s, true
+	}
+	if e, ok := root["error"].(map[string]any); ok {
+		if s, ok := pick(e, "message", "msg"); ok {
+			return s, true
+		}
+	}
+	if s, ok := pick(root, "message"); ok {
+		return s, true
+	}
+	return "", false
 }
 
 // channelRefusedMarkers 通道校验失败的文案特征（大小写不敏感）。
@@ -462,9 +576,22 @@ func modelBlockFields(body string) (code, msg string) {
 	return code, msg
 }
 
+// businessCodeKeys 是上游信封里承载**业务码**的字段名。
+//
+// 上游现网用 "code"，但同一套错误信封在不同端点/不同版本下出现过别名
+// （errCode / errorCode / error_code / bizCode，以及嵌套在 extError 里）。
+// 只认字面键名 "code" 的话，一旦上游换键名，**IsChannelRefused 与
+// IsAccountRestricted 会同时失明**：11-128 与 11140 双双落通用 4xx ⇒
+// 好号被降权出池（连败计数），真封禁也检不出（永不禁用）。
+//
+// 因此这里认一组常见别名。取**首个命中**即可（同一信封里多个码字段时，
+// 上游的权威码是外层的那个）。
+var businessCodeKeys = []string{"code", "errCode", "errorCode", "error_code", "bizCode", "biz_code"}
+
 // hasBusinessCode reports whether a JSON error envelope contains an exact
-// business code in a field named "code". Upstream envelopes vary between
-// top-level and nested error/data objects, so walk the decoded structure.
+// business code in one of the business-code fields. Upstream envelopes vary
+// between top-level and nested error/data objects, so walk the decoded
+// structure.
 func hasBusinessCode(body, want string) bool {
 	var root any
 	if err := json.Unmarshal([]byte(body), &root); err != nil {
@@ -474,8 +601,10 @@ func hasBusinessCode(body, want string) bool {
 	walk = func(value any) bool {
 		switch node := value.(type) {
 		case map[string]any:
-			if code, ok := node["code"]; ok && strings.TrimSpace(fmt.Sprint(code)) == want {
-				return true
+			for _, key := range businessCodeKeys {
+				if code, ok := node[key]; ok && strings.TrimSpace(fmt.Sprint(code)) == want {
+					return true
+				}
 			}
 			for _, child := range node {
 				if walk(child) {
@@ -492,6 +621,30 @@ func hasBusinessCode(body, want string) bool {
 		return false
 	}
 	return walk(root)
+}
+
+// BusinessCodeOf 提取 body 里的业务码（供错误文案标注实际业务码用）。
+//
+// 找不到时返回空串。取顶层 / error 子对象里第一个命中的业务码字段。
+func BusinessCodeOf(body string) string {
+	var root map[string]any
+	if err := json.Unmarshal([]byte(body), &root); err != nil {
+		return ""
+	}
+	nodes := []map[string]any{root}
+	if inner, ok := root["error"].(map[string]any); ok {
+		nodes = append(nodes, inner)
+	}
+	for _, node := range nodes {
+		for _, key := range businessCodeKeys {
+			if v, ok := node[key]; ok && v != nil {
+				if s := strings.TrimSpace(fmt.Sprint(v)); s != "" {
+					return s
+				}
+			}
+		}
+	}
+	return ""
 }
 
 // hasBusinessEnvelope 报告错误 body 是否携带上游业务信封形态（JSON 且含
@@ -698,7 +851,26 @@ func Classify(status int, body string) ErrKind {
 		return ErrChannelRefused
 	}
 	if IsAccountRestricted(body) {
+		// 分类仍归 ErrAccountFault（口径不变：账号级故障码优先于 429 兜底，
+		// 见下方 status==429 注释）。**惩罚强度**按状态码区分，见
+		// applyErrorPolicy 的 ErrAccountFault 分支：429（瞬时限流）只软冷却、
+		// 不永久禁用。
 		return ErrAccountFault
+	}
+	// 裸 "request illegal"（**无业务码**）：分类器无从判断它属于通道校验还是
+	// 账号封禁。旧口径把它落通用 4xx ErrClient —— 而 ErrClient 是**唯一会喂
+	// 连败计数**的分支 ⇒ 5 次连败就把健康号降权出池 10 分钟。
+	//
+	// 处置口径：**不罚号**（归 ErrChannelRefused，零动作、继续轮转）。
+	// 理由是代价不对称：
+	//   - 判成通道校验：换号重试（次数有界），账号零惩罚，最坏 400。
+	//   - 判成账号封禁：永久禁用（不可自愈、需人工申诉）。
+	//   - 判成 ErrClient：喂连败 ⇒ 5 次后降权出池 10 分钟（可自愈，但仍伤号）。
+	// 三者都不该「误伤健康号」，但**惩罚最轻、最可自愈**的是通道校验口径，
+	// 且它与上游现行语义一致（上游后来把同一句文案升级成带 11-128 业务码
+	// 的形态 ⇒ 无码形态极可能是 11-128 的旧版）。
+	if IsUncodedRequestIllegal(body) {
+		return ErrChannelRefused
 	}
 	for _, m := range accountFaultMarkers {
 		if strings.Contains(lower, strings.ToLower(m)) || strings.Contains(body, m) {
