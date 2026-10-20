@@ -153,6 +153,52 @@ var accountFaultMarkers = []string{
 	"trial version is not yet activated",
 }
 
+// IsChannelVerificationBlocked 判定上游「渠道校验拦截」形态——即 11-128 / 11128
+// 业务码 + "request illegal" 文案，附带 displayMsg「请求被拦截，请重新发送」与
+// displayTips「这次调用没通过渠道校验，可能不是官方客户端发出的，请用官方版本重新发送」。
+//
+// 关键区分（issue #197，两种形态共用同一句 msg，只有业务码不同）：
+//
+//	11-128 / 11128 → **请求级**拦截。上游明示可重试（「请重新发送」）。实测该
+//	  账号的凭证、余额、JWT 全部正常，用**完全相同的出站头部**换健康账号即可 200；
+//	  账号本身没被封。这是「请求形状没过渠道校验」（多因缺 X-Conversation-ID
+//	  等会话头三元组，见 headers.go），处置是**软冷却**（自动轮换、上游解除标记
+//	  后自愈），绝不能 Disable——历史实现 Disable 会把仍可用的号永久踢出池子。
+//
+//	11140 → **账号级**授权风控（auth/auth_forbidden）。这是真的封禁，必须
+//	  Disable 并提示重新登录。
+//
+// 判定优先按结构化业务码（hasBusinessCode 走 JSON 解析，容忍空白与嵌套）；
+// 无业务码时退回 displayTips/displayMsg 的渠道校验文案特征串。
+func IsChannelVerificationBlocked(body string) bool {
+	// 1) 结构化业务码：11-128 与 11128 是同一业务码的两种书写（带/不带连字符）。
+	if hasBusinessCode(body, "11-128") || hasBusinessCode(body, "11128") {
+		return true
+	}
+	// 2) 文案特征：只有明确写着「渠道校验失败 / 不是官方客户端发出」才是请求级
+	//    拦截。裸 "request illegal"（无渠道校验特征）归账号级 11140 处置。
+	lower := strings.ToLower(body)
+	for _, m := range channelVerificationMarkers {
+		if strings.Contains(lower, m) {
+			return true
+		}
+	}
+	return false
+}
+
+// channelVerificationMarkers 渠道校验拦截的文案特征（大小写不敏感）。
+// 取自上游 displayTips / displayMsg 的固定英文文案——只有这组文案才说明
+// 「请求没通过渠道校验、请用官方客户端重发」，是请求级而非账号级。
+var channelVerificationMarkers = []string{
+	"channel verification",
+	"not sent from an official client",
+	"please resend from the official client",
+	"this call failed channel verification",
+	"请求被拦截，请重新发送",
+	"没通过渠道校验",
+	"不是官方客户端发出的",
+}
+
 // contentBlockedMarkers 内容策略拦截关键词（大小写不敏感子串匹配）。
 //
 // 定位：上游按逐字精确指纹审核，system 来源的模板句（如 Claude Code/Codex

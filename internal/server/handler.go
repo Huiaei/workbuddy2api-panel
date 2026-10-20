@@ -1465,19 +1465,27 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 		// 偶发路径缺失不是限流信号，不该按限流惩罚升级。
 		h.cfg.Pool.Cooldown(uid, pool.CoolSoft, notFoundCooldown, "upstream 404")
 	case upstream.ErrAccountFault:
-		// 账号级授权/配额故障按 msg 分野（口径与 Classify 的 accountFaultMarkers 一致）：
-		//   - "request illegal"（业务码 11-128 / 11140）→ 上游**渠道校验拦截**，不是账号封禁。
+		// 账号级授权/配额故障按**业务码**分野（口径见 upstream.IsChannelVerificationBlocked）：
+		//   - 11-128 / 11128「request illegal」→ 上游**渠道校验拦截**，不是账号封禁。
 		//     上游 body 自带 displayMsg「请求被拦截，请重新发送」与 displayTips「渠道校验失败，
 		//     可能不是从官方客户端发出的，请用官方客户端重新发送」——上游明示这是可重试的请求级
 		//     拦截。实测该账号凭证/余额/JWT 全部正常，同一套出站头部换健康账号即可 200，换任何
-		//     模型、任何 header 变体都稳定复现，属上游按账号下发的风控标记。历史实现在此处
-		//     Disable，会把仍可用的账号永久踢出池子并要求人工解冻（issue #197）。改为软冷却：
-		//     账号暂时出池、自动轮换，上游解除标记后自愈，绝不永久禁用。
+		//     模型、任何 header 变体都稳定复现，属**请求形状**没过渠道校验（多因缺会话头三元组，
+		//     见 upstream/headers.go）。历史实现在此处 Disable，会把仍可用的账号永久踢出池子并
+		//     要求人工解冻（issue #197）。改为软冷却：账号暂时出池、自动轮换，上游解除标记后
+		//     自愈，绝不永久禁用。
+		//   - 11140「request illegal」→ **真的**账号级授权封禁（auth/auth_forbidden），
+		//     必须 Disable 并提示重新登录。这是两种形态唯一的区别，msg 文案完全相同，
+		//     只看文案会把真封禁降级成软冷却（账号永远轮换、永远不恢复）。
 		//   - 14017（trial not activated）→ register 未完成，补完 register 后可能自愈，
 		//     **保持软冷却**（禁用会让用户补完 register 后仍无法用）。
 		// 大小写不敏感（与 Classify 的 marker 匹配同口径）。
-		if strings.Contains(strings.ToLower(body), "request illegal") {
+		if upstream.IsChannelVerificationBlocked(body) {
 			h.cfg.Pool.CooldownSoftRate(uid, h.softCooldown(), time.Time{}, "channel verification blocked (11-128 request illegal)")
+			return
+		}
+		if strings.Contains(strings.ToLower(body), "request illegal") {
+			h.cfg.Pool.Disable(uid, "account banned by upstream (11140 request illegal), re-login required")
 			return
 		}
 		h.cfg.Pool.Cooldown(uid, pool.CoolSoft, h.softCooldown(), "account fault (14017)")
