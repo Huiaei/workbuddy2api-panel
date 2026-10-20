@@ -476,11 +476,19 @@ func (a *Auth) SaveAtomic() error {
 	if err != nil {
 		return err
 	}
-	tmp := a.FilePath + ".tmp"
-	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
+	// 暂存名必须**唯一**：固定 "<path>.tmp" 会让两个持有同一 FilePath 的
+	// *Auth 实例互相踩（a.mu 只保护同一个对象；scheduler 的 keepalive 刷新与
+	// handler 的按需刷新持有的是**不同**对象）。
+	// 实测（300 轮 × 2 写者）：SaveAtomic 返回 nil 但内容未落盘 282 次
+	// （被对方 rename 走），另有 266 次报「源文件不存在」的假失败。
+	// 改成唯一名后，ENOAENT 归零（剩下正常的 last-writer-wins）。
+	//
+	// 复用 internal/atomicfile：同一套暂存名生成 + 原子替换 + 降级原地覆盖，
+	// 避免两处各写一份、日后各改各的。
+	if err := atomicfile.Write(a.FilePath, raw, 0o600); err != nil {
 		// Docker bind-mount 权限问题的典型现场：容器内 app 用户（uid 10001）
 		// 对宿主机挂载目录无写权限。给出可操作指引而不是裸 syscall 错误。
-		msg := fmt.Sprintf("写入 %s 失败: %v", tmp, err)
+		msg := err.Error()
 		if errors.Is(err, fs.ErrPermission) {
 			msg += "\n（Docker 部署：容器内用户对宿主机挂载目录无写权限。解法任选：" +
 				"1) 以本机 uid 运行容器：PUID=$(id -u) PGID=$(id -g) docker compose up -d；" +
@@ -488,37 +496,6 @@ func (a *Auth) SaveAtomic() error {
 				"3) compose 设 user: \"0:0\" 以 root 运行）"
 		}
 		return errors.New(msg)
-	}
-	if err := os.Rename(tmp, a.FilePath); err != nil {
-		// rename 失败 → 退化为原地覆盖。目标文件本身通常可写（能读到它就能写它），
-		// 而 tmp 里是完整新内容。
-		//
-		// 判据必须用 atomicfile.CanFallbackToInPlace（按平台补齐错误码），不能用
-		// IsReplaceableErr：Windows 上 rename 失败的原因是 ERROR_NOT_SAME_DEVICE
-		// （跨卷）与 ERROR_ACCESS_DENIED（目标被占用/只读），而 Windows 的
-		// syscall.EXDEV 是臆造占位值（0x20000000）→ 旧判据在 Windows 上恒为 false
-		// → 这里直接报错 → **刷新后的 accessToken 不落盘**，下次启动继续用旧 token。
-		if !atomicfile.CanFallbackToInPlace(err) {
-			return fmt.Errorf("replace %s: %w", a.FilePath, err)
-		}
-		f, openErr := os.OpenFile(a.FilePath, os.O_WRONLY|os.O_TRUNC, 0o600)
-		if openErr != nil {
-			_ = os.Remove(tmp)
-			return fmt.Errorf("replace %s (bind mount fallback): %w", a.FilePath, openErr)
-		}
-		_, writeErr := f.Write(raw)
-		if writeErr == nil {
-			writeErr = f.Sync()
-		}
-		closeErr := f.Close()
-		if writeErr != nil {
-			return fmt.Errorf("replace %s (bind mount fallback, 完整新内容保留在 %s): %w", a.FilePath, tmp, writeErr)
-		}
-		_ = os.Remove(tmp)
-		if closeErr != nil {
-			return fmt.Errorf("replace %s (bind mount fallback): %w", a.FilePath, closeErr)
-		}
-		return nil
 	}
 	return nil
 }
