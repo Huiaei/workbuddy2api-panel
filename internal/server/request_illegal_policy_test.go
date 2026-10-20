@@ -155,6 +155,10 @@ func TestIsAccountRestricted(t *testing.T) {
 		{"11128 + request illegal（通道校验，非封禁）", `{"code":11128,"msg":"request illegal"}`, false},
 		{"裸 request illegal（无业务码）", `{"msg":"request illegal"}`, false},
 		{"空 body", ``, false},
+		// msg 是封禁文案、但 displayMsg 带模型级限流说明：11140 的信封里 msg 与
+		// displayMsg 是两个字段，上游可能这么组合。那是模型侧限流（几分钟自愈），
+		// 不是账号封禁——永久禁用好号并让用户重新登录是最重的误伤。
+		{"11140 + 限流 displayMsg（不得判为封禁）", `{"code":11140,"msg":"request illegal","displayMsg":{"en":"The model provider is rate-limiting requests. Please wait a moment and try again."}}`, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -162,5 +166,22 @@ func TestIsAccountRestricted(t *testing.T) {
 				t.Fatalf("IsAccountRestricted(%s)=%v want %v", tc.body, got, tc.want)
 			}
 		})
+	}
+}
+
+// TestClassify11140RateLimitVariantStaysSoftRate 回归守卫：11140 信封里同时带
+// "request illegal" 与模型级限流文案时，分类必须落在 ErrSoftRate（软冷却），
+// 不得落到 ErrAccountFault（永久禁用）。
+//
+// 这是本次修复实测抓到的真实误伤：上游把模型级限流文案塞进 11140 的
+// displayMsg，msg 仍是 "request illegal"，于是 code+文案双条件双双命中，
+// 分类层直接判成账号封禁 → 好号被永久踢出池子。
+func TestClassify11140RateLimitVariantStaysSoftRate(t *testing.T) {
+	body := `{"code":11140,"msg":"request illegal","displayMsg":{"en":"The model provider is rate-limiting requests. Please wait a moment and try again."}}`
+	if got := upstream.Classify(400, body); got != upstream.ErrSoftRate {
+		t.Fatalf("Classify=%v want %v（限流文案不得被当成账号封禁）", got, upstream.ErrSoftRate)
+	}
+	if upstream.IsAccountRestricted(body) {
+		t.Fatal("IsAccountRestricted 必须对限流变体返回 false")
 	}
 }

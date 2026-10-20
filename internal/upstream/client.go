@@ -167,11 +167,27 @@ const accountRestrictedMsg = "request illegal"
 //     健康，issue #197），按文案一刀切会把可用账号误判成封禁并永久禁用；
 //   - 只看 code：11140 也承载模型级限流文案（"The model provider is
 //     rate-limiting requests."），那种场景必须保持 ErrSoftRate。
+//
+// 第三条排除项（限流文案）：11140 的信封里 msg 与 displayMsg 是两个字段，上游
+// 可能给出 msg="request illegal" 而 displayMsg 带模型级限流说明。此时**不能**
+// 永久禁用账号——那是模型侧限流，等几分钟自愈。命中限流文案即放弃封禁判定，
+// 让分类链继续走到 softRateMarkers 归 ErrSoftRate。
 func IsAccountRestricted(body string) bool {
-	if !strings.Contains(strings.ToLower(body), accountRestrictedMsg) {
+	lower := strings.ToLower(body)
+	if !strings.Contains(lower, accountRestrictedMsg) {
 		return false
 	}
-	return hasBusinessCode(body, "11140")
+	if !hasBusinessCode(body, "11140") {
+		return false
+	}
+	// 限流文案优先：模型级限流变体不得被当成账号封禁（否则一次限流就把好号
+	// 永久禁用，面板还标成 banned，用户只能重新登录——而重登对限流无效）。
+	for _, m := range softRateMarkers {
+		if strings.Contains(lower, strings.ToLower(m)) {
+			return false
+		}
+	}
+	return true
 }
 
 // IsChannelRefused 报告上游 body 是否为 WorkBuddy 的**通道校验失败**
