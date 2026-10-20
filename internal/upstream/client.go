@@ -2316,6 +2316,13 @@ func (c *Client) enterpriseResource(a *auth.Auth, soon time.Duration) (remain, t
 	if uerr := json.Unmarshal(data, &resp); uerr != nil {
 		return 0, 0, 0, time.Time{}, 0, fmt.Errorf("enterprise resource parse: %w", uerr)
 	}
+	// data 判空：上游偶发 `data: null`（个人接口 Accounts: null 是同源现象）。
+	// json.Unmarshal(null, &resp) 不报错且 resp 全零 → 若继续走，limit=0、used=0
+	// → remain=0、total=0，表现为「额度 0，但账号健康」——与「接口偶发失败」无法
+	// 区分，排障时只能靠猜。这里显式判空并返回 error，让上层显示「查询失败」。
+	if len(data) == 0 || string(data) == "null" {
+		return 0, 0, 0, time.Time{}, 0, fmt.Errorf("enterprise resource: upstream returned null data")
+	}
 	limit := resp.LimitNum
 	if limit == 0 && resp.LimitNumSnake != 0 {
 		limit = resp.LimitNumSnake
@@ -2328,11 +2335,21 @@ func (c *Client) enterpriseResource(a *auth.Auth, soon time.Duration) (remain, t
 	if limit < 0 {
 		return enterpriseUnlimitedRemain, enterpriseUnlimitedTotal, 0, time.Time{}, 0, nil
 	}
-	// credit 是浮点（如 812.45），池内 credits 是整数：四舍五入到最近整数
-	// （向下取整会低报剩余额度，与"额度还有多少"的展示意图相悖）。
+	// credit 是浮点（如 812.45），池内 credits 是整数：**向上取整**（ceil）。
+	//
+	// 为什么向上而不是四舍五入（issue #222 建议 1）：这个数字的语义是
+	// 「还剩多少额度」，向上取整是保守方向——宁可少报不可多报。多报会让
+	// 调度器以为账号还有额度而继续派发，实际打过去就是 402；少报只会让调度器
+	// 提前换一个号，不会造成 402。
+	//
+	// 向上取整还有一个副作用：used 永远 ≥ 真实已用量，remain 永远 ≤ 真实剩余，
+	// 故 remain 不会因为浮点误差而虚高。
 	usedInt := int64(used)
-	if used-float64(usedInt) >= 0.5 {
+	if used > float64(usedInt) {
 		usedInt++
+	}
+	if usedInt < 0 {
+		usedInt = 0
 	}
 	remain = limit - usedInt
 	if remain < 0 {
