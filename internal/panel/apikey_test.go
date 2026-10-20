@@ -154,8 +154,12 @@ func TestAddAPIKeySuccess(t *testing.T) {
 	if !st.APIKey {
 		t.Error("Status.APIKey 应为 true")
 	}
-	if st.Credits != 1188 || st.CreditsTotal != 2000 {
-		t.Errorf("额度映射错误：credits=%d total=%d want 1188/2000", st.Credits, st.CreditsTotal)
+	// 上游 credit=812.45 是**已用**（企业口径与个人相反），池内取整数用 **ceil**
+	// （issue #222 建议 1：向上取整是保守方向——宁可少报剩余额度不可多报，多报
+	// 会让调度器以为还有额度而继续派发，实际打过去就是 402）→ used=813，
+	// remain = 2000-813 = 1187。
+	if st.Credits != 1187 || st.CreditsTotal != 2000 {
+		t.Errorf("额度映射错误：credits=%d total=%d want 1187/2000", st.Credits, st.CreditsTotal)
 	}
 }
 

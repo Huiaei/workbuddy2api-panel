@@ -149,9 +149,11 @@ func TestEnterpriseCheckinStillRefreshesCredits(t *testing.T) {
 	if !ok {
 		t.Fatal("status not found")
 	}
-	// limitNum - round(credit) = 2000 - 812 = 1188。
-	if st.Credits != 1188 || st.CreditsTotal != 2000 {
-		t.Errorf("企业额度映射错误：credits=%d total=%d want 1188/2000", st.Credits, st.CreditsTotal)
+	// limitNum - ceil(credit) = 2000 - 813 = 1187。企业 credit 是浮点已用量，
+	// 池内取整数用 **ceil**（issue #222 建议 1：向上取整保守——宁可少报剩余额度
+	// 不可多报，多报会让调度器以为还有额度而继续派发，实际打过去就是 402）。
+	if st.Credits != 1187 || st.CreditsTotal != 2000 {
+		t.Errorf("企业额度映射错误：credits=%d total=%d want 1187/2000", st.Credits, st.CreditsTotal)
 	}
 }
 
