@@ -144,10 +144,12 @@ func TestCloneFrameHandlesNonChoiceFrames(t *testing.T) {
 	if !ok || e["code"] != 11128 {
 		t.Fatalf("cloneFrame 丢失了 error 内容: %+v", got)
 	}
-	// 原对象被改不得影响副本。
-	got["error"].(map[string]any)["code"] = 999
-	e2, _ := got["error"].(map[string]any)
-	if e2["code"] != 999 {
-		t.Fatalf("cloneFrame 未拷贝 error 内容: %+v", e2)
+	// error 帧也必须**深拷**：改写**源**不得影响副本（浅拷贝会共享同一个 map）。
+	src := map[string]any{"error": map[string]any{"code": 11128}}
+	dst := cloneFrame(src)
+	de, _ := src["error"].(map[string]any)
+	de["code"] = 99999
+	if ce, _ := dst["error"].(map[string]any); ce["code"] != 11128 {
+		t.Fatalf("cloneFrame 未深拷 error 对象: %+v", dst)
 	}
 }

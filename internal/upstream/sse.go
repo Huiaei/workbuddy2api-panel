@@ -399,8 +399,9 @@ func stripToolCallNames(obj map[string]any, seen map[int]bool) {
 // 修复后状态（错误）——「观察者只读不改对象」这条承诺就只对同步读取成立。
 // 传深拷贝 ⇒ 观察者拿到的永远是「上游原样」，任何时候读都对。
 //
-// 拷贝深度：只深拷 choices[].delta 与 choices[].finish_reason（这正是被就地
-// 改写的两处），其余字段按值拷贝即可（字符串/数字/布尔是不可变值）。
+// 拷贝深度：深拷 choices[].delta、choices[].finish_reason 与 error 子对象
+// （这正是会被就地改写的三处），其余字段按值拷贝即可（字符串/数字/布尔是
+// 不可变值）。
 func cloneFrame(obj map[string]any) map[string]any {
 	if obj == nil {
 		return nil
@@ -408,6 +409,15 @@ func cloneFrame(obj map[string]any) map[string]any {
 	out := make(map[string]any, len(obj))
 	for k, v := range obj {
 		out[k] = v
+	}
+	// error 子对象也要深拷：错误帧同样会被读方就地处理（补 code、改文案），
+	// 浅拷贝会让观察者与错误处理共享同一个 map。
+	if e, ok := obj["error"].(map[string]any); ok {
+		ne := make(map[string]any, len(e))
+		for k, v := range e {
+			ne[k] = v
+		}
+		out["error"] = ne
 	}
 	chs, ok := obj["choices"].([]any)
 	if !ok {
