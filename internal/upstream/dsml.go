@@ -55,7 +55,7 @@ const markupPipe = "\uFF5C\uFF5C"
 // 结束标记一律比同名的开始标记多一个 '/'，因此 markupInvokeRe / markupParamRe 里
 // 「< 开头」的匹配不可能落到结束标记上。
 const (
-	markupOpen        = "<" + markupPipe + "DSML" + markupPipe + " calls>"
+	markupOpen        = markupCallOpenTag
 	markupClose       = "</" + markupPipe + "DSML" + markupPipe + " calls>"
 	markupInvokeClose = "</" + markupPipe + "DSML" + markupPipe + " invoke>"
 	markupParamClose  = "</" + markupPipe + "DSML" + markupPipe + " parameter>"

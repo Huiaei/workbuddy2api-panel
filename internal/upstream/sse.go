@@ -492,9 +492,13 @@ type StreamOption func(*streamOptions)
 type streamOptions struct {
 	onErrorFrame func(payload string)
 	markup       *MarkupRepair
-	// frameObserver 旁路观察每个上游帧（原始 chunk 对象）。纯观测：不改任何
+	// frameObservers 旁路观察每个上游帧（原始 chunk 对象）。纯观测：不改任何
 	// 透传字节、不影响帧计数。用于「零 tool_calls 停摆」判定（issue #149）。
-	frameObserver func(obj map[string]any)
+	//
+	// 是**列表**而不是单槽位：单槽位时后注册的观察者会静默覆盖先注册的
+	// （option 是按顺序应用的），排查这类问题时极难发现「我的观察者根本没
+	// 被调用」。列表让多个观察者共存，调用顺序 = 注册顺序。
+	frameObservers []func(obj map[string]any)
 	// streamEndObserver 在**流读取结束**时回调一次，参数是「本流是否被截断」
 	// （上游没发 data: [DONE] 就 EOF = 截断）。纯观测，不改任何透传字节。
 	// 停摆判定需要它：截断的零 tool_calls 是「帧没到齐」，不是「模型不调工具」。
@@ -509,8 +513,10 @@ type streamOptions struct {
 // 但观察者能给出统一的停摆判定口径，供请求日志与告警使用。
 //
 // 非 JSON 帧不会回调（无法解析成对象）。error 帧**会**回调（它也是合法 JSON）。
+//
+// 可**多次注册**：每个观察者都会被调用（注册顺序 = 调用顺序）。
 func WithFrameObserver(fn func(obj map[string]any)) StreamOption {
-	return func(o *streamOptions) { o.frameObserver = fn }
+	return func(o *streamOptions) { o.frameObservers = append(o.frameObservers, fn) }
 }
 
 // WithStreamEndObserver 注册一个**流结束观察者**：本流读取结束时回调一次，参数
@@ -730,8 +736,8 @@ func StreamHint(w http.ResponseWriter, r io.Reader, hintFn func(string) string, 
 				o.onErrorFrame(payload)
 			}
 			// 逐帧观察者（issue #149 停摆判定）：error 帧也是合法 JSON，一并观察。
-			if o.frameObserver != nil {
-				o.frameObserver(obj)
+			for _, obs := range o.frameObservers {
+				obs(obj)
 			}
 			if werr := writeRaw(payload); werr != nil {
 				return 0, werr
@@ -741,8 +747,8 @@ func StreamHint(w http.ResponseWriter, r io.Reader, hintFn func(string) string, 
 		// 逐帧观察者（issue #149 停摆判定）：只看原始上游帧，**不观察修复/规范化
 		// 之后的帧**——判定口径必须是「上游真的吐了 tool_calls 吗」，而不是
 		// 「网关还原之后有没有」。纯观测，不改透传字节。
-		if o.frameObserver != nil {
-			o.frameObserver(obj)
+		for _, obs := range o.frameObservers {
+			obs(obj)
 		}
 		for _, ch := range repairFrame(obj) {
 			if werr := writeChunk(ch, payload); werr != nil {
