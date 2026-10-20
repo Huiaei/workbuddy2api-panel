@@ -807,6 +807,13 @@ func TestChatAllUnavailableReturns503(t *testing.T) {
 	}
 }
 
+// TestChatSessionDeadDisables 12153 连续 3 次才禁用（与 scheduler 的 keepalive
+// 口径一致）。
+//
+// 此前是「chat 里遇到 1 次就禁用」——12153 会在上游偶发出现（token 恰好被
+// 别的客户端用掉、并发刷新撞车），单次就杀号是历史误判的主要来源
+// （13 个 disabled 号全是这么来的）。且禁用是**终态**（不自动恢复，只能
+// 面板手动解冻），误杀的代价很高。
 func TestChatSessionDeadDisables(t *testing.T) {
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
 		return 401, `{"code":12153,"msg":"Offline user session not found"}`, false
@@ -820,8 +827,17 @@ func TestChatSessionDeadDisables(t *testing.T) {
 		t.Errorf("code=%d", rec.Code)
 	}
 	st, _ := p.Status("u1")
+	if st.Disabled {
+		t.Errorf("第一次 12153 不应禁用（连续 %d 次才禁用）: %+v", pool.SessionDeadThreshold(), st)
+	}
+	// 再来两次 → 达到阈值 → 禁用。
+	for i := 0; i < pool.SessionDeadThreshold()-1; i++ {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`)))
+	}
+	st, _ = p.Status("u1")
 	if !st.Disabled {
-		t.Errorf("account should be disabled: %+v", st)
+		t.Errorf("连续 %d 次 12153 后应禁用: %+v", pool.SessionDeadThreshold(), st)
 	}
 }
 
