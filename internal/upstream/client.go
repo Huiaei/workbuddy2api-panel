@@ -1485,6 +1485,17 @@ func (c *Client) ChatStream(a *auth.Auth, body []byte, clientIP string, meta Cha
 // 全局脚本：首条消息非 system 时前置兜底 system（防 console 域上游 code 11-128；
 // #119 后 global 出站固定 /v2，该兜底保留——上游对 /v2 是否需要 system 无实测
 // 反证，删了无回滚路径）。
+// dumpBodyLimit 是调试 body dump 的截断长度（字符）。
+const dumpBodyLimit = 4000
+
+// dumpTruncate 把 body 截断到 dumpBodyLimit，截断处显式标注。
+func dumpTruncate(b []byte) string {
+	if len(b) <= dumpBodyLimit {
+		return string(b)
+	}
+	return string(b[:dumpBodyLimit]) + fmt.Sprintf("…[truncated, total %d bytes]", len(b))
+}
+
 func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byte, clientIP string, meta ChatMeta) (rc io.ReadCloser, status int, respBody []byte, err error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -1492,9 +1503,13 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 	prepared := c.prepareBody(body, a.Realm(), a.UID, meta.ConversationID)
 	if os.Getenv("WB2A_DUMP_BODY") != "" {
 		// 调试开关：打印入站与出站请求体，便于定位上游 11-128/11140 这类
-		// 「按请求体判定」的错误。上线不需要，长会话请自行截断。
-		log.Printf("[dbg-body] inbound  : %s", string(body))
-		log.Printf("[dbg-body] prepared: %s", string(prepared))
+		// 「按请求体判定」的错误。上线不需要。
+		//
+		// 截断到 dumpBodyLimit：长会话的 body 可能有几百 KB，整条打进日志会
+		// 把日志冲垮、也会把提示词原文大面积留在磁盘上。截断处明确标注，
+		// 避免误以为看到的是完整 body。
+		log.Printf("[dbg-body] inbound  : %s", dumpTruncate(body))
+		log.Printf("[dbg-body] prepared: %s", dumpTruncate(prepared))
 	}
 	if c.globalOn(a) {
 		prepared = ensureConsoleSystem(prepared)
