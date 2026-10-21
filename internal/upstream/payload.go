@@ -84,6 +84,9 @@ func PrepareBodyOptWithEffortsAndDefault(src []byte, sanitize bool, efforts map[
 		if msgs, ok := obj["messages"].([]any); ok {
 			sanitizeMessages(msgs)
 		}
+		// tools[] 声明同样在扫描范围内（客户端工具描述里也可能带身份句），
+		// 见 sanitizeTools 的注释。
+		sanitizeTools(obj)
 	}
 	out, err := json.Marshal(obj)
 	if err != nil {

@@ -86,6 +86,8 @@ func sanitizeText(text string) string {
 	for _, rw := range sanitizeRewrites {
 		text = strings.ReplaceAll(text, rw[0], rw[1])
 	}
+	// 本产品身份句改写（2026-10-21 CN 渠道校验黑名单，见 dshProductNameRe）。
+	text = sanitizeDSHProductName(text)
 	if sanitizeHdrRe.MatchString(text) {
 		text = sanitizeHdrRe.ReplaceAllString(text, "")
 	}
@@ -111,6 +113,14 @@ func hasFingerprint(text string) bool {
 		if strings.Contains(text, f) {
 			return true
 		}
+	}
+	// 本产品名的身份句：上游按**大小写不敏感**的逐字匹配拦截（实测
+	// "you are an AI agent powered by deepseek harness." 同样触发 400 code=11128），
+	// 而预检走的是大小写敏感的 strings.Contains —— 只写 "DeepSeek Harness" 会漏掉
+	// 全小写/首字母大写等变体，净化被整段跳过 ⇒ 变体原样出站 ⇒ 必然被拦。
+	// 这里用已编译的 (?i) 正则兜底（dshProductNameRe）。
+	if dshProductNameRe.MatchString(text) {
+		return true
 	}
 	return sanitizeBareHdrRe.MatchString(text)
 }
@@ -217,4 +227,108 @@ func sanitizeMessages(messages []any) bool {
 		}
 	}
 	return changed
+}
+
+// sanitizeTools 净化出站 body 顶层的 tools[] 声明。
+//
+// 为什么也要洗：客户端（DSH 等）会把工具描述/参数 schema 一并发出，而描述里
+// 同样可能带**本产品身份句**（实测真实 DSH 工具集 183 个里有 2 个描述含
+// "DeepSeek Harness"）。上游的逐字黑名单是扫**整个请求体**的——只洗 messages
+// 会漏掉 tools 里的命中。
+//
+// 只洗文本字段（description / name / parameters 里的字符串值），不碰结构。
+func sanitizeTools(obj map[string]any) bool {
+	rawTools, ok := obj["tools"].([]any)
+	if !ok {
+		return false
+	}
+	changed := false
+	for _, raw := range rawTools {
+		tool, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		// OpenAI 形态 tools[].function.*；裸 tools[].* 兼容。
+		if fn, ok := tool["function"].(map[string]any); ok {
+			if sanitizeToolTextFields(fn) {
+				changed = true
+			}
+		}
+		if sanitizeToolTextFields(tool) {
+			changed = true
+		}
+	}
+	return changed
+}
+
+// sanitizeToolTextFields 洗一个工具声明里的所有文本字段。
+func sanitizeToolTextFields(tool map[string]any) bool {
+	changed := false
+	for _, key := range []string{"description", "name"} {
+		if s, ok := tool[key].(string); ok {
+			if ns := sanitizeText(s); ns != s {
+				tool[key] = ns
+				changed = true
+			}
+		}
+	}
+	// parameters 是 JSON schema 树，递归洗其中的字符串值（description / title / default）。
+	if p, ok := tool["parameters"]; ok {
+		if np, ch := sanitizeSchemaStrings(p); ch {
+			tool["parameters"] = np
+			changed = true
+		}
+	}
+	return changed
+}
+
+// sanitizeSchemaStrings 递归净化 JSON schema 树里的字符串值。
+func sanitizeSchemaStrings(node any) (any, bool) {
+	switch n := node.(type) {
+	case map[string]any:
+		changed := false
+		for k, v := range n {
+			switch vv := v.(type) {
+			case string:
+				if s := sanitizeText(vv); s != vv {
+					n[k] = s
+					changed = true
+				}
+			case map[string]any:
+				if nv, ch := sanitizeSchemaStrings(vv); ch {
+					n[k] = nv
+					changed = true
+				}
+			case []any:
+				if nv, ch := sanitizeSchemaStrings(vv); ch {
+					n[k] = nv
+					changed = true
+				}
+			}
+		}
+		return n, changed
+	case []any:
+		changed := false
+		for i, v := range n {
+			switch vv := v.(type) {
+			case string:
+				if s := sanitizeText(vv); s != vv {
+					n[i] = s
+					changed = true
+				}
+			case map[string]any:
+				if nv, ch := sanitizeSchemaStrings(vv); ch {
+					n[i] = nv
+					changed = true
+				}
+			case []any:
+				if nv, ch := sanitizeSchemaStrings(vv); ch {
+					n[i] = nv
+					changed = true
+				}
+			}
+		}
+		return n, changed
+	}
+	return node, false
 }
