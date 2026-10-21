@@ -47,6 +47,22 @@ type Config struct {
 		// 关掉。关闭后 Event.ClientIP/UserAgent 保持为空，归档里不出现该字段。
 		// 热生效（经 livecfg 快照），无需重启。
 		RequestClientInfo bool `json:"request_client_info"`
+		// LogFile 日志落盘路径。缺省空 = 只输出到 stderr/stdout（不落盘）。
+		//
+		// 为什么需要：网关的运行日志（启动信息、上游错误、账号池事件）此前只往
+		// stderr/stdout 写。在 Windows 上双击/托盘启动时根本没有控制台窗口可看，
+		// 出了「上游返回 400 但客户端只看到一个错」这类问题就完全无从查证。
+		// 落盘后可直接翻日志文件。
+		//
+		// 相对路径按**进程工作目录**解析（与 config.json 相对路径一致的口径）。
+		// 父目录不存在会自动创建；追加写（不截断历史）。与 stdout 共存，互不影响。
+		// 改动需重启进程。
+		LogFile string `json:"log_file"`
+		// LogFileMaxMB 单个日志文件上限（MiB）。缺省 64；<=0 回落默认。
+		// 超限后轮转为 log.1 / log.2 …（最多保留 LogFileBackups 份）。
+		LogFileMaxMB int `json:"log_file_max_mb"`
+		// LogFileBackups 轮转保留份数，缺省 3；<=0 回落默认。
+		LogFileBackups int `json:"log_file_backups"`
 	} `json:"logging"`
 
 	Server struct {
@@ -310,6 +326,8 @@ func Default() *Config {
 	c.Logging.RequestArchiveEnabled = true
 	c.Logging.RequestRetentionDays = 7
 	c.Logging.RequestArchiveMaxMB = 100
+	c.Logging.LogFileMaxMB = 64
+	c.Logging.LogFileBackups = 3
 	// 缺省 true 靠显式赋值实现（同 Schedule 开关）：JSON 里键缺席时字段保留此值，
 	// 只有显式 false 才关闭来源记录。
 	c.Logging.RequestClientInfo = true
@@ -640,6 +658,12 @@ func (c *Config) normalize() error {
 	}
 	if c.Logging.RequestArchiveMaxMB <= 0 {
 		c.Logging.RequestArchiveMaxMB = 100
+	}
+	if c.Logging.LogFileMaxMB <= 0 {
+		c.Logging.LogFileMaxMB = 64
+	}
+	if c.Logging.LogFileBackups <= 0 {
+		c.Logging.LogFileBackups = 3
 	}
 	// 入站读取上限（issue #100）：空值回落默认 300s；"0" 合法（不限制）；
 	// 负值无语义，fail fast（静默钳 0 会把保护悄悄关掉）。
