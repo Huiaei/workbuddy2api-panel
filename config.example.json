@@ -14,7 +14,11 @@
     "request_archive_enabled": true,
     "request_retention_days": 7,
     "request_archive_max_mb": 100,
-    "request_client_info": true
+    "request_client_info": true,
+    "_comment_log_file": "运行日志落盘路径。留空 = 只输出到控制台（不落盘）。Windows 上没有控制台窗口时，排查问题只能靠猜；配上这个开关就能直接翻日志文件。相对路径按进程工作目录解析，父目录会自动创建。改动需重启。",
+    "log_file": "",
+    "log_file_max_mb": 64,
+    "log_file_backups": 3
   },
   "cooldown": {
     "soft_rate": "600s",

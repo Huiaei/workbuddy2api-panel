@@ -368,6 +368,9 @@ curl -s http://localhost:7863/v1/search/messages \
 | `logging.request_archive_enabled` | `true` | 请求元数据 JSONL 归档开关；不记录提示词、响应正文或 Authorization |
 | `logging.request_retention_days` | `7` | 请求归档保留天数；超期文件在启动和周期清理时删除 |
 | `logging.request_archive_max_mb` | `100` | 请求归档总容量上限（MiB）；超限优先删除最旧文件 |
+| `logging.log_file` | 空 | 运行日志落盘路径；空 = 只输出到控制台（不落盘）。Windows 上没有控制台窗口时排查只能靠猜，配上这个开关就能直接翻日志文件。相对路径按进程工作目录解析，父目录自动创建，追加写不截断。改动需重启 |
+| `logging.log_file_max_mb` | `64` | 单个日志文件上限（MiB）；超限轮转为 `.1` / `.2` … |
+| `logging.log_file_backups` | `3` | 日志轮转保留份数；最老的自动删除 |
 | `cooldown.soft_rate` | `600s` | 软限流（429 / 限流文案）冷却基数；同一账号连续触发按 2 倍指数退避 |
 | `cooldown.soft_rate_max` | `2h` | 软冷却指数退避封顶 |
 | `schedule.checkin_hours` | `[9, 21]` | 每日本地时区整点签到 + 余额查询解冻。空数组 / `null` = 未配置回落默认（不是禁用） |

@@ -23,6 +23,7 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/credithist"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/livecfg"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/logfile"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/panel"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/redisstore"
@@ -359,8 +360,33 @@ func main() {
 	// 清扫回调返回统计汇总（测试/日志可观测），调度器 hook 只要求 func()：
 	// 这里收掉返回值——汇总已由 panel 侧内部日志输出。
 	sch.SetTaskSweepHook(func() { pn.RunTaskSweepOnce() })
-	log.SetOutput(io.MultiWriter(os.Stderr, pn.Logs()))
-	server.SetChatLogOutput(io.MultiWriter(os.Stdout, pn.Logs()))
+	// 日志落盘（logging.log_file）：Windows 上没有控制台窗口时，出问题只能靠猜。
+	// 打不开文件就降级（只 WARN，不让网关起不来）——stderr 仍然有输出。
+	var logFile *logfile.Writer
+	if cfg.Logging.LogFile != "" {
+		lf, err := logfile.New(cfg.Logging.LogFile, cfg.Logging.LogFileMaxMB, cfg.Logging.LogFileBackups)
+		if err != nil {
+			log.Printf("WARN: 日志落盘不可用（仅输出到控制台）: %v", err)
+		} else {
+			logFile = lf
+			defer logFile.Close()
+		}
+	}
+	var logWriters []io.Writer
+	logWriters = append(logWriters, os.Stderr, pn.Logs())
+	if logFile != nil {
+		logWriters = append(logWriters, logFile)
+	}
+	log.SetOutput(io.MultiWriter(logWriters...))
+	var chatWriters []io.Writer
+	chatWriters = append(chatWriters, os.Stdout, pn.Logs())
+	if logFile != nil {
+		chatWriters = append(chatWriters, logFile)
+	}
+	server.SetChatLogOutput(io.MultiWriter(chatWriters...))
+	if logFile != nil {
+		log.Printf("INFO: 日志落盘已启用: %s", logFile.Path())
+	}
 
 	h := server.NewHandler(server.Config{
 		Pool:         p,
