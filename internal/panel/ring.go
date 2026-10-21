@@ -18,6 +18,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/linguo2625469/workbuddy2api-panel/internal/atomicfile"
 )
 
 // 日志频道。
@@ -160,16 +162,14 @@ func (r *Ring) persistTasksLocked() {
 	if err == nil {
 		err = os.MkdirAll(filepath.Dir(r.taskArchive), 0700)
 	}
-	tmp := r.taskArchive + ".tmp"
+	// 走 atomicfile：Windows 上 os.Rename 替换被占用的目标会返回
+	// "Access is denied."（ERROR_ACCESS_DENIED），手写 tmp+rename 拿不到
+	// 降级与重试；atomicfile.Write 两者都做了。
 	if err == nil {
-		err = os.WriteFile(tmp, raw, 0600)
-	}
-	if err == nil {
-		err = os.Rename(tmp, r.taskArchive)
+		err = atomicfile.Write(r.taskArchive, raw, 0600)
 	}
 	if err != nil {
 		r.archiveError = err.Error()
-		_ = os.Remove(tmp)
 	} else {
 		r.archiveError = ""
 	}

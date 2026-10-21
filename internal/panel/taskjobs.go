@@ -15,6 +15,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/linguo2625469/workbuddy2api-panel/internal/atomicfile"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
 )
@@ -581,31 +582,17 @@ func (m *taskJobManager) persistLocked() error {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
-	tmp, err := os.CreateTemp(dir, ".task-jobs-*.tmp")
-	if err != nil {
-		return err
-	}
-	tmpName := tmp.Name()
-	defer os.Remove(tmpName)
-	if err := tmp.Chmod(0o600); err != nil {
-		_ = tmp.Close()
-		return err
-	}
-	if _, err := tmp.Write(raw); err != nil {
-		_ = tmp.Close()
-		return err
-	}
-	if err := tmp.Sync(); err != nil {
-		_ = tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	if err := os.Rename(tmpName, m.path); err != nil {
-		return err
-	}
-	if err := os.Chmod(m.path, 0o600); err != nil {
+	// 走 atomicfile 而不是手写 tmp+rename：
+	//
+	// 手写 tmp+rename 在 **Windows** 上有一个必现的失败：目标文件被别的
+	// 写者/读者占用时，MoveFileEx(..., MOVEFILE_REPLACE_EXISTING) 返回
+	// ERROR_ACCESS_DENIED（"Access is denied."）——任务状态因此**存不下去**
+	// （日志里：panel: 保存后台任务恢复状态失败: rename ... Access is denied.）。
+	//
+	// atomicfile.Write 统一处理了：唯一暂存名（并发写不互相踩）、rename 失败
+	// 时按 Windows 错误码降级为原地覆盖（CanFallbackToInPlace）、以及目标被
+	// 占用时的重试（isTargetBusyErr + retryRename）。
+	if err := atomicfile.Write(m.path, raw, 0o600); err != nil {
 		return err
 	}
 	return nil
