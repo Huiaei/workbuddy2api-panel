@@ -18,6 +18,22 @@
 
 ---
 
+> [!IMPORTANT]
+> **本 fork 已于 2026-10-21 停止跟随上游。** 上游 `linguo2625469/workbuddy2api-panel` 同样于 2026-10-21
+> 声明停止维护（不再更新代码、不再处理 issue / PR）。本 fork 的 `main` 分支是**当前唯一维护分支**，
+> 以**发行版 v1.13.0（`d66384d`）为基线**，已吸收上游 `main` 的全部后续修复并额外修掉一批线上问题。
+>
+> **为什么以 v1.13.0 而不是上游 main 为基线**：v1.13.0 是绝大多数用户实际运行的发行版；
+> 上游 main 相对它只多 9 个提交，其中包含一整套 DSML 层（与本 fork 的「零 tool_calls 停摆检测」交互复杂），
+> 因此本 fork 把 DSML 能力**单独移植**进来，而不是整体切换基线——结果是本 fork 的 `main` 在功能上是
+> **上游 main 的超集**。
+>
+> **本 fork 修掉而上游没有的**（详见 [与上游的差异](#-与上游的差异)）：
+> 11-128 / 11140 按业务码分流、渠道校验失败不误禁账号、CN 域上游对身份句的逐字黑名单规避、
+> Windows 落盘原子写、额度「未知 ≠ 0」、企业额度解析、裸模型跨域回退、搜索端点、日志落盘等。
+>
+> **维护方式披露**：本 fork 的 issue 排查、代码审查、测试与修复实现**大量由 AI 辅助完成**。
+
 > **本项目是 [Sliverkiss/workbuddy2api](https://github.com/Sliverkiss/workbuddy2api) 的增强分支**（fork）。
 > 上游仓库现已删除；本项目**已同步至上游删库前的最后一次更新**（`ea8b1e5`），此后由本分支独立维护演进。
 > 在上游基础上重构了可视化运维层；差异概览见 [与上游的差异](#-与上游的差异)，上游设计的精巧之处（账号池调度、错误分类、提示词体系）原样保留，详见下文。
@@ -163,6 +179,83 @@ WorkBuddy2API 是一个自托管的 **OpenAI 兼容反向代理网关**，将腾
 未吸收（明确不做）：脚本体系（task_runner/school 脚本—我们已有更完整的纯 API 实现）、governance/CI workflow、成本账本选号（依赖 usage.credit 观测，收益待验证）。
 
 > 上游仓库此后已删除，上述第二轮（`ea8b1e5`）即其**删库前的最后一次更新**，本分支已完整吸收。此后本仓库与上游不再有同步关系，演进以本仓库为准。
+
+### 2026-10 之后的修复集（本 fork 独有）
+
+上游 `linguo2625469/workbuddy2api-panel` 于 2026-10-21 停止维护。本 fork 在其停止前
+把上游 `main`（`73a7560`）的**全部修复吸收进来**（含 11158 模型权限锁、reasoning_text 剥离、
+6004 双时钟、缓存 miss 假阳性、cn.chat_base、ProxyFromEnvironment、models.hidden、
+裸模型跨域回退、区域调度、补偿可观测、到期提醒快照、DSML 原生工具调用还原等），
+并在此基础上修掉了下面这批上游没有的问题：
+
+#### 错误分类与账号惩罚
+
+| 症状 | 上游行为 | 本 fork 行为 |
+|---|---|---|
+| `11-128` / `11128` 渠道校验未通过 | 计入账号失败 → 健康账号被降级 / 禁用（issue #188 / #197 / #231） | **账号无过错**：不冷却、不禁用、不计入失败；按业务码 + 主文案判定，且 `11-128`（字符串码）与 `11128`（数字码）**两种形态都认** |
+| `11140` + `request illegal` | 与普通 4xx 混同 | 判定为**账号被限制** → 禁用并提示在 WorkBuddy 提交反馈申诉 |
+| `11140` 但文案是「模型提供方正在限流」 | 一律当封禁 | 仍按**软限流**处理（不误禁用账号） |
+| 裸 `{"msg":"request illegal"}`（无业务码） | 计入账号失败 | 归为**客户端错误**，不惩罚账号 |
+| 判据来源 | 混用 `displayMsg` / `displayTips` | **只看主文案**（`body.msg` → `body.error.message` → `body.error.msg` → `body.message`）。此前用 `displayMsg` 判「安全策略拦截」会让**整个网关降级到次日 0 点** |
+| 流式 SSE error 帧 | 丢业务码 → 健康账号被误降级 10 分钟 | error 帧分类**保留完整业务信封**（含 `displayMsg` / `displayTips`） |
+| `6021` / `queue.full` | 池级冷却 | 渠道级忙碌 + 透传上游 `Retry-After`（**不伪造**） |
+
+#### 上游渠道校验对身份句的逐字黑名单
+
+2026-10-21 起，CN 域上游对**本产品（DeepSeek Harness）的身份句**新增逐字黑名单，命中即
+`400 code=11128 "Illegal API invocation from an unapproved channel"`。这不是账号问题、不是出站头问题、
+不是请求体字段问题——是**一句话逐字命中**：
+
+| 黑名单句 | 命中条件 | 改写后 |
+|---|---|---|
+| `You are an AI agent powered by DeepSeek Harness` | 独立成句 | `You are an AI agent powered by the DSH runtime` |
+| `You are interacting with the user through the DeepSeek Harness Web GUI…` | **两句连体 221 字符**才命中 | `You are interacting with the user through the DSH web interface` |
+
+两条**互相独立**，必须同时改。产品名本身**不能全局替换**——路径形态
+`C:\app\DeepSeek Harness\…` 不被拦（改了会让模型拿到错路径），所以实现里只改写整句、
+并对残留产品名做**路径感知**的别名替换。工具声明（`tools[].description` / 参数 schema）同样走脱敏。
+
+> 该黑名单是上游在 2026-10-20 19:xx ~ 10-21 01:22 之间新增的：10-19 / 10-20 同样的句式全部 200。
+
+#### 账号池
+
+- **「额度未知」≠「额度为 0」**：上游把 `total_tokens <= 0` 当成 0 积分上报，配置了
+  `credit_floor > 0` 的部署会**静默挡掉所有新账号**。本 fork 用 `creditsKnown` 区分二者，
+  面板显示「未知」。
+- **无限额度哨兵不再撑大分母**：上游用 `1<<40` 表示无限额度，直接参与权重归一化 ⇒
+  无限额度账号**独占全部流量**。本 fork 改用**第二大的真实余额**作分母。
+- **燃尽熔断（burn guard）**：按时间窗的花费速率熔断；面板显示燃尽状态；
+  「解冻」会一并清除熔断。
+- **软冷却到期后不再透出过期 reason**（修面板「可用 + 历史 429」并排）。
+- **402 硬冷却的到期时间跟上游时区走**，不跟部署机器本地时区。
+- **12153 连续 3 次才禁用**（与调度器口径一致），不再一次就封。
+
+#### 落盘与并发（Windows 专项）
+
+Go 的 `os.Open` 在 Windows 上**不传 `FILE_SHARE_DELETE`** ⇒ 任何进程持有目标句柄时，
+`MoveFileEx(..., MOVEFILE_REPLACE_EXISTING)` 必返 `ERROR_ACCESS_DENIED`。上游手写的
+tmp + rename 把它当致命错误 ⇒ **后台任务状态在 Windows 上永远存不下去**。本 fork 统一走
+`internal/atomicfile`：唯一暂存名 + 原地覆盖降级 + 忙重试（40 次 × 5ms），并覆盖
+配置、账号凭证、任务状态、任务日志四条落盘路径。CI 增加 `windows-latest` job。
+
+#### 上游交互细节
+
+- **企业额度解析**（issue #222）：键名归一化（`credit` / `Credit` / `CREDIT` / `credit_` / `limitNum` / `limit_num` 等价）、
+  取值**与 map 遍历顺序无关**、类型不匹配**不静默当 0**、`used` 向上取整（保守）、
+  `data: null` 显式判空。
+- **剔除 `function.name` 为空的 `tool_call`**（修线上 11133）。
+- **无 `conversation_id` 时 `prompt_cache_key` 回退会话 key**：否则始终发送的
+  `X-Conversation-ID` 会让上游前缀缓存**永不命中**（费钱且变慢）。
+- **始终发送 `X-Conversation-ID`**（空则随机 32 hex），对齐官方客户端。
+- **裸模型名跨域回退**（默认关闭）。
+- **同账号 refresh 单飞**，避免并发刷新复用已消费的 RT 撞 12153 掉登录。
+- **`/v1/search` 与 `/v1/search/messages`** 搜索端点，且**计入在途租约**（不绕过 `max_in_flight`）。
+
+#### 可观测性
+
+- **运行日志落盘** `logging.log_file`（Windows 上没有控制台也能查）。
+- `WB2A_DUMP_BODY` 开关：打印入站 / 出站 body（截断 4000 字符，Authorization 只打长度）。
+- 积分历史（按账号）、积分到期卡片、停摆率、请求级 JSONL 日志、搜索请求计入记账。
 
 ## 架构总览
 
