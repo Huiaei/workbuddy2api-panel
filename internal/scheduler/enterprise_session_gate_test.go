@@ -2,6 +2,7 @@ package scheduler
 
 import (
 	"encoding/base64"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/cst"
 	"testing"
 	"time"
 
@@ -47,7 +48,7 @@ func sessionTestScheduler(t *testing.T, switched bool) (*Scheduler, *recorderUps
 func TestEnterpriseSessionGateSkipsBehaviorTasks(t *testing.T) {
 	// 与 TestEnterpriseGateSkipsGrowthTasks 同款：把夜猫子窗口钉在窗口内。
 	restoreClock := nowForNightWindow
-	nowForNightWindow = func() time.Time { return time.Date(2026, 10, 12, 23, 30, 0, 0, time.Local) }
+	nowForNightWindow = func() time.Time { return time.Date(2026, 10, 12, 23, 30, 0, 0, cst.Loc) }
 	t.Cleanup(func() { nowForNightWindow = restoreClock })
 
 	cases := []struct {
