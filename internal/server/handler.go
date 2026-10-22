@@ -611,15 +611,22 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	_ = json.Unmarshal(body, &peek)
 
+	// 工具名名单：上游在没有 tools 的请求里会把工具调用吐成原生标记文本
+	// （见 upstream/dsml.go），修复层用它做严格判定。名单来自「本请求声明的 tools」
+	// 与「会话历史里出现过的工具名」两个来源——实测 tools 声明会在中转环节丢失，
+	// 只认前者会让修复层在最需要它的场景下失效。
+	// 在提示词/模型名改写之前取（那些改写不动 tools / messages[].tool_calls 子树）。
+	declaredTools := upstream.ToolNameAllowlist(body)
+
 	// 停摆判定用的工具名单：**只看本请求自己声明的** tools/functions，不含会话历史。
 	//
-	// 为什么不用合并名单（tools 声明 + 会话历史里的工具名）：合并名单对**标记
-	// 修复**是对的（那段正文里的工具标记是不是我们认识的工具），对**停摆判定**
-	// 是错的——多轮会话里模型第 1 轮调了工具、第 2 轮给最终答案，第 2 轮
-	// finish_reason=stop + 零 tool_calls 是**完全正常**的收尾。拿合并名单判，会把
-	// 这种正常收尾误判成停摆 → 白白换号重试一次（多花一次上游调用 + 让客户端多等
-	// 一轮）。停摆的语义是「本轮本该调工具却没调」，只有本请求自己声明了 tools
-	// 才有「本该调」这回事。
+	// 为什么不能用上面的合并名单：合并名单把「本请求声明的」和「历史里出现过的」
+	// 混在一起，对**标记修复**是对的（那段正文里的工具标记是不是我们认识的工具），
+	// 对**停摆判定**是错的——多轮会话里模型第 1 轮调了工具、第 2 轮给最终答案，
+	// 第 2 轮 finish_reason=stop + 零 tool_calls 是**完全正常**的收尾。拿合并名单
+	// 判，会把这种正常收尾误判成停摆 → 白白换号重试一次（多花一次上游调用 +
+	// 让客户端多等一轮）。停摆的语义是「本轮本该调工具却没调」，只有本请求自己
+	// 声明了 tools 才有「本该调」这回事。
 	stallDeclaredTools := upstream.DeclaredToolNames(body)
 	// 停摆判定的第二个必要条件：**历史里还没有工具结果**。
 	//
@@ -849,17 +856,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	//     粘性 key 进程内稳定生成；粘性 key 也空时走轮级兜底（TurnKey/TurnRequestID），
 	//     无 user 消息时退化成本请求级随机——轮转内捕获一次即共享；
 	//   - messageID 在 ChatHeaders 内每条消息生成（消息级独立，无需外部可见）。
-	//
-	// conversationID 透传客户端会话 id；不带 conversation_id 的客户端
-	// （Anthropic / Claude Code 入站流量）回退到已解析的会话键 sessKey
-	// （system + 首条 user 派生，会话内稳定）。不回退的话，上游 prompt_cache_key
-	// 会退化成「每账号一个常量」——同账号下所有客户端（Claude Code 会话、桌面端等）
-	// 共用同一个上游前缀缓存槽，互相覆盖，导致前缀命中不稳定、常整段 miss
-	//（issue #169 / #229：缓存命中率≈0）。
-	//
-	// 注意：这里只在 conversationID 为空且 sessKey 非空时回退。sessKey 为空
-	//（body 无 user 消息，或带 user_id 从而抑制派生）时保持空串——此时
-	// injectConversationHeaders 才会补随机 32 hex，与 v1.13.0 原行为一致。
+	// ConversationID passes the client dialog id through. Clients that have none
+	// (Anthropic / Claude Code traffic) fall back to the session key, otherwise
+	// the upstream prompt_cache_key degrades into one constant per account and
+	// every client on that account ends up sharing a single, constantly evicted
+	// prefix-cache slot.
 	convID := session.ResolveConversationID(body)
 	if convID == "" {
 		convID = sessKey
@@ -1224,12 +1225,18 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// 组装请求上下文做判定）。
 			// errFrame：上游 error 帧原文（观察者旁路采集），用于流尾的账号处置。
 			var errFrame string
+			// 标记修复：上游在没有 tools 的请求里会把工具调用吐成原生标记文本，
+			// 这里在透传前还原成 delta.tool_calls（见 upstream/dsml.go）。
+			// 第二个参数为 true = 名单为空时启用弱判定——tools 声明在链路上丢失是
+			// 实测最常见的泄漏成因，只做严格判定等于对主场景不设防。
+			repair := upstream.NewMarkupRepair(declaredTools, true)
 			// 零 tool_calls 停摆探测器（issue #149）：流式路径**不重试**（帧已写给
 			// 客户端收不回来），只做观测——判定口径与非流式一致（见 DetectToolStall）。
 			stallDetect := upstream.NewStreamToolStallDetector(stallDeclaredTools, stallHistoryHasResult, stallForcedTool)
 			sErr := upstream.StreamHint(w, stats, upstream.FrameHintFunc(func() upstream.HintContext {
 				return h.hintContext(bareModel, reqHasImage)
 			}), upstream.WithErrorFrameObserver(func(payload string) { errFrame = payload }),
+				upstream.WithMarkupRepair(repair),
 				upstream.WithFrameObserver(stallDetect.Observe),
 				// 流结束观测：上游没发 [DONE] 就 EOF = 流被截断 → 零 tool_calls 是
 				// 「帧没到齐」而不是「模型不调工具」→ 不判停摆（与非流式同口径）。
@@ -1289,9 +1296,21 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			if st.hasCache {
 				cacheMissWarn.noteCacheTokens(bareModel, st.promptTokens, st.cacheHit, st.cacheMiss)
 			}
-			// 注：v1.13.0 基线**没有** DSML 标记修复器（internal/upstream/dsml.go
-			// 不在本分支），所以流式侧没有「修复器还原出过调用」这个信号，
-			// 「流式判停摆 / 非流式不判停摆」的两种口径差异在本分支不存在。
+			if n := repair.Converted(); n > 0 {
+				// 修复命中：上游本来会把工具调用吐成正文标记，这里已还原成 tool_calls。
+				// 打一行便于运维确认「这次不再空转」以及统计发生率。
+				//
+				// 同时告诉停摆探测器：上游**确实调了工具**（只是吐成了文本标记），
+				// 否则流式会判停摆、非流式（先修复再判定）不判——同一形态两种口径。
+				stallDetect.MarkRepaired(n)
+				log.Printf("INFO: [server] stream acct=%s model=%s: repaired %d native tool call(s) from assistant text (tool names known=%d)",
+					logfmt.Label(acct.UID, acct.Nickname), bareModel, n, len(declaredTools))
+			} else if m := repair.Seen(); m > 0 {
+				// 识别到标记却没还原：说明判定没过（工具名不合规 / 块内夹带正文 /
+				// 参数畸形）。单独记一行，排障时能一眼区分「没识别到」与「识别到但拒绝」。
+				log.Printf("WARN: [server] stream acct=%s model=%s: saw %d native tool call block(s) but repaired none (tool names known=%d)",
+					logfmt.Label(acct.UID, acct.Nickname), bareModel, m, len(declaredTools))
+			}
 			// 零 tool_calls 停摆观测（issue #149）：流式**不重试**（帧已写给客户端），
 			// 只记录观测。判定口径与非流式一致：声明了 tools 却零 tool_calls 且 stop 收尾。
 			streamStall := stallDetect.Info()
@@ -1301,7 +1320,6 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				log.Printf("WARN: [server] stream acct=%s model=%s: zero-tool_call stall (declared tools=%d, text_len=%d, finish=%s) — upstream answered with text only, tools not invoked",
 					logfmt.Label(acct.UID, acct.Nickname), bareModel, streamStall.DeclaredTools, streamStall.ContentLen, streamStall.FinishReason)
 			}
-
 			st.ttfb = stats.TTFB()
 			// usage 缺失时保留 chatStat.toks 的 -1 哨兵（观测缺失 → 显示 "-"），
 			// 不写入零值——否则「没观测到 usage」被伪造成「测得 0 token」，
@@ -1348,6 +1366,17 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			st.outcome = reqlog.OutcomeHTTPError
 			return
 		}
+		// 标记修复（非流式）：把正文里的原生工具调用标记还原成 message.tool_calls。
+		// 只在「没有结构化 tool_calls」且「finish_reason 为 stop」时生效（见 dsml.go）；
+		// 名单为空时走弱判定（tools 声明在中转环节丢失是常态）。
+		mrepair := upstream.RepairAggregatedResponse(resp, declaredTools, true)
+		if n := mrepair.Converted(); n > 0 {
+			log.Printf("INFO: [server] non-stream model=%s: repaired %d native tool call(s) from assistant text (tool names known=%d)",
+				bareModel, n, len(declaredTools))
+		} else if m := mrepair.Seen(); m > 0 {
+			log.Printf("WARN: [server] non-stream model=%s: saw %d native tool call block(s) but repaired none (tool names known=%d)",
+				bareModel, m, len(declaredTools))
+		}
 		// 零 tool_calls 停摆检测（issue #149）：请求声明了 tools，模型却只回了正文
 		// 并以 stop 收尾——工具一次没跑，客户端会按「正常完成」收尾，任务停在原地。
 		//
@@ -1364,7 +1393,6 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		// 积分），重试只是再问一次，不会退回上一跳的消耗。若把记账放在重试之后，
 		// 停摆的那一跳在账本上凭空消失 → 账号余额被高估（选号会继续往它身上派，
 		// 实际上它已经在烧钱）+ 积分燃尽熔断（issue #229）漏计这一跳。
-
 		credit, total, hasCredit := usageCreditTotal(resp)
 		if usage, ok := resp["usage"].(map[string]any); ok {
 			if hit, miss, okC := cacheTokensFromUsage(usage); okC {

@@ -106,27 +106,13 @@ func TestDeclaredToolNames(t *testing.T) {
 	}
 }
 
-// TestDeclaredToolNamesExcludesHistoryTools 停摆判定用的名单**只看本请求自己声明
-// 的** tools，不含会话历史。
-//
-// （1.13.0 基线上没有标记修复层，所以没有「合并名单」可对比；这里直接钉住
-// 「历史里的 tool_calls 不算本轮声明」这条语义。）
-//
-// 为什么必须排除历史：多轮会话里模型第 1 轮调了工具、第 2 轮给最终答案，
-// 第 2 轮 finish_reason=stop + 零 tool_calls 是**完全正常**的收尾。若把历史
-// 工具算进本轮声明，这个正常收尾会被误判成停摆 → 白白换号重试一次。
-func TestDeclaredToolNamesExcludesHistoryTools(t *testing.T) {
-	historyOnly := []byte(`{"messages":[{"role":"assistant","tool_calls":[{"function":{"name":"get_weather"}}]}]}`)
-	if got := DeclaredToolNames(historyOnly); len(got) != 0 {
-		t.Errorf("DeclaredToolNames must exclude history tools, got %v", got)
+// TestDeclaredToolNamesVsAllowlist 停摆判定用的名单必须**窄于**标记修复用的名单。
+func TestDeclaredToolNamesVsAllowlist(t *testing.T) {
+	body := []byte(`{"messages":[{"role":"assistant","tool_calls":[{"function":{"name":"get_weather"}}]}]}`)
+	if got := ToolNameAllowlist(body); len(got) == 0 {
+		t.Errorf("ToolNameAllowlist should include history tools, got %v", got)
 	}
-	// 本请求自己声明的才算。
-	declared := []byte(`{"tools":[{"type":"function","function":{"name":"get_weather"}}],"messages":[{"role":"assistant","tool_calls":[{"function":{"name":"other_tool"}}]}]}`)
-	got := DeclaredToolNames(declared)
-	if !got["get_weather"] {
-		t.Errorf("DeclaredToolNames must include own declared tools, got %v", got)
-	}
-	if got["other_tool"] {
+	if got := DeclaredToolNames(body); len(got) != 0 {
 		t.Errorf("DeclaredToolNames must exclude history tools, got %v", got)
 	}
 }
