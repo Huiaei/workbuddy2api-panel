@@ -2,6 +2,7 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -719,7 +720,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	// gateway_hint 判定所需的请求形态（image_url part）：在改写前取（与 turnKey
 	// 同理）。11133「模型不支持图片」指向的前提。
-	reqHasImage := hasImagePart(body)
+	reqHasImage := imagePartIfPresent(body)
 
 	// 在途租约：成功选中即占名额；函数出口（含成功 return 与 panic）统一释放。
 	var heldUID string
@@ -2017,6 +2018,15 @@ func writeOpenAIErrorHint(w http.ResponseWriter, status int, code, msg, hint str
 	})
 }
 
+// imagePartIfPresent 是 hasImagePart 的前置闸门：hasImagePart 只认 content
+// 数组形态，每次调用都要 json.Unmarshal 整个请求体，而绝大多数的请求根本
+// 不带图。先用一次 bytes.Contains 扫原始字节，没有 "image_url" 就零解析返回
+// false——调用点在每条请求的改写之前，省下的是热路径上每次一条的解析开销
+// （长会话 body 可达数百 KB）。
+func imagePartIfPresent(body []byte) bool {
+	return bytes.Contains(body, []byte(`"image_url"`)) && hasImagePart(body)
+}
+
 // hasImagePart 报告聊天请求体是否携带多模态 image_url part（OpenAI 兼容形态
 // messages[].content[] {type:"image_url"}）。畸形/其他形态一律 false（hint 侧
 // 宁缺勿滥：判不出带图就不给「模型不支持图片」指向）。
@@ -2030,8 +2040,9 @@ func hasImagePart(body []byte) bool {
 		return false
 	}
 	for _, m := range peek.Messages {
-		// Text-only system/history messages use strings; tool-call messages
-		// may use null. Neither should hide images in another message.
+		// 纯文本的 system / 历史消息 content 是字符串，工具调用轮是 null：
+		// 这两种形态解析成数组会失败，直接跳过即可——它们不该把别的消息里
+		// 的图挡住（此前正是这里 continue 掉整条消息，导致混合形态漏检）。
 		var parts []struct {
 			Type string `json:"type"`
 		}
