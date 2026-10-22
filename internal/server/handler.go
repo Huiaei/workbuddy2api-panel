@@ -28,6 +28,7 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/session"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/usage"
+	"math/rand"
 )
 
 // Config handler 依赖。
@@ -897,6 +898,8 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// allowExtraIteration：本轮结束时的 continue 是否来自停摆重试（它不消耗
 	// 轮转预算，因此即使 rotateUsed 已达上限也要允许再进一次循环体）。
 	allowExtraIteration := false
+	// busyWaited：本次请求是否已经为「全池被 14003 挡住」等过一次（只等一次）。
+	busyWaited := false
 	for attempt := 0; rotateUsed < h.cfg.MaxRotate || allowExtraIteration; attempt++ {
 		allowExtraIteration = false
 		// 退避序号：随尝试次数指数增长（backoffAfter 内部有封顶）。停摆重试也
@@ -949,6 +952,40 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				log.Printf("WARN: [server] non-stream model=%s: no second account available after tool-stall — returning upstream content as-is",
 					bareModel)
 				return
+			}
+			// 全池被 14003（或 6004）挡住时**先等一次**再报 503（issue #46）。
+			//
+			// 以前这种情况立刻返 503：客户端几秒内连撞三次就熔断，用户侧表现为
+			// 「经常断」。而上游其实只是间歇繁忙——同一分钟内既有 14003 也有成功，
+			// 等几秒大概率就好了，比让客户端自己重试更可控。
+			//
+			// 判据收紧到三条同时成立才等：
+			//   (a) 全池确实被挡（ModelBlockedForRealm.Blocked）；
+			//   (b) 挡住的原因是**瞬时**的（Transient：14003/6004）。11102/11158 换号
+			//       必然同样失败，等了也是白等，直接报不可重试；
+			//   (c) 剩余冷却在上限内（modelBusyWaitMax）。
+			// 只等一次、不占换号次数（与停摆重试同口径），等待期间未 Acquire
+			// 故不占在途名额。
+			if !busyWaited {
+				if mb := h.cfg.Pool.ModelBlockedForRealm(bareModel, realm); mb.Blocked && mb.Transient && !mb.Until.IsZero() {
+					if d := time.Until(mb.Until); d > 0 && d <= modelBusyWaitMax {
+						busyWaited = true
+						// 抖动**只加不减**（0~+25%）：早醒会在冷却没解除时醒来，
+						// 这一次等待额度白花、客户端多等几秒照样拿 503；晚醒没有任何代价。
+						wait := d + time.Duration(rand.Int63n(int64(d)/4+1))
+						log.Printf("INFO: [server] model=%s: all accounts blocked by transient model busy, waiting %v for one retry (earliest unblock %s)",
+							bareModel, wait.Round(time.Millisecond), mb.Until.Format(time.RFC3339))
+						select {
+						case <-time.After(wait):
+						case <-r.Context().Done():
+						}
+						if r.Context().Err() != nil {
+							break // 客户端已断连：等待无意义，走末端错误
+						}
+						allowExtraIteration = true
+						continue
+					}
+				}
 			}
 			st.status = http.StatusServiceUnavailable
 			// 记下"是不是模型级阻塞"。选号返回 nil 有两种完全不同的成因：
@@ -1471,6 +1508,13 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// （限流语义、客户端应等待重试），其余保持 503。本地调度类错误（无可用账号/
 	// 传输层抖动/非上游返回的 lastErr）→ 保留自有文案 no_healthy_account（本地错误
 	// 没有上游原文可透传，不编造）。
+	// 末端错误映射前补一次模型级快照。上面 `acct == nil` 分支已取过一次，但
+	// **「轮转耗尽」这条退出路径没取**——而两者对客户端是同一件事（全池该模型都
+	// 不可选）。不补的话：走选号失败分支报 503 model_busy + Retry-After，走轮转
+	// 耗尽却落到通用 no_healthy_account 且没有 Retry-After（MaxRotate=1 时必现）。
+	if !modelBlock.Blocked {
+		modelBlock = h.cfg.Pool.ModelBlockedForRealm(bareModel, realm)
+	}
 	status := http.StatusServiceUnavailable
 	code := "no_healthy_account"
 	msg := "all accounts are temporarily unavailable, please retry later"
@@ -1540,7 +1584,27 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	//
 	// 用 400 而非 503：这是"你选的这个模型当前不可用"，不是"服务端暂时过载"。
 	// 换号重试必然同样失败，客户端不该按可重试错误处理。
-	if modelBlock.Blocked {
+	if modelBlock.Blocked && modelBlock.Transient {
+		// 瞬时原因（14003 模型繁忙 / 6004 模型限流）：号与权限都正常，只是这个模型
+		// 这一刻排队满/超量。**必须给可重试语义**——此前一律 400 model_unavailable
+		// 等于告诉客户端「换模型才有效」，DSH / Codex 据此不再重试，高峰期用户侧
+		// 表现为「DeepSeek 用不了」，而官方客户端同一时刻还在正常排队（issue #24）。
+		code = "model_busy"
+		status = http.StatusServiceUnavailable
+		if !upstreamMsgPassed {
+			msg = "the model is temporarily busy at upstream on every account, retry after a short wait"
+		}
+		hint = fmt.Sprintf("model_busy: %d account(s) cooling down this model (transient)", modelBlock.Count)
+		if !modelBlock.Until.IsZero() {
+			hint += "; earliest unblock at " + modelBlock.Until.Format(time.RFC3339)
+			if d := time.Until(modelBlock.Until); d > 0 {
+				w.Header().Set("Retry-After", strconv.Itoa(int(math.Ceil(d.Seconds()))))
+			}
+		}
+		if s := strings.TrimSpace(modelBlock.Reason); s != "" {
+			hint += "; upstream: " + s
+		}
+	} else if modelBlock.Blocked {
 		code = "model_unavailable"
 		// 有上游原文时保留它（含 requestId，用户要拿去向上游反馈），只把"有几个号
 		// 被挡、最早何时解封"这类本地调度信息放进 gateway_hint。
@@ -1884,6 +1948,12 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 		// 选号侧 healthyForModel 对该账号自动避开该模型。
 		// 立即换号（本轮 continue），该账号该模型冷却，下次选号避开。
 		h.cfg.Pool.BlockModelBackoff(uid, model, upstream.ModelBlockReasonFor(body))
+	case upstream.ErrModelBusy:
+		// 14003「该模型此刻繁忙」：**瞬时**的 (账号,模型) 级避让，10s 首档、封顶 1m。
+		// 特意不走 BlockModelBackoff（那是 6h 起、封顶 24h 的确定性负缓存）——
+		// 把间歇抖动停成整分钟不可用正是 issue #46 的实案。也不罚号（不 NoteError /
+		// 不喂连败）：上游只是排队满了，账号与权限都健康。
+		h.cfg.Pool.BlockModelBusy(uid, model, upstream.ModelBusyReasonFor(body))
 	default:
 		// 其余（ErrClient/ErrNone）：只换号不罚（防雪崩），不喂熔断。
 		// ErrClient（未知 4xx）喂连败计数（issue #114）：连续 N 次该形态失败 →
@@ -1898,6 +1968,12 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 // ---------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------
+
+// modelBusyWaitMax 「全池被瞬时模型繁忙挡住」时最多等多久再报 503（issue #46）。
+//
+// 10s 是实测折衷：上游 14003 的间歇周期在秒级，等 10s 能救回绝大多数；再长就会
+// 逼客户端撞到自己的超时。测试里设 0 可关闭（与 rotateBackoffBase 同口径）。
+var modelBusyWaitMax = 10 * time.Second
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
 	raw, _ := json.Marshal(v)

@@ -349,6 +349,73 @@ func (p *Pool) BlockModelBackoff(uid, model, reason string) {
 	p.dirty.Store(true)
 }
 
+// modelBusy 首档 / 封顶 TTL（14003 瞬时模型繁忙）。
+//
+// 生产日志（全球域 deepseek-v4.1-flash）显示上游繁忙是**间歇**的：同一分钟内既有
+// 14003 也有成功。旧口径没有 14003 这一类，它落进通用 429 → 逐号 600s 软冷却，
+// 三个号各自停 10 分钟再叠加，就成了整分钟客户端可见的黑障（十分钟里 20 秒 503，
+// 之后客户端直接放弃，issue #46）。
+//
+// 首档 10s、封顶 1m：宁可多交一次**不扣费**的 14003，也不要把间歇抖动停成整分钟
+// 不可用。翻倍阶梯保留，持续繁忙的模型仍会逐级退开（10s→20s→40s→60s）。
+const (
+	modelBusyBaseTTL = 10 * time.Second
+	modelBusyMaxTTL  = time.Minute
+)
+
+// modelBusyReasonPrefix 14003 条目的 reason 前缀。选号侧与状态台账据此把这个
+// 「瞬时」条目与 11102/11158（确定性无权限）区分开：前者可等、后者只能换模型。
+const modelBusyReasonPrefix = "14003"
+
+// modelRateLimitReasonPrefix 6004「模型级限流」条目的 reason 前缀（handler 写入的
+// 是 "6004 model rate limit"）。与 14003 同属**瞬时**类：号健康、权限也在，等或
+// 换模型即可，而不是 11102/11158 那种"换号必然同样失败"。
+const modelRateLimitReasonPrefix = "6004"
+
+// BlockModelBusy 14003「该模型此刻繁忙」的 (账号, 模型) 级短避让入口
+// （handler.applyErrorPolicy 调用）。
+//
+// 与 BlockModelBackoff 的区别全在 TTL 与语义：本入口是**瞬时**的（秒级、封顶 1m），
+// 且 reason 以 "14003" 开头，供 ModelBlockedForRealm 标出 Transient，末端据此报
+// 503 model_busy + Retry-After（可重试）而不是 400 model_unavailable（不可重试）。
+func (p *Pool) BlockModelBusy(uid, model, reason string) {
+	if uid == "" || model == "" {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	e, ok := p.byUID[uid]
+	if !ok {
+		return
+	}
+	now := time.Now()
+	hits := 1
+	if e.modelCooldowns != nil {
+		if prev, ok := e.modelCooldowns[model]; ok && strings.HasPrefix(prev.Reason, modelBusyReasonPrefix) {
+			hits = prev.Hits + 1
+		}
+	}
+	ttl := modelBusyBaseTTL
+	for i := 1; i < hits && ttl < modelBusyMaxTTL; i++ {
+		ttl *= 2
+	}
+	if ttl > modelBusyMaxTTL {
+		ttl = modelBusyMaxTTL
+	}
+	if !strings.HasPrefix(reason, modelBusyReasonPrefix) {
+		reason = modelBusyReasonPrefix + " model busy: " + reason
+	}
+	if e.modelCooldowns == nil {
+		e.modelCooldowns = map[string]modelCooldown{}
+	}
+	e.modelCooldowns[model] = modelCooldown{
+		Until:  now.Add(ttl),
+		Reason: reason,
+		Hits:   hits,
+	}
+	p.dirty.Store(true)
+}
+
 // BlockModelClear 清除 (账号, 模型) 的确定性模型拒绝负缓存（11102/11158；该模型
 // 实测又通了）。半开探测或正常请求对该模型成功后调用（handler 成功路径）。只清
 // 这两类条目、不碰 6004 独立冷却表——6004 有自身上游重置墙钟语义，成功不该抹掉。
@@ -363,7 +430,8 @@ func (p *Pool) BlockModelClear(uid, model string) {
 		return
 	}
 	mc, exists := e.modelCooldowns[model]
-	if !exists || (!strings.HasPrefix(mc.Reason, "11102") && !strings.HasPrefix(mc.Reason, "11158")) {
+	if !exists || (!strings.HasPrefix(mc.Reason, "11102") && !strings.HasPrefix(mc.Reason, "11158") &&
+		!strings.HasPrefix(mc.Reason, modelBusyReasonPrefix)) {
 		return
 	}
 	delete(e.modelCooldowns, model)
@@ -379,6 +447,19 @@ type ModelBlockStatus struct {
 	Reason  string    // 冷却原因（通常为上游原文，如 "11102 model ... not found"）
 	Until   time.Time // 最早解封时间（零值 = 上游未给重置时刻）
 	Count   int       // 因此被挡的账号数
+	// Transient true = 挡住它的是**瞬时**原因（14003 模型繁忙 / 6004 模型限流），
+	// 号与权限都正常，等一会儿就好。false = 确定性原因（11102 无此模型 /
+	// 11158 无权限），换号重试必然同样失败，只能换模型。
+	//
+	// 这个区分决定末端 HTTP 语义：Transient → 503 + Retry-After（客户端该重试）；
+	// 非 Transient → 400 model_unavailable（客户端该换模型）。此前一律 400，
+	// 客户端据此不再重试，高峰期表现为「这个模型用不了」（issue #24）。
+	Transient bool
+
+	// 内部聚合位：遍历过程中累计"见过瞬时条目"与"见过确定性条目"，
+	// 最终 Transient = 全为瞬时（有确定性条目就不可重试）。
+	transientSeen     bool
+	deterministicSeen bool
 }
 
 // ModelBlocked 报告该模型是否在全池范围内被模型级冷却挡住。
@@ -429,6 +510,16 @@ func (p *Pool) ModelBlockedForRealm(model, realm string) ModelBlockStatus {
 			if st.Reason == "" {
 				st.Reason = mc.Reason
 			}
+			// 瞬时性由**每个**挡住的号共同决定：只要有一个号的条目是确定性的
+			// （11102/11158），整体就不能报「可重试」——那种情况下重试一定还是
+			// 同样失败，让客户端等一下只是白等。
+			if strings.HasPrefix(mc.Reason, modelBusyReasonPrefix) ||
+				strings.HasPrefix(mc.Reason, modelRateLimitReasonPrefix) {
+				st.transientSeen = true
+			} else {
+				st.transientSeen = false
+				st.deterministicSeen = true
+			}
 			// 取最早解封：那才是"再等多久值得重试"的答案。
 			if !mc.Until.IsZero() && (st.Until.IsZero() || mc.Until.Before(st.Until)) {
 				st.Until = mc.Until
@@ -440,6 +531,7 @@ func (p *Pool) ModelBlockedForRealm(model, realm string) ModelBlockStatus {
 		return ModelBlockStatus{}
 	}
 	st.Blocked = true
+	st.Transient = st.transientSeen && !st.deterministicSeen
 	return st
 }
 

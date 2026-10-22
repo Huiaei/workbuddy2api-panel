@@ -40,6 +40,7 @@ const (
 	ErrAccountFault                  // 账号级授权/配额故障（11140 request illegal / 14017 trial not activated）→ 冷却轮换，不无限重试
 	ErrChannelRefused                // 11-128/11128 通道校验失败（请求形状没过官方渠道校验，账号本身健康）→ 不罚号、继续轮转
 	ErrModelBlocked                  // 11102「该后端无此模型」→ (账号,模型) 负缓存避让，切模型/切账号
+	ErrModelBusy                     // 14003「该模型此刻繁忙」→ **瞬时** (账号,模型) 级秒级避让（不罚号、10s 首档、封顶 1m），末端 503 model_busy + Retry-After
 	ErrWafBlock                      // 403 + 非业务信封体（APISIX WAF 拦截页/空体）→ 账号软冷却 + 抖动退避
 	ErrPromptTooLong                 // 11115「prompt is too long」→ 请求级错误（上下文超限是请求的问题非账号的问题）：不罚号、不轮转，末端透传原文
 	ErrImageInvalid                  // 图片请求格式/数据无效 → 请求级错误：不罚号、不轮转，末端透传原文
@@ -65,6 +66,8 @@ func (k ErrKind) String() string {
 		return "bad_params"
 	case ErrModelBlocked:
 		return "model_blocked"
+	case ErrModelBusy:
+		return "model_busy"
 	case ErrWafBlock:
 		return "waf_block"
 	case ErrPromptTooLong:
@@ -491,6 +494,21 @@ func IsModelRateLimit(body string) bool {
 	return reModelRateLimit.MatchString(body)
 }
 
+// modelBusyCode 上游「该模型此刻繁忙 / 排队已满」的业务 code（14003）。
+//
+// 与 11102/11158 的关键区别：14003 是**瞬时的**。生产日志里同一分钟内既有 14003
+// 也有成功，账号本身健康、模型也有权限，只是上游这一刻排队满了。所以它只做
+// (账号,模型) 级**秒级**避让，绝不罚号、绝不进 11102 那种 6h 起的负缓存
+// （那会把间歇抖动停成整分钟不可用，issue #46 的实案）。
+const modelBusyCode = "14003"
+
+// reModelBusy 预编译：每次错误分类都会跑，错误风暴时尤甚（与 6004 同口径）。
+var reModelBusy = regexp.MustCompile(`"code"\s*:\s*"?` + modelBusyCode + `"?`)
+
+// IsModelBusy 报告 body 是否明确指向模型级瞬时繁忙（业务 code 14003）。
+// `"code":14003` / `"code": 14003` / `"code":"14003"` 均可命中。
+func IsModelBusy(body string) bool { return reModelBusy.MatchString(body) }
+
 // modelBlockCode 明确指向「该后端无此模型」的业务 code。
 const modelBlockCode = "11102"
 
@@ -549,6 +567,21 @@ func ModelBlockReasonFor(body string) string {
 		return ModelForbiddenReason
 	}
 	return ModelBlockReason
+}
+
+// ModelBusyReasonFor 14003 条目的 reason 文本（写进 (账号,模型) 冷却台账，面板可见）。
+// 带上游 msg 有助排查，但截断到 160 字符——reason 会被面板表格与 /status 台账原样
+// 展示，长 body 会把表格撑坏。
+func ModelBusyReasonFor(body string) string {
+	_, msg := modelBlockFields(body)
+	msg = strings.TrimSpace(msg)
+	if msg == "" {
+		return modelBusyCode + " model busy"
+	}
+	if r := []rune(msg); len(r) > 160 {
+		msg = string(r[:160]) + "…"
+	}
+	return modelBusyCode + " model busy: " + msg
 }
 
 // modelBlockFields 提取顶层或 error 子对象中的业务 code 与消息。
@@ -822,6 +855,13 @@ func Classify(status int, body string) ErrKind {
 	// 只认 400/404（见 IsModelBlocked），429+11102 落下方 status==429 层走限流语义。
 	if IsModelBlocked(status, body) {
 		return ErrModelBlocked
+	}
+	// 14003「该模型此刻繁忙」紧随其后：它也是 (账号,模型) 级的精确业务码，但性质是
+	// **瞬时**。必须先于 402/429 兜底——否则 429+14003 会被通用 429 归 ErrSoftRate
+	// ⇒ 逐号 600s 软冷却 ⇒ 两三个号一叠就成了整分钟玩家可见的黑障（issue #46：
+	// 十分钟里 20 秒 503，之后客户端直接放弃）。
+	if IsModelBusy(body) {
+		return ErrModelBusy
 	}
 	// 402：真正的计费余额耗尽状态码，最严、最不可自愈，最先判。
 	if status == http.StatusPaymentRequired {

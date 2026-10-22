@@ -68,6 +68,10 @@ func GatewayHint(kind ErrKind, msg string, ctx HintContext) string {
 		return "upstream capacity is full (queue.full); this is a channel-level issue, not an account problem; retry after a short wait"
 	case ErrModelBlocked:
 		return "upstream has no such model on this backend; switch model or retry on another account"
+	case ErrModelBusy:
+		// 14003：上游只是这一刻排队满了，号与权限都正常。给可重试语义，让客户端
+		// 按 Retry-After 等——官方客户端同一时刻也在排队（issue #24）。
+		return "model busy at upstream on every account (14003, per-model short cooldown); retry after a moment"
 	case ErrContentBlocked:
 		// 措辞不含 "upstream"：content_blocked 响应有不含上游字样的既有口径
 		// （handler_test 的泄漏守卫），hint 遵守同一口径。
