@@ -4,6 +4,7 @@
 package pool
 
 import (
+	"github.com/linguo2625469/workbuddy2api-panel/internal/cst"
 	"log"
 	"sort"
 	"strings"
@@ -156,7 +157,7 @@ func sanitizeExpiryBuckets(in []ExpiryBucket, now time.Time) []ExpiryBucket {
 			continue
 		}
 		if b.ExpireAt.IsZero() {
-			if t, err := time.ParseInLocation("2006-01-02", b.Date, time.Local); err == nil {
+			if t, err := time.ParseInLocation(cst.DayLayout, b.Date, cst.Loc); err == nil {
 				b.ExpireAt = t
 			}
 		}

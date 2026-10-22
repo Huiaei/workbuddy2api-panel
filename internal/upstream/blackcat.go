@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/cst"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/session"
 )
 
@@ -97,7 +98,7 @@ func (c *Client) ClaimCompensation(a *auth.Auth) (int64, error) {
 
 // HeatmapYesterdayMissed 检查昨日是否漏签（heatmap cell score==0）。
 func (c *Client) HeatmapYesterdayMissed(a *auth.Auth) (bool, error) {
-	yesterday := time.Now().AddDate(0, 0, -1).Format("2006-01-02")
+	yesterday := cst.Now().AddDate(0, 0, -1).Format(cst.DayLayout) // 上游自然日（CST），不跟宿主时区
 	data, err := c.growthJSON(a, http.MethodGet, "/activity/growth/heatmap", nil)
 	if err != nil {
 		return false, err
