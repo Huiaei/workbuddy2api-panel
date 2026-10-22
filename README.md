@@ -14,25 +14,47 @@
   <img alt="API" src="https://img.shields.io/badge/API-OpenAI_Compatible-412991?style=flat-square">
   <img alt="Deploy" src="https://img.shields.io/badge/Deploy-Single_Binary%20%7C%20Docker-2496ED?style=flat-square">
   <img alt="Transport" src="https://img.shields.io/badge/Transport-SSE%20%2F%20Streaming-0DBD8B?style=flat-square">
+  <img alt="AI" src="https://img.shields.io/badge/AI-Generated_Project-8A2BE2?style=flat-square">
 </p>
 
 ---
 
+## 🤖 本项目是一个 AI 项目
+
+> [!IMPORTANT]
+> **本仓库的代码、issue 排查、代码审查、测试编写与修复实现，均由 AI 主导完成**
+> （具体由 DeepSeek Harness / DeepSeek 系列模型驱动，人工负责提出需求、验证结果、
+> 决定取舍与发布）。
+>
+> 这意味着：
+>
+> - **AI 产出的代码未经传统意义上的人工逐行审阅**，仍可能存在逻辑缺陷、边界遗漏与风格问题；
+> - **欢迎审查**：任何你觉得不对的地方，请直接提 issue 或 PR，哪怕只是一行看不懂的代码；
+> - **发现错误请以「代码事实」为准**，不要假设某个行为是刻意设计的——很多时候它只是 AI 的误解；
+> - **关键场景请自行复核**：涉及账号安全、积分计费、对外暴露的部署，落地前请自行验证关键路径。
+>
+> 透明性说明：上游 [Sliverkiss/workbuddy2api](https://github.com/Sliverkiss/workbuddy2api)
+> 与 [linguo2625469/workbuddy2api-panel](https://github.com/linguo2625469/workbuddy2api-panel)
+> 的原始部分由原作者人工编写；**本 fork 自 2026-10 起的全部修复与维护工作为 AI 产出**。
+> 完整披露见[「🤖 AI 项目声明与维护披露」](#-ai-项目声明与维护披露)。
+
 > [!IMPORTANT]
 > **本 fork 已于 2026-10-21 停止跟随上游。** 上游 `linguo2625469/workbuddy2api-panel` 同样于 2026-10-21
-> 声明停止维护（不再更新代码、不再处理 issue / PR）。本 fork 的 `main` 分支是**当前唯一维护分支**，
+> 声明停止维护（不再更新代码、不再处理 issue / PR）。本 fork 的 `fix/all-known-issues` 分支是
+> **当前唯一维护分支，也是仓库默认分支**，
 > 以**发行版 v1.13.0（`d66384d`）为基线**，已吸收上游 `main` 的全部后续修复并额外修掉一批线上问题。
 >
 > **为什么以 v1.13.0 而不是上游 main 为基线**：v1.13.0 是绝大多数用户实际运行的发行版；
 > 上游 main 相对它只多 9 个提交，其中包含一整套 DSML 层（与本 fork 的「零 tool_calls 停摆检测」交互复杂），
-> 因此本 fork 把 DSML 能力**单独移植**进来，而不是整体切换基线——结果是本 fork 的 `main` 在功能上是
-> **上游 main 的超集**。
+> 因此本 fork 把 DSML 能力**单独移植**进来，而不是整体切换基线——结果是本 fork 的 `fix/all-known-issues`
+> 在功能上是**上游 main 的超集**。
 >
 > **本 fork 修掉而上游没有的**（详见 [与上游的差异](#-与上游的差异)）：
 > 11-128 / 11140 按业务码分流、渠道校验失败不误禁账号、CN 域上游对身份句的逐字黑名单规避、
 > Windows 落盘原子写、额度「未知 ≠ 0」、企业额度解析、裸模型跨域回退、搜索端点、日志落盘等。
 >
-> **维护方式披露**：本 fork 的 issue 排查、代码审查、测试与修复实现**大量由 AI 辅助完成**。
+> **维护方式披露**：本 fork 的 issue 排查、代码审查、测试与修复实现**全部由 AI 主导完成**，
+> 详见顶部[「🤖 本项目是一个 AI 项目」](#-本项目是一个-ai-项目)。
 
 > **本项目是 [Sliverkiss/workbuddy2api](https://github.com/Sliverkiss/workbuddy2api) 的增强分支**（fork）。
 > 上游仓库现已删除；本项目**已同步至上游删库前的最后一次更新**（`ea8b1e5`），此后由本分支独立维护演进。
@@ -58,6 +80,48 @@
 5. **作者保留止损的权利。** 若滥用行为持续，作者可能随时停止维护、关闭或删除仓库，且不另行通知。上游的今天可能就是本项目的明天，望自重。
 
 如果你的用途是管理自己的账号，欢迎正常使用、反馈问题与提交 PR。
+
+## 🤖 AI 项目声明与维护披露
+
+**本项目是一个 AI 项目。**
+
+自 2026-10 起，本仓库（`Huiaei/workbuddy2api-panel`）的**全部维护工作——issue 排查、代码审查、
+测试编写、修复实现、文档撰写——均由 AI 主导完成**，具体由 DeepSeek Harness / DeepSeek 系列模型驱动。
+人工的角色是：提出需求、验证结论、决定取舍与发布节奏。
+
+### 哪些是 AI 产出，哪些不是
+
+| 范围 | 产出方式 |
+|---|---|
+| 上游 [Sliverkiss/workbuddy2api](https://github.com/Sliverkiss/workbuddy2api) 的原始代码 | 原作者**人工**编写 |
+| 上游 [linguo2625469/workbuddy2api-panel](https://github.com/linguo2625469/workbuddy2api-panel) 的面板与任务体系 | 原作者**人工**编写（含其自行披露的少量 AI 辅助） |
+| **本 fork 自 2026-10 起的全部修复集**（错误分类、账号池、Windows 落盘、CN 域身份句脱敏、DSML 移植等） | **AI 主导产出** |
+| 本 fork 的测试用例、README 的「2026-10 之后的修复集」章节 | **AI 主导产出** |
+
+### 这意味着什么
+
+- **代码未经传统意义上的人工逐行审阅**。虽然每批改动都通过了 `go build` / `go vet` / `go test ./...`
+  与 Windows CI 专项 job，但仍然可能存在**逻辑缺陷、边界遗漏、错误假设与风格问题**。
+- **行为异常时请以「代码事实」为准**。如果你在文档里读到的行为和实际表现不符，
+  **那几乎总是 bug，而不是「刻意设计」**——请直接提 issue。
+- **关键路径请自行复核**。涉及账号安全、积分计费、对外暴露的部署，落地前请自行验证关键路径，
+  不要仅凭本文档的描述就上线。
+- **欢迎审查**。哪怕只是一行看不懂的代码、或一个你觉得「AI 写错了」的地方，都欢迎提 issue 或 PR。
+
+### 已知的 AI 产出固有风险
+
+| 风险 | 本项目的处理 |
+|---|---|
+| 误判错误类型 ⇒ 误禁健康账号 | 11-128 / 11140 按**业务码**分流，渠道校验失败**零惩罚**（账号无过错） |
+| 用 `displayMsg` / `displayTips` 等**提示文案**做判据 | 判据只用**主文案**（`body.msg` → `body.error.message` → …），否则一次安全提示就会让**整个网关降级** |
+| 探针单次采样 ⇒ 把噪声当结论 | 本项目所有关键结论均以 **K≥3 次重复**验证后才写入文档 |
+| 手写近似请求体 ⇒ 证明不了真实形态 | CN-400 根因排查中，前 8 批「手写近似 body」的探针**全部失败**；破局点是用**网关真实代码 + 真实会话实录**打真实上游 |
+| 跨平台假设（POSIX 语义直接搬到 Windows） | Windows 上 `os.Open` 不带 `FILE_SHARE_DELETE` ⇒ 手写 tmp+rename 必失败；统一走 `internal/atomicfile`，并有 `windows-latest` CI job 兜底 |
+
+### 提交与评审
+
+本 fork 的提交记录里，AI 产出的改动以 `DSH Agent <dsh@local>` 作为作者，便于识别。
+**这些提交同样接受正常的人工审查**——请不要因为「AI 写的」就默认跳过 code review。
 
 ## 项目简介
 
@@ -322,7 +386,7 @@ curl -s http://localhost:7863/healthz
 ```bash
 git clone https://github.com/Huiaei/workbuddy2api-panel.git
 cd workbuddy2api-panel
-git checkout release/v1.13.0-fixed    # 以 1.13.0 发行版为基线的修复版
+git checkout fix/all-known-issues    # 以 1.13.0 发行版为基线的修复版（默认分支）
 docker build -t workbuddy2api-fixed:latest .
 docker run -d --name workbuddy2api \
   -p 7863:7863 -e TZ=Asia/Shanghai \
@@ -330,16 +394,17 @@ docker run -d --name workbuddy2api \
   workbuddy2api-fixed:latest
 ```
 
-> `release/v1.13.0-fixed` = **精确的 1.13.0 发行版**（tag `d66384d`）+ 全部已知问题修复，
-> 不携带 1.13.0 之后的上游改动；`fix/all-known-issues-v1.13.0` = 上游 `main` + 同一套修复。
-> 两条分支的修复集相同，区别只在基线。
+> `fix/all-known-issues`（**默认分支**）= **精确的 1.13.0 发行版**（tag `d66384d`）+ 全部已知问题修复，
+> 并单独移植了 1.13.0 之后上游的 DSML 等能力 ⇒ 功能上是上游 `main` 的**超集**。
+> 仓库的 `main` 分支则与上游 `main`（`73a7560`）保持同步，**仅作对照参考，不维护**。
 
 ### 方式一：Docker Compose（推荐服务器部署）
 
 ```bash
-# 1. 克隆
-git clone https://github.com/linguo2625469/workbuddy2api-panel.git
+# 1. 克隆（本 fork：默认分支即含全部修复）
+git clone https://github.com/Huiaei/workbuddy2api-panel.git
 cd workbuddy2api-panel
+git checkout fix/all-known-issues
 
 # 2. 准备配置（compose 挂载此文件，缺失会导致容器启动失败）
 cp config.example.json config.json
@@ -1079,6 +1144,10 @@ sudo chown -R 10001:10001 ./auths ./data ./config.json
 ## 免责声明
 
 本项目仅供学习和研究使用。使用者需遵守 CodeBuddy 服务条款，自行承担使用风险（包括账号封禁、条款违约等）。作者不对任何因使用本项目产生的直接或间接损失负责。
+
+> **本项目为 AI 产出**，详见顶部[「🤖 本项目是一个 AI 项目」](#-本项目是一个-ai-项目)与
+> [「AI 项目声明与维护披露」](#-ai-项目声明与维护披露)。使用前请知悉其固有的质量风险，
+> 并对关键路径自行复核。
 
 ## License
 
