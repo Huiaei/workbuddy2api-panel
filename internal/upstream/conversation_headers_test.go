@@ -60,8 +60,11 @@ func TestChatStreamConversationChannelHeaders(t *testing.T) {
 						if id != tc.meta.ConversationID {
 							t.Fatalf("explicit conversation ID changed: %q", id)
 						}
-					} else if len(id) != 32 || !validTraceID(id) || id == previousID {
-						t.Fatalf("fallback ID must be fresh 32 hex: %q (previous %q)", id, previousID)
+					} else if !isUUIDv4(id) || id == previousID {
+						// 兜底形态是 **UUID v4（36 字符带横线）**，对齐官方
+						// X-Conversation-ID 的双版本抓包形态（issue #51）；
+						// 32 hex 是 X-Request-ID 的形态，不是这个位置。
+						t.Fatalf("fallback ID must be fresh UUID v4: %q (previous %q)", id, previousID)
 					}
 					if tc.meta.ConversationRequestID != "" && h.Get("X-Conversation-Request-ID") != tc.meta.ConversationRequestID {
 						t.Fatal("explicit request ID changed")
@@ -74,4 +77,27 @@ func TestChatStreamConversationChannelHeaders(t *testing.T) {
 			})
 		}
 	}
+}
+
+// isUUIDv4 判断 s 是否为小写 UUID v4 带横线形态（8-4-4-4-12，版本位 4、variant 位 8/9/a/b）。
+// 用于钉住 X-Conversation-ID 的官方形态（issue #51 双版本抓包）。
+func isUUIDv4(s string) bool {
+	if len(s) != 36 || s[8] != '-' || s[13] != '-' || s[18] != '-' || s[23] != '-' {
+		return false
+	}
+	if s[14] != '4' {
+		return false
+	}
+	if c := s[19]; c != '8' && c != '9' && c != 'a' && c != 'b' {
+		return false
+	}
+	for i, c := range s {
+		if i == 8 || i == 13 || i == 18 || i == 23 {
+			continue
+		}
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+			return false
+		}
+	}
+	return true
 }

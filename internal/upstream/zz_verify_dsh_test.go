@@ -59,7 +59,7 @@ func TestZZVerifyDSHFix(t *testing.T) {
 		{"sanitize=on（修复，应通过）", true, 200},
 	} {
 		c.SanitizeFingerprints.Store(tc.sanitize)
-		prepared := c.prepareBody(raw, a.Realm(), a.UID, "")
+		prepared := c.prepareBody(raw, a.Realm(), a.UID, "", "")
 		status, respBody := zzSendPrepared(t, c, a, tc.label, prepared)
 		t.Logf("[%s] ⇒ HTTP %d  body=%s", tc.label, status, zzSummary(respBody))
 		if status != tc.want {

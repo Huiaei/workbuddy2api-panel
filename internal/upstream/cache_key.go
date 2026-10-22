@@ -11,8 +11,8 @@ package upstream
 
 import (
 	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"strings"
 )
 
@@ -24,9 +24,15 @@ import (
 //  3. 都没有 → 用入站 conversationID 参数（来自 X-Conversation-ID 头解析）
 //
 // 安全约束——按账号隔离：
-//   - 生成键格式 `wb2a-<uid8>-<convHex>`
-//   - uid8 是账号 UID 前 8 字符，跨账号绝不相同 → 跨账号缓存键绝不碰撞
+//   - 生成键是 **UUID v4 形态（36 字符带横线）**，由 sha256(uid|会话) 确定性派生
+//   - uid 参与哈希，跨账号绝不碰撞 → 跨账号缓存键绝不碰撞
 //   - 跨账号复用同一 cache key 会让上游命中错账号的前缀缓存、泄露对方对话，故 uid 是硬隔离因子
+//
+// 为什么不再是 `wb2a-<uid8>-<hex>`（issue #51）：旧格式有三个可识别特征——
+// ① 项目缩写 `wb2a` 明文在最前面；② 账号 uid 前 8 位明文写进 X-Conversation-ID
+// 与 prompt_cache_key；③ 长度固定 48 字符。官方客户端这些位置恒为 UUID v4。
+// 三者叠加就是「本仓独有的标识形态」，属于最直白的一类自证指纹。uid 仍参与哈希，
+// 隔离性不变，只是不再明文外泄。
 //
 // 入参 uid 为账号 UID（空则用 "-"，但仍会注入键；调用方应保证传真实 UID）。
 // 入参 conversationID 为网关解析出的会话标识（body 里没有 conversation_id 时用它做哈希源）。
@@ -71,22 +77,22 @@ func InjectPromptCacheKey(body []byte, uid, conversationID string) []byte {
 	return out
 }
 
-// buildCacheKey 生成 `wb2a-<uid8>-<convHex>` 格式的稳定 cache key。
+// buildCacheKey 生成 **UUID v4 形态**的稳定 cache key（36 字符带横线）。
 //
-// uid8 提供账号隔离段；convHex = sha256(uid + conversationID)[:16] 的 hex 提供会话段
-// （同账号同会话稳定、不同会话不同）。会话源为空时 convHex 仍由 uid 单独哈希，
-// 保证跨账号绝不碰撞但同一空会话不复用（空会话 = 新会话语义）。
+// 由 sha256(uid|conversation) 确定性派生：同账号同会话恒得同值（缓存槽稳定），
+// 不同会话/不同账号各自独立。派生时把第 7 字节置 version=4、第 9 字节置
+// RFC 4122 variant，使输出是**合法 UUID v4**——形态与官方客户端在这些位置
+// （X-Conversation-ID / prompt_cache_key / body.conversation_id）的值一致。
+//
+// 注意：本函数是确定性派生，不是随机 UUID；同一 (uid, conversation) 必须恒得同值，
+// 否则缓存槽会漂移（issue #169 的命中率修复依赖这一点）。
 func buildCacheKey(uid, conversation string) string {
-	uid8 := uid
-	if len(uid8) > 8 {
-		uid8 = uid8[:8]
-	}
-	if uid8 == "" {
-		uid8 = "-"
-	}
 	sum := sha256.Sum256([]byte(uid + "|" + conversation))
-	convHex := hex.EncodeToString(sum[:16])
-	return "wb2a-" + uid8 + "-" + convHex
+	var u [16]byte
+	copy(u[:], sum[:16])
+	u[6] = (u[6] & 0x0f) | 0x40 // version 4
+	u[8] = (u[8] & 0x3f) | 0x80 // RFC 4122 variant
+	return fmt.Sprintf("%x-%x-%x-%x-%x", u[0:4], u[4:6], u[6:8], u[8:10], u[10:16])
 }
 
 // strField 从 map 取 string 字段，非 string 或空串返回 ""。

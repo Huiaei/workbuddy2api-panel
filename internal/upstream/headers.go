@@ -273,19 +273,26 @@ func (c *Client) injectIdentityHeaders(req *http.Request, a *auth.Auth) {
 	if a == nil || a.UID == "" {
 		return
 	}
+	enterprise := strings.TrimSpace(a.EnterpriseID)
+	// 判定只看 EnterpriseID，不看 auth.method（issue #51 实测修正）。
+	//
+	// token_source 描述的是 **token 的来路**（如 enterprise_switch = 由企业会话
+	// 切换得来），不是「这个账号属于企业」。旧的 `enterprise == "" && method == ""`
+	// 合取会让「个人号 + token 带 token_source」走进注入分支：于是美国/国内个人号
+	// 也被塞上 X-Auth-Method: enterprise_switch 与一段 108 字节的 X-Userinfo，
+	// 而两版客户端对个人号真机抓包里这两个头**都不存在**（capture/raw3 国际版、
+	// capture/raw8 国内版）。个人号 enterpriseId 为空，本就不存在「企业」这层语义。
+	//
+	// 因此：个人号三头（X-Auth-Method / X-Id-Source / X-Userinfo）全不发，
+	// 与企业号一样是「按账号形态条件发送」而不是常量。
+	if enterprise == "" {
+		return
+	}
 	method := a.TokenSource()
 	if method != "" {
 		req.Header.Set("X-Auth-Method", method)
 	}
-	enterprise := strings.TrimSpace(a.EnterpriseID)
-	if enterprise == "" && method == "" {
-		// 个人号且 token 无 token_source：与官方客户端同样三头全不发。
-		return
-	}
-	payload := map[string]any{"uin": a.UID}
-	if enterprise != "" {
-		payload["owner_uin"] = enterprise
-	}
+	payload := map[string]any{"uin": a.UID, "owner_uin": enterprise}
 	if method != "" {
 		payload["token_source"] = method
 	}
@@ -409,26 +416,29 @@ func (c *Client) injectConversationHeaders(req *http.Request, meta ChatMeta) {
 		convReqID = session.NewMessageID()
 	}
 	messageID := session.NewMessageID()
+	// X-Conversation-ID 的兜底形态是 **UUID v4（36 字符）**，不是 32 hex：
+	// 官方客户端这个位置恒为带横线 UUID，32 hex 是 X-Request-ID 的形态（issue #51
+	// 双版本抓包）。客户端自己声明了会话就透传它的值，只有缺失时才用本仓生成的。
 	conversationID := meta.ConversationID
 	if conversationID == "" {
-		conversationID = session.NewMessageID()
+		conversationID = session.NewConversationID()
 	}
 	req.Header.Set("X-Conversation-ID", conversationID)
 	req.Header.Set("X-Conversation-Request-ID", convReqID)
 	req.Header.Set("X-Conversation-Message-ID", messageID)
 	req.Header.Set("X-Request-ID", messageID)
 	req.Header.Set("X-Root-Request-ID", convReqID)
+	// trace / span 与 request id **无关且纯随机**（issue #51）：官方抓包里
+	// X-Trace-ID / X-B3-TraceId 前 12 hex 解不出时间，X-B3-SpanId 也与前两者无关系。
+	// 旧实现把 convReqID 当 trace、把 messageID[:16] 当 span ⇒ 三者同源，正是
+	// 「官方不存在、本仓却有」的规律。meta.TraceID 仍是显式覆盖入口。
 	traceID := meta.TraceID
-	if traceID == "" {
-		traceID = convReqID
+	if !validTraceID(traceID) {
+		traceID = session.NewTraceID()
 	}
 	req.Header.Set("X-Trace-ID", traceID)
-	b3Trace := convReqID
-	if !validTraceID(b3Trace) {
-		b3Trace = messageID // 非法 B3 TraceId → 回落恒 32 hex 的消息级 ID
-	}
-	req.Header.Set("X-B3-TraceId", b3Trace)
-	req.Header.Set("X-B3-SpanId", messageID[:16])
+	req.Header.Set("X-B3-TraceId", traceID)
+	req.Header.Set("X-B3-SpanId", session.NewSpanID())
 	req.Header.Set("X-B3-Sampled", "1")
 }
 

@@ -1175,7 +1175,7 @@ func (c *Client) chatBase(a *auth.Auth) string {
 
 // prepareBody 组装出站请求体（脱敏开关由 Client.SanitizeFingerprints 控制）。
 // realm 为账号 Realm()（cn/global），供 efforts 缓存分桶（跨域 effort 集合不互相污染）。
-func (c *Client) prepareBody(body []byte, realm, uid, conversationID string) []byte {
+func (c *Client) prepareBody(body []byte, realm, uid, conversationID, convReqID string) []byte {
 	efforts, defs := c.effortsSnapshot(realm), c.defaultEffortsSnapshot(realm)
 	if realmKey(realm) == "global" {
 		// global 域降级源 = 远端探测桶（权威）∪ 产品静态兜底表（全局 21 名内档位如
@@ -1187,6 +1187,9 @@ func (c *Client) prepareBody(body []byte, realm, uid, conversationID string) []b
 	// prompt_cache_key 注入（P0 费用优化，费用降 ~17×）：按账号隔离的稳定缓存键，
 	// 让同一客户端对同一账号的连续请求命中上游前缀缓存。
 	body = InjectPromptCacheKey(body, uid, conversationID)
+	// body 侧会话轮级字段：把本轮 ID 同时写进消息体，与出站头保持头体一致
+	// （官方桌面端头与体都带 conversationRequestId，见 conv_fields.go）。
+	body = injectConversationFields(body, convReqID)
 	return body
 }
 
@@ -1500,7 +1503,7 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	prepared := c.prepareBody(body, a.Realm(), a.UID, meta.ConversationID)
+	prepared := c.prepareBody(body, a.Realm(), a.UID, meta.ConversationID, meta.ConversationRequestID)
 	if os.Getenv("WB2A_DUMP_BODY") != "" {
 		// 调试开关：打印入站与出站请求体，便于定位上游 11-128/11140 这类
 		// 「按请求体判定」的错误。上线不需要。
