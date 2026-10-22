@@ -3,6 +3,7 @@ package logfile
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -92,6 +93,11 @@ func TestNewRejectsEmptyPath(t *testing.T) {
 }
 
 func TestNewOnUnwritableDirFails(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		// Windows 上 os.MkdirAll(dir, 0o555) 不会真的让目录不可写
+		//（Windows 的只读属性对目录不生效），New 会成功打开文件 ⇒ 本用例不成立。
+		t.Skip("Windows 无 POSIX 目录权限语义，跳过")
+	}
 	if os.Geteuid() == 0 {
 		t.Skip("root 可绕过目录权限，跳过")
 	}
@@ -99,7 +105,10 @@ func TestNewOnUnwritableDirFails(t *testing.T) {
 	sub := filepath.Join(dir, "ro")
 	os.MkdirAll(sub, 0o555)
 	defer os.Chmod(sub, 0o755)
-	if _, err := New(filepath.Join(sub, "x.log"), 1, 1); err == nil {
+	w, err := New(filepath.Join(sub, "x.log"), 1, 1)
+	if err == nil {
+		// 万一真的打开了，必须关掉，否则 TempDir 清理会因文件被占用而报错。
+		w.Close()
 		t.Fatal("不可写目录应报错")
 	}
 }

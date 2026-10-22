@@ -7,7 +7,7 @@ name: go-binaries
 # appVersion、tag 版本 == 源码版本（-ci 后缀的测试 tag 豁免，用于演练发布线）。
 on:
   push:
-    branches: [main]
+    branches: [main, fix/all-known-issues]
     tags: ["v*"]
   pull_request:
     paths:

@@ -6,7 +6,7 @@ name: docker-ghcr
 # tag 说明：main 推 latest + main + sha-xxxxxx；v1.2.3 推 1.2.3 / 1.2 / 1
 on:
   push:
-    branches: [main]
+    branches: [main, fix/all-known-issues]
     tags: ["v*"]
   pull_request:
     paths:
@@ -91,6 +91,8 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
+            # latest 只跟随**默认分支**（本 fork 的默认分支是 fix/all-known-issues），
+            # 分支 tag 仍按 ref 给，但 main（上游同步分支）不再抢 latest。
             type=raw,value=latest,enable={{is_default_branch}}
             type=ref,event=branch
             type=semver,pattern={{version}}
