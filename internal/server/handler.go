@@ -22,6 +22,7 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/httpauth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/livecfg"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/guard"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/logfmt"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/prompt"
@@ -73,6 +74,12 @@ type Config struct {
 	// Usage 逐请求用量记录器（可选；nil = 不记录）。
 	// 在 recordAttempt 这一唯一汇聚点调用，因此流式/非流式、成功/失败都会计入，
 	// 且与 pool 的每账号累计器同源，两条口径不会漂移。
+	// TrialGuard 试用/限免模型熔断（可选；nil = 关闭）。
+	// 观测到监控名单内的模型产生 usage.credit（免费结束开始计费）或到达
+	// 限免截止时间时，持久禁用该模型：从 /v1/models 移除，并对该模型的请求
+	// 直接返回 403。也支持按时段强制熔断与手动恢复（见 guard 包）。
+	TrialGuard *guard.State
+
 	Usage *usage.Recorder
 
 	// RequestLog 请求指标与脱敏 JSONL 归档（可选；nil = 不记录）。
@@ -391,6 +398,52 @@ func applyModelInfoFields(entry map[string]any, mi upstream.ModelInfo) map[strin
 	if mi.Credits != "" {
 		entry["credits"] = mi.Credits // 积分倍率原文（如 "x0.05"），仅展示
 	}
+	// 限时优惠（modelPromotions）：credits 是牌价，promo_* 是当前生效折扣。
+	// 必须透出到 OpenAI 兼容的 /v1/models——远端客户端（子代理路由、CLI 工具）
+	// 只读这个接口，看不到 promo 就会按牌价误判模型成本。
+	// promo_active=true 仅表示「折扣已被 machine-readable 证实生效」（条目带
+	// discount.factor）；badge-only 条目为 false，真实时段在 promo_note 里。
+	if mi.PromoLabel != "" {
+		entry["promo_label"] = mi.PromoLabel
+		// 有标签就显式给布尔值：缺字段会让客户端把「不确定」当成「无折扣」，
+		// 与 false 语义不同。false 表示「活动存在但当前无可证实的折扣」。
+		entry["promo_active"] = mi.PromoActive
+	}
+	if mi.PromoNote != "" {
+		entry["promo_note"] = mi.PromoNote
+	}
+	if mi.PromoFactor != nil {
+		entry["promo_factor"] = *mi.PromoFactor
+	}
+	if mi.PromoCredits != "" {
+		entry["promo_credits"] = mi.PromoCredits
+	}
+	if mi.PromoWindow != "" {
+		entry["promo_window"] = mi.PromoWindow
+	}
+	if mi.PromoWindowKind != "" {
+		entry["promo_window_kind"] = mi.PromoWindowKind
+	}
+	if mi.PromoPeakWindow != "" {
+		entry["promo_peak_window"] = mi.PromoPeakWindow
+	}
+	if mi.PromoWeekdaysOnly {
+		entry["promo_weekdays_only"] = true
+	}
+	if mi.PromoDerived {
+		// 值由 hover 文案派生：官方改时段会自动跟随，但置信度低于上游
+		// machine-readable 字段，客户端可据此决定是否二次确认。
+		entry["promo_derived"] = true
+	}
+	if mi.PromoValidFrom != "" {
+		entry["promo_valid_from"] = mi.PromoValidFrom
+	}
+	if mi.PromoValidUntil != "" {
+		entry["promo_valid_until"] = mi.PromoValidUntil
+	}
+	if mi.PromoTimezone != "" {
+		entry["promo_timezone"] = mi.PromoTimezone
+	}
 	if len(mi.Tags) > 0 {
 		entry["tags"] = mi.Tags
 	}
@@ -436,6 +489,31 @@ func (h *Handler) modelList() []map[string]any {
 	hidden := h.loadLive().HiddenModels
 	for _, mi := range h.fetchDynamicModels() {
 		if _, ok := hidden["cn:"+mi.ID]; ok {
+			continue
+		}
+		// 先登记/更新限免截止时间，并处理「上游延长免费」的自动复活。
+		// 必须在 Disabled 检查之前：否则已过期的旧 deadline 会先把模型过滤掉，
+		// 永远走不到 SetDeadline / NoteFreeUntil。
+		if h.cfg.TrialGuard != nil && mi.PromoValidUntil != "" {
+			if t, err := time.Parse(time.RFC3339, mi.PromoValidUntil); err == nil {
+				allDayFree := mi.PromoFactor != nil && *mi.PromoFactor == 0 && mi.PromoWindow == ""
+				if allDayFree {
+					if h.cfg.TrialGuard.NoteFreeUntil(mi.ID, t) {
+						log.Printf(
+							"INFO: [server] trial guard revived model=%s until=%s (new all-day free promo)",
+							mi.ID, t.Format(time.RFC3339),
+						)
+					}
+				} else if h.cfg.TrialGuard.SetDeadline(mi.ID, t) {
+					log.Printf(
+						"INFO: [server] trial guard revived model=%s until=%s (promo extended)",
+						mi.ID, t.Format(time.RFC3339),
+					)
+				}
+			}
+		}
+		// 试用守卫：仍被熔断的模型不列出。
+		if h.cfg.TrialGuard != nil && h.cfg.TrialGuard.Disabled(mi.ID) {
 			continue
 		}
 		entry := map[string]any{
@@ -679,6 +757,24 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 试用守卫：模型一旦被观测到开始计费、限免到期或命中时段规则，后续请求
+	// 直接拒绝，避免在不知情的情况下继续扣积分。返回 403 而不是 404，让客户端
+	// 能区分「模型不存在」与「试用/限免结束被网关禁用」。
+	if h.cfg.TrialGuard != nil {
+		if entry, disabled := h.cfg.TrialGuard.DisabledEntry(bareModel); disabled {
+			msg := "model " + bareModel + " disabled by trial guard: credit consumption observed after free trial"
+			switch entry.Reason {
+			case "promo_expired":
+				msg = "model " + bareModel + " disabled by trial guard: free promo expired"
+			case "window_blocked":
+				msg = "model " + bareModel + " disabled by trial guard: outside the allowed time window"
+			}
+			writeOpenAIError(w, http.StatusForbidden, "trial_model_disabled", msg)
+			st.status = http.StatusForbidden
+			return
+		}
+	}
+
 	tried := map[string]bool{}
 	var lastErr error
 	// stallRetry 记录本次请求已因「零 tool_calls 停摆」重试了几次（issue #149）。
@@ -815,6 +911,24 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				TokensPerSecond:  delta.TokensPerSecond,
 				HasTPS:           delta.HasTokensPerSecond,
 			}, delta.HasTotalTokens || delta.HasCompletionTokens || delta.HasPromptTokens)
+		}
+
+		// 试用守卫：上游一旦对监控名单内的模型返回 credit>0，说明免费试用/限免
+		// 已结束、开始计费——立即熔断并持久化，后续请求直接拒绝。
+		if h.cfg.TrialGuard != nil && hasCredit && credit > 0 {
+			if h.cfg.TrialGuard.NoteCredit(delta.Model, credit) {
+				if e, ok := h.cfg.TrialGuard.DisabledEntry(delta.Model); ok && e.FreeClaimUntil != nil {
+					log.Printf(
+						"WARN: [server] trial guard disabled model=%s credit=%.4f (charged despite declared free until %s; same claim will not revive)",
+						delta.Model, credit, e.FreeClaimUntil.Format(time.RFC3339),
+					)
+				} else {
+					log.Printf(
+						"WARN: [server] trial guard disabled model=%s credit=%.4f (trial started billing)",
+						delta.Model, credit,
+					)
+				}
+			}
 		}
 	}
 

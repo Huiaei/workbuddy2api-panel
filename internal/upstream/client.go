@@ -1666,6 +1666,27 @@ type ModelInfo struct {
 	PromoCredits string   // 折扣后倍率原文（如 "0x" / "0.50x"），仅展示
 	PromoLabel   string   // 徽章文案（限时免费 / 夜间折扣 / 错峰使用）
 	PromoNote    string   // hover 说明原文（含时段/日期描述）
+
+	// 优惠的机器可读明细（/v1/models 透出，客户端据此算生效价/判断窗口）：
+	//   PromoActive       此刻是否按折扣计价（true=生效价即 PromoCredits）
+	//   PromoWindowKind   "discount"（有 discount.factor）/ "offpeak"（窗口是高峰）/
+	//                     "badge"（仅徽章）
+	//   PromoWindow       折扣窗口（discount 类），如 "23:00-8:00"
+	//   PromoPeakWindow   高峰窗口（offpeak 类），如 "09:00-12:00,14:00-18:00"
+	//   PromoWeekdaysOnly offpeak 是否仅工作日（周末全天非高峰）
+	//   PromoValidFrom/Until 活动有效期（RFC3339，来自 schedule）
+	//   PromoTimezone     活动时区（schedule.timezone）
+	//   PromoDerived      true=PromoFactor/Window 由 hover 文案派生，
+	//                     置信度低于上游 machine-readable 字段
+	PromoActive       bool
+	PromoWindowKind   string
+	PromoWindow       string
+	PromoPeakWindow   string
+	PromoWeekdaysOnly bool
+	PromoValidFrom    string
+	PromoValidUntil   string
+	PromoTimezone     string
+	PromoDerived      bool
 }
 
 // dynModelEntry 上游模型目录（CN /console 与 global /v2 同构）的单条模型解析形态，
@@ -2083,6 +2104,58 @@ func applyModelPromotions(out map[string]ModelInfo, promos []v3ModelPromotion) {
 			f := c.p.Discount.Factor
 			mi.PromoFactor = &f
 			mi.PromoCredits = c.p.Discount.DiscountedCredits
+		}
+		// PromoActive 只在有 discount.factor 时置 true：badge-only 条目虽处于
+		// 「展示窗口」，但无法证明此刻按折扣计价（glm-5.2 白天 badge 与真实
+		// 折扣窗口 23:00-08:00 互为补集），宁可少报也不多报。
+		mi.PromoActive = c.p.Discount != nil
+		mi.PromoWindowKind = "badge"
+		if c.p.Discount != nil {
+			mi.PromoWindowKind = "discount"
+		}
+		if sc := c.p.Schedule; sc != nil {
+			mi.PromoTimezone = sc.Timezone
+			mi.PromoValidFrom = sc.ValidFrom
+			mi.PromoValidUntil = sc.ValidUntil
+			windows := make([]string, 0, len(sc.Daily))
+			for _, w := range sc.Daily {
+				if w.Start == "" || w.End == "" {
+					continue
+				}
+				windows = append(windows, w.Start+"-"+w.End)
+			}
+			joined := strings.Join(windows, ",")
+			// "00:00-23:59" 是上游给「错峰使用」类条目下发的全日常量，没有信息量
+			// 且与 hover 文案（高峰 9-12/14-18）矛盾，透出会误导客户端，直接丢弃。
+			if joined != "00:00-23:59" {
+				mi.PromoWindow = joined
+			}
+		}
+
+		// 文案派生（badge-only 条目）：上游只给 hover 文案时，从文案解析时段与
+		// 折扣比例。官方改时段/比例只要文案格式不变就自动跟随，无需改代码。
+		// 解析失败保持 badge 语义（不臆造），宁可少报折扣也不多报。
+		if c.p.Discount == nil && mi.PromoNote != "" {
+			if sch := ParsePromoNote(mi.PromoNote); sch.Derived {
+				mi.PromoDerived = true
+				mi.PromoWindowKind = sch.Kind
+				mi.PromoFactor = sch.Factor
+				if sch.Kind == "offpeak" {
+					mi.PromoPeakWindow = strings.Join(sch.Windows, ",")
+					mi.PromoWeekdaysOnly = sch.WeekdaysOnly
+					mi.PromoWindow = ""
+				} else {
+					mi.PromoWindow = strings.Join(sch.Windows, ",")
+				}
+				if active, known := sch.ActiveAt(now); known {
+					mi.PromoActive = active
+				}
+				if sch.Factor != nil {
+					if base, ok := parseCreditsRate(mi.Credits); ok {
+						mi.PromoCredits = formatCreditsRate(base * (*sch.Factor))
+					}
+				}
+			}
 		}
 		out[id] = mi
 	}
