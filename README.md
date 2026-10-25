@@ -289,6 +289,13 @@ WorkBuddy2API 是一个自托管的 **OpenAI 兼容反向代理网关**，将腾
 | 流式 SSE error 帧 | 丢业务码 → 健康账号被误降级 10 分钟 | error 帧分类**保留完整业务信封**（含 `displayMsg` / `displayTips`） |
 | `6021` / `queue.full` | 池级冷却 | 渠道级忙碌 + 透传上游 `Retry-After`（**不伪造**） |
 
+#### 模型目录与优惠
+
+| 症状 | 上游行为 | 本 fork 行为 |
+|---|---|---|
+| 「错峰使用 / 夜间折扣」类优惠只有 hover 文案、无机器可读 `factor` | 客户端拿牌价，错峰实付 `x0.085` 却显示 `x0.17`（选型被误导） | 从文案派生时段与折扣，`/v1/models` 透出 `promo_*` 一组；派生值标 `promo_derived` 区分置信度（上游 PR #237） |
+| 试用/限免模型免费期**静默结束**（无通知） | 照常发请求、继续扣分 | 可选**自动熔断**：`usage.credit > 0` 或 `promo_valid_until` 到点即持久禁用；上游延长则自动复活（同一份已证伪的声明不再用于复活）。**默认名单留空**——不配置即完全不动（上游 PR #238，落盘改走 `atomicfile`） |
+
 #### 上游渠道校验对身份句的逐字黑名单
 
 2026-10-21 起，CN 域上游对**本产品（DeepSeek Harness）的身份句**新增逐字黑名单，命中即
@@ -602,6 +609,32 @@ curl -s http://localhost:7863/v1/search/messages \
 | `session_sticky.ttl` | `30m` | 会话绑定 TTL（滚动续期） |
 | `session_sticky.gc_interval` | `5m` | 过期绑定 GC 周期 |
 
+### 优惠（promo）与限免模型的自动熔断
+
+上游 `/v3/config` 的 `modelPromotions` 里，一类条目**只有 hover 文案、没有机器可读的 `discount.factor`**（如「周一至周五 09:00–12:00、14:00–18:00 属高峰原价，非高峰期积分5折」「每晚 23:00—次日 8:00 积分限时立减」）。客户端若只拿到牌价 `credits`，在错峰时段实付 `x0.085` 却显示 `x0.17`，选型会被误导。
+
+网关从 hover 文案派生时段与折扣比例，`/v1/models` 增透以下字段（遵循空值省略约定）：
+
+| 字段 | 含义 |
+|---|---|
+| `promo_label` / `promo_active` / `promo_note` | 徽章文案 / 折扣是否已被机器可读证实生效 / hover 原文 |
+| `promo_factor` / `promo_credits` | 折扣系数（0=限免）/ 折后倍率原文 |
+| `promo_window` / `promo_window_kind` / `promo_peak_window` / `promo_weekdays_only` | 生效时段与类型 |
+| `promo_valid_from` / `promo_valid_until` / `promo_timezone` | 活动窗口 |
+| `promo_derived` | 由文案派生的值（置信度低于上游机器可读字段） |
+
+**试用/限免模型的自动熔断**（默认关闭）：上游会把「14 天试用」模型的免费期**静默结束**，无任何通知——转为计费后请求照样发出，继续扣分。熔断把「知道」变成「动作」：
+
+| 触发 | 行为 |
+|---|---|
+| 监控名单内模型出现 `usage.credit > 0` | 积分熔断：持久禁用，从 `/v1/models` 移除、`/v1/chat/completions` 直接 403 |
+| `promo_valid_until` 到点 | 到期熔断：不必等第一次扣费 |
+| 上游延长 `valid_until`（不同且未来） | 自动复活；**同一份已被证伪的声明不再用于复活**（避免 复活→扣费→熔断 循环） |
+
+时段规则（`TRIAL_GUARD_WINDOWS`）支持 `block`（窗口内禁止）与 `allow`（仅窗口内允许，适合「只有夜间免费」的模型），跨午夜与按星期均可。
+
+> **默认名单刻意留空**。上游 PR 里硬编码的三个模型名（`hy4-preview-f` / `step-5-preview` / `hy3`）是提交者自己环境里的，换一台机器就是别人的模型——默认禁掉用户从没配置过的模型属于静默误伤。要用必须显式设 `TRIAL_GUARD_WATCH`。
+
 ### 上游超时语义（三段各归其位）
 
 | 字段 | 作用对象 | 默认 | 行为 |
@@ -617,6 +650,8 @@ curl -s http://localhost:7863/v1/search/messages \
 加载顺序：JSON 文件 → `WB2A_*` 环境变量（变量非空才覆盖）：
 
 `WB2A_LISTEN` · `WB2A_API_KEY` · `WB2A_AUTH_DIR` · `WB2A_STATE_FILE` · `WB2A_DNS`(逗号分隔多个) · `WB2A_MAX_BODY_MB` · `WB2A_SOFT_RATE`(duration) · `WB2A_SOFT_RATE_MAX`(duration) · `WB2A_TIMEOUT_SECONDS` · `WB2A_HEADER_TIMEOUT_SECONDS` · `WB2A_IDLE_TIMEOUT_SECONDS` · `WB2A_USER_AGENT` · `WB2A_SANITIZE_FINGERPRINTS`(bool) · `WB2A_PROMPT_MODE` · `WB2A_PROMPT_FILE`
+
+试用/限免模型自动熔断（默认关闭，见「试用与限免模型的自动熔断」）：`TRIAL_GUARD_ENABLED`(bool) · `TRIAL_GUARD_WATCH`(逗号分隔模型名) · `TRIAL_GUARD_STATE`(状态文件路径) · `TRIAL_GUARD_WINDOWS`(`模型|HH:MM-HH:MM|[星期1-7,可省]|[block\|allow]`)
 
 ## 核心行为语义
 
