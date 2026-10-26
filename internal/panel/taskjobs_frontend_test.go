@@ -34,7 +34,7 @@ const ctx = {
   clearInterval: id => timers.delete(id)
 };
 vm.createContext(ctx);
-vm.runInContext(src.slice(start, end), ctx);
+vm.runInContext("'use strict';\n" + src.slice(start, end), ctx);
 const flush = async () => { for(let i=0;i<10;i++) await Promise.resolve(); };
 (async () => {
   vm.runInContext("taskUID='cn-a'; taskCapabilities={automate:true};", ctx);

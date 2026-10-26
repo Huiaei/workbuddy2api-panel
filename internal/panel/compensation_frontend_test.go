@@ -27,7 +27,7 @@ const end = src.indexOf('function compDeadlineText');
 if (start < 0 || end < 0 || end < start) throw new Error('compensation region not found');
 const ctx = { Array, Object, Number, String };
 vm.createContext(ctx);
-vm.runInContext(src.slice(start, end) +
+vm.runInContext("'use strict';\n" + src.slice(start, end) +
   '\nthis.compPending = compPending; this.compTotalPending = compTotalPending; this.compErrored = compErrored;', ctx);
 
 const rows = [
@@ -109,7 +109,7 @@ const start = src.indexOf('function compPending');
 const end = src.indexOf('function compDeadlineText');
 const ctx = { Array, Object, Number, String };
 vm.createContext(ctx);
-vm.runInContext(src.slice(start, end) + '\nthis.compPending = compPending;', ctx);
+vm.runInContext("'use strict';\n" + src.slice(start, end) + '\nthis.compPending = compPending;', ctx);
 const rows = [
   { uid: 'a', status: { active: true,  claimed: false, credit_num: 500 } }, // 唯一应保留
   { uid: 'g', status: { active: true,  claimed: true,  credit_num: 500 } }, // 删 !claimed 会漏进来
@@ -153,7 +153,7 @@ const end = src.indexOf('function renderCompensation');
 if (start < 0 || end < 0 || end < start) throw new Error('deadline region not found');
 const ctx = { Date, Math, Number, String, isFinite };
 vm.createContext(ctx);
-vm.runInContext(src.slice(start, end) + '\nthis.f = compDeadlineText;', ctx);
+vm.runInContext("'use strict';\n" + src.slice(start, end) + '\nthis.f = compDeadlineText;', ctx);
 
 // 上游 end_time 是不带时区的 "YYYY-MM-DD HH:mm:ss"，按本地时区格式化造输入，
 // 这样用例在任何 TZ 下都自洽（写死日期会在换季/换区后自己失效）。
@@ -221,7 +221,7 @@ const ctx = {
   Date, Math, Number, String, isFinite, Array, Object,
 };
 vm.createContext(ctx);
-vm.runInContext(src.slice(start, end) + '\nthis.render = renderCompensation;', ctx);
+vm.runInContext("'use strict';\n" + src.slice(start, end) + '\nthis.render = renderCompensation;', ctx);
 
 const out = {};
 // ① 全部查询失败 → 卡片必须可见，且列出失败原因

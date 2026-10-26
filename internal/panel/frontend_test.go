@@ -194,7 +194,12 @@ const end = src.indexOf('function rateLimitRowsHtml');
 if (start < 0 || end < 0) throw new Error('rate limit helpers not found');
 const ctx = { Date, Number, String, Math };
 vm.createContext(ctx);
-vm.runInContext(src.slice(start, end) + '\nthis.rateLimitMeta=rateLimitMeta;', ctx);
+// 必须带 'use strict'：app.js 头部就是严格模式，浏览器里未声明的赋值会直接抛
+// ReferenceError（不像非严格模式那样静默建全局）。此前本测试按函数切片运行、
+// 切出的片段不含文件头的 'use strict'，于是 rateLimitMeta 里漏声明的 detail
+// 被静默建成全局、测试照样通过，而线上是「账号池整块空白」（issue #241）。
+// 切片前补上严格模式，才能钉住这一类回归。
+vm.runInContext("'use strict';\n" + src.slice(start, end) + '\nthis.rateLimitMeta=rateLimitMeta;', ctx);
 const now = new Date(2026, 8, 28, 14, 0, 0).getTime();
 const reset = new Date(2026, 8, 28, 16, 0, 0).getTime();
 const until = new Date(2026, 8, 28, 15, 0, 0).getTime();
@@ -400,7 +405,7 @@ const end = src.indexOf('function reqOutcomeTag');
 if (start < 0 || end < 0) throw new Error('reqMatch not found');
 const ctx = {};
 vm.createContext(ctx);
-vm.runInContext(src.slice(start, end) + '\nthis.reqMatch=reqMatch;', ctx);
+vm.runInContext("'use strict';\n" + src.slice(start, end) + '\nthis.reqMatch=reqMatch;', ctx);
 const base = { outcome: 'success', client_ip: '203.0.113.7', user_agent: 'python-requests/2.31.0', model: 'cn:glm-5.3', account: '示例(uid8)', request_id: 'req-1' };
 const other = { outcome: 'http_error', client_ip: '198.51.100.4', user_agent: 'Mozilla/5.0 Chrome/120', model: 'global:hy3', account: '甲(uid9)', request_id: 'req-2' };
 const rows = [base, other];
@@ -448,7 +453,7 @@ const end = src.indexOf('function mdRowHtml');
 if (start < 0 || end < 0) throw new Error('model filter helpers not found');
 const ctx = { Number, String, Array, Object, isFinite, parseFloat };
 vm.createContext(ctx);
-vm.runInContext(src.slice(start, end) + '\nthis.mdMatch=mdMatch; this.mdSortList=mdSortList; this.mdRateValue=mdRateValue;', ctx);
+vm.runInContext("'use strict';\n" + src.slice(start, end) + '\nthis.mdMatch=mdMatch; this.mdSortList=mdSortList; this.mdRateValue=mdRateValue;', ctx);
 const models = [
   { id: 'cn:glm-5.2', name: 'GLM-5.2', vendor: 'Zhipu', tags: ['视觉'], supports_tool_call: true, supports_images: true, supports_reasoning: true, can_disable_thinking: true, supported_efforts: ['high', 'xhigh'], default_effort: 'high', is_default: false, credits: '0.79', promo_factor: 0.5, promo_credits: '0.40', promo_label: '夜间折扣', context_length: 1000000, max_output_tokens: 131000 },
   { id: 'cn:hy3', name: 'Hy3', supports_tool_call: true, supports_images: true, supports_reasoning: true, can_disable_thinking: false, supported_efforts: ['low', 'high'], default_effort: 'high', is_default: false, credits: '0', promo_factor: 0, promo_credits: '0', promo_label: '限时免费', context_length: 192000, max_output_tokens: 64000 },
@@ -528,7 +533,7 @@ const end = src.indexOf('function mdRowHtml');
 if (start < 0 || end < 0) throw new Error('model availability helpers not found');
 const ctx = { esc: s => String(s) };
 vm.createContext(ctx);
-vm.runInContext(src.slice(start, end) + '\nthis.mdAvailabilityOf=mdAvailabilityOf; this.mdAvailabilityTag=mdAvailabilityTag;', ctx);
+vm.runInContext("'use strict';\n" + src.slice(start, end) + '\nthis.mdAvailabilityOf=mdAvailabilityOf; this.mdAvailabilityTag=mdAvailabilityTag;', ctx);
 const model = id => ({ id });
 const state = (m, locks, recent) => ctx.mdAvailabilityOf(m, locks, recent).key;
 const success = [{ model: 'global:ok', status: 200, outcome: 'success', time: '2026-10-18T12:00:00Z' }];
@@ -590,7 +595,7 @@ const ctx = {
   $: () => host,
 };
 vm.createContext(ctx);
-vm.runInContext(src.slice(escStart, escEnd) + src.slice(fmtStart, fmtEnd) + src.slice(start, end) +
+vm.runInContext("'use strict';\n" + src.slice(escStart, escEnd) + src.slice(fmtStart, fmtEnd) + src.slice(start, end) +
   '\nthis.renderUsageChart=renderUsageChart;', ctx);
 const series = [
   { t: '2026-09-30T09', scope: 'hour', prompt_tokens: 35, completion_tokens: 16, total_tokens: 51, requests: 1 },
@@ -649,7 +654,7 @@ const ctx = {
   esc: s => String(s == null ? '' : s),
 };
 vm.createContext(ctx);
-vm.runInContext(src.slice(start, end) +
+vm.runInContext("'use strict';\n" + src.slice(start, end) +
   '\nthis.trangeState=trangeState; this.trangeQuery=trangeQuery; this.trangeLabel=trangeLabel; this.trangeMidnight=trangeMidnight;', ctx);
 const q = (preset, rolling) => {
   ctx.trangeState('t').preset = preset;
@@ -785,7 +790,7 @@ const end = src.indexOf('function renderPackages');
 if (start < 0 || end < 0) throw new Error('detail group functions not found');
 const ctx = { Date, Math, Number, String, Map, Array, Object, isFinite };
 vm.createContext(ctx);
-vm.runInContext(src.slice(start, end) + '\nthis.pkDetailGroups = pkDetailGroups; this.pkDetailLimit = pkDetailLimit;', ctx);
+vm.runInContext("'use strict';\n" + src.slice(start, end) + '\nthis.pkDetailGroups = pkDetailGroups; this.pkDetailLimit = pkDetailLimit;', ctx);
 const input = [
   { id: 'small-late', size: 100, remain: 1, expires_at: 400 },
   { id: 'zero-early-b', size: 200, remain: 0, expires_at: 200 },
@@ -841,7 +846,7 @@ const end = src.indexOf('function renderExpiryDistribution');
 if (start < 0 || end < 0) throw new Error('expiry summary functions not found');
 const ctx = { Date, Math, Number, String, Map, Array, Object, isFinite };
 vm.createContext(ctx);
-vm.runInContext(src.slice(start, end) + '\nthis.summarizeCreditDays = summarizeCreditDays; this.pkAccountColorMap = pkAccountColorMap;', ctx);
+vm.runInContext("'use strict';\n" + src.slice(start, end) + '\nthis.summarizeCreditDays = summarizeCreditDays; this.pkAccountColorMap = pkAccountColorMap;', ctx);
 const day = 86400000, now = 100000;
 const out = ctx.summarizeCreditDays([
   { uid: 'a', remain: 100, packages: [
@@ -911,7 +916,7 @@ const ctx = {
   $: id => (id === 'cfgForm' ? cfgForm : null),
 };
 vm.createContext(ctx);
-vm.runInContext(src.slice(start, end) + '\nthis.collectConfig = collectConfig;', ctx);
+vm.runInContext("'use strict';\n" + src.slice(start, end) + '\nthis.collectConfig = collectConfig;', ctx);
 const out = ctx.collectConfig();
 const has = (o, k) => Object.prototype.hasOwnProperty.call(o || {}, k);
 process.stdout.write(JSON.stringify([
@@ -967,7 +972,7 @@ const ctx = {
   lastPackages: null, lastPackagesAt: 0,
 };
 vm.createContext(ctx);
-vm.runInContext(src.slice(start, end) + '\nthis.renderExpiry = renderExpiry;', ctx);
+vm.runInContext("'use strict';\n" + src.slice(start, end) + '\nthis.renderExpiry = renderExpiry;', ctx);
 const iso = n => {
   const d = new Date(); d.setHours(0, 0, 0, 0); d.setDate(d.getDate() + n);
   const p = x => String(x).padStart(2, '0');
@@ -1035,7 +1040,7 @@ const ctx = {
   Date, Math, Number, String, Map, Array, Object, isNaN,
 };
 vm.createContext(ctx);
-vm.runInContext(src.slice(start, end) + '\nthis.renderExpirySnapshot = renderExpirySnapshot;', ctx);
+vm.runInContext("'use strict';\n" + src.slice(start, end) + '\nthis.renderExpirySnapshot = renderExpirySnapshot;', ctx);
 const day = n => {
   const d = new Date(); d.setHours(0, 0, 0, 0); d.setDate(d.getDate() + n);
   return d.toISOString();
@@ -1108,7 +1113,7 @@ const ctx = {
   lastPackages: null, lastPackagesAt: 0,
 };
 vm.createContext(ctx);
-vm.runInContext(src.slice(start, end) + '\nthis.renderExpiry = renderExpiry; this.renderExpirySnapshot = renderExpirySnapshot;', ctx);
+vm.runInContext("'use strict';\n" + src.slice(start, end) + '\nthis.renderExpiry = renderExpiry; this.renderExpirySnapshot = renderExpirySnapshot;', ctx);
 const iso = n => {
   const d = new Date(); d.setHours(0, 0, 0, 0); d.setDate(d.getDate() + n);
   const p = x => String(x).padStart(2, '0');
@@ -1199,7 +1204,7 @@ const ctx = {
   lastPackages: null, lastPackagesAt: 0,
 };
 vm.createContext(ctx);
-vm.runInContext(src.slice(start, end) + '\nthis.renderExpirySnapshot = renderExpirySnapshot;', ctx);
+vm.runInContext("'use strict';\n" + src.slice(start, end) + '\nthis.renderExpirySnapshot = renderExpirySnapshot;', ctx);
 const refreshedAt = new Date(Date.now() - 3 * 60000).toISOString();
 ctx.renderExpirySnapshot({ accounts: [
   { uid: 'a', nickname: 'n', credits_expiry_buckets: [{ date: '2099-01-01', remain: 1 }] },
@@ -1288,7 +1293,7 @@ const ctx = {
   Date, Math, Number, String, Map, Array, Object, isNaN, Infinity, isFinite, Set,
 };
 vm.createContext(ctx);
-vm.runInContext(src.slice(start, end) + '\nthis.renderUsageChart = renderUsageChart;', ctx);
+vm.runInContext("'use strict';\n" + src.slice(start, end) + '\nthis.renderUsageChart = renderUsageChart;', ctx);
 const series = [];
 for (let h = 0; h < 5; h++) {
   const d = new Date(); d.setHours(d.getHours() - (4 - h), 0, 0, 0);
@@ -1488,7 +1493,7 @@ func TestRegionSchedulingFormRoundTrip(t *testing.T) {
  const nodes={cfgForm:{elements},cfgPath:{},cfgNote:{},cfgKey:{}};
  const ctx={cfgLoaded:null,api:async()=>({config:cfg,environment_managed_fields:[],api_key_env_managed:false}),$:id=>nodes[id],markDurationFields(){},toast(message){throw Error(message)}};
  vm.createContext(ctx);
- vm.runInContext(src.slice(src.indexOf('const CFG_MAP ='),src.indexOf('/* Go 时长字段即时校验')),ctx);
+ vm.runInContext("'use strict';\n" + src.slice(src.indexOf('const CFG_MAP ='),src.indexOf('/* Go 时长字段即时校验')),ctx);
  (async()=>{
    await ctx.loadConfig();
    assert.equal(elements.strategy_domestic.value,'round_robin');
@@ -1545,7 +1550,7 @@ const ctx = {
   Date, Math, Number, String, Map, Array, Object, isNaN, Infinity, isFinite, Set,
 };
 vm.createContext(ctx);
-vm.runInContext(src.slice(start) + '\nthis.renderUsageChart = renderUsageChart;', ctx);
+vm.runInContext("'use strict';\n" + src.slice(start) + '\nthis.renderUsageChart = renderUsageChart;', ctx);
 const series = [];
 for (let h = 0; h < 5; h++) {
   const d = new Date(); d.setHours(d.getHours() - (4 - h), 0, 0, 0);
@@ -1578,5 +1583,190 @@ process.stdout.write(JSON.stringify({
 	if strings.TrimSpace(string(out)) != want {
 		t.Fatalf("mobile chart tooltip structure=%s\nwant %s（groups 应等于数据点数，loose 应为 0）",
 			strings.TrimSpace(string(out)), want)
+	}
+}
+
+func TestAppJSRenderAccountsRateLimited(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed; renderAccounts test skipped")
+	}
+	harness := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const inert = new Proxy(function () {}, {
+  get(t, k) { if (k === Symbol.toPrimitive) return () => ''; return inert; },
+  set() { return true; },
+  apply() { return inert; },
+  construct() { return inert; },
+  has() { return true; },
+});
+function mkEl() {
+  return {
+    innerHTML: '', textContent: '', value: '', style: {}, dataset: {},
+    classList: { add() {}, remove() {}, toggle() {}, contains() { return false; } },
+    appendChild() {}, addEventListener() {}, removeEventListener() {},
+    setAttribute() {}, getAttribute() { return null; },
+    querySelector() { return inert; }, querySelectorAll() { return []; },
+    focus() {}, blur() {}, click() {}, closest() { return null; },
+    remove() {}, children: [],
+  };
+}
+const els = {};
+const elById = id => { if (!els[id]) els[id] = mkEl(); return els[id]; };
+const document = {
+  getElementById: elById,
+  querySelector: () => inert,
+  querySelectorAll: () => [],
+  createElement: () => mkEl(),
+  addEventListener() {},
+  documentElement: inert, head: inert, body: inert, cookie: '', readyState: 'complete',
+};
+const sandbox = {
+  location: { hash: '#accounts' },
+  history: { replaceState() {} },
+  localStorage: { getItem: () => null, setItem() {} },
+  navigator: { clipboard: { writeText: () => Promise.resolve() } },
+  document,
+  fetch: () => new Promise(() => {}),
+  addEventListener() {}, removeEventListener() {},
+  matchMedia: () => ({ matches: false, addEventListener() {} }),
+  MutationObserver: class { constructor() {} observe() {} disconnect() {} takeRecords() { return []; } },
+  setInterval, clearInterval, setTimeout, clearTimeout,
+  console, JSON, Math, Date, Number, String, Boolean, Object, Array, Promise, Map, Set,
+  RegExp, Error, TypeError, isNaN, parseInt, parseFloat,
+  encodeURIComponent, decodeURIComponent, URL, Symbol, Proxy, Reflect,
+};
+sandbox.window = sandbox; sandbox.globalThis = sandbox;
+vm.createContext(sandbox);
+vm.runInContext(src, sandbox, { filename: 'app.js' });
+const accounts = JSON.parse(process.env.ACC_JSON);
+sandbox.renderAccounts(accounts);
+const html = elById('accBody').innerHTML;
+process.stdout.write(JSON.stringify({
+  rows: (html.match(/<tr/g) || []).length,
+  hasModel: html.includes('gpt-6.1-sol'),
+}));
+// app.js 顶层 start() 的 setInterval 会让 node 事件循环不退出，成功路径显式收尾。
+process.exit(0);
+`
+	hf, err := os.CreateTemp(t.TempDir(), "render-accounts-*.cjs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := hf.WriteString(harness); err != nil {
+		t.Fatal(err)
+	}
+	hf.Close()
+
+	// 生产形态：global 号撞上游 11158，网关记下模型级限流；reset_at 为零时间
+	// （"0001-01-01T00:00:00Z"）表示上游未给重置时刻。
+	accounts := `[
+	 {"uid":"d8abf6cd-bcdb-4b13-8737-ec7fb580737b","nickname":"限流号","realm":"cn",
+	  "credits":5728,"credits_total":5728,"disabled":false,"cooling":false,
+	  "rate_limited_models":[{"model":"gpt-6.1-sol","kind":"rate_limit",
+	   "until":"2026-10-25T21:57:24.34078646+08:00","reset_at":"0001-01-01T00:00:00Z",
+	   "reason":"11158 model not allowed for account type"}]},
+	 {"uid":"2978e9b4-ffc3-47ad-8a79-0ebd2a70a6fe","nickname":"正常号","realm":"cn",
+	  "credits":3856,"credits_total":3900,"disabled":false,"cooling":false}
+	]`
+	cmd := exec.Command(node, hf.Name(), "app.js")
+	cmd.Dir = "." // 测试工作目录 = internal/panel
+	cmd.Env = append(os.Environ(), "ACC_JSON="+accounts)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("renderAccounts 在含 rate_limited_models 的账号上崩溃（整表空白的根因）: %v\n%s", err, out)
+	}
+	const want = `{"rows":2,"hasModel":true}`
+	if strings.TrimSpace(string(out)) != want {
+		t.Fatalf("renderAccounts=%s want %s（应渲染 2 行且含限流模型名）", out, want)
+	}
+}
+
+func TestAppJSRenderRateLimitedAccounts(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed; render smoke skipped")
+	}
+	harness := `const fs = require('fs');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const inert = new Proxy(function () {}, {
+  get(t, k) { if (k === Symbol.toPrimitive) return () => ''; return inert; },
+  set() { return true; },
+  apply() { return inert; },
+  construct() { return inert; },
+  has() { return true; },
+});
+const stubs = {
+  location: { hash: '#accounts' },
+  history: { replaceState() {} },
+  localStorage: { getItem: () => null, setItem() {} },
+  navigator: { clipboard: { writeText: () => Promise.resolve() } },
+  document: { querySelectorAll: () => [], querySelector: () => inert, getElementById: () => inert, addEventListener() {}, documentElement: inert, head: inert, body: inert, createElement: () => inert, cookie: '' },
+  fetch: () => new Promise(() => {}),
+  addEventListener() {}, removeEventListener() {},
+  matchMedia: () => ({ matches: false, addEventListener() {} }),
+  MutationObserver: class { constructor() {} observe() {} disconnect() {} takeRecords() { return []; } },
+};
+// Node 25 的 navigator 是只读 getter，必须用 defineProperty 覆盖。
+for (const [k, v] of Object.entries(stubs)) {
+  Object.defineProperty(globalThis, k, { value: v, writable: true, configurable: true });
+}
+let api;
+try {
+  api = new Function(src + '\nreturn { renderAccounts: renderAccounts, renderModelLocks: renderModelLocks, renderExpirySnapshot: renderExpirySnapshot };')();
+} catch (e) {
+  console.log('TOPLEVEL FAIL:', (e && e.stack ? e.stack : e).toString().split('\n').slice(0, 5).join('\n'));
+  process.exit(1);
+}
+const now = Date.now();
+const resetAt = new Date(now + 6 * 3600 * 1000).toISOString();
+const until = new Date(now + 1 * 3600 * 1000).toISOString();
+const account = {
+  uid: 'uid-0000000000000001', nickname: '被限流的号', realm: 'cn',
+  credits: 100, credits_total: 200, credits_expiring: 40,
+  credits_earliest_expiry: new Date(now + 3 * 86400 * 1000).toISOString(),
+  credits_earliest_remaining: 40,
+  credits_expiry_buckets: [{ date: new Date(now + 3 * 86400 * 1000).toISOString().slice(0, 10), expire_at: new Date(now + 3 * 86400 * 1000).toISOString(), remain: 40 }],
+  // 四种台账形态全给：双时钟（until < reset_at，模型级限流被网关封顶）、只有上游
+  // 重置时刻、两者都没有、以及 11102 模型不可用。
+  rate_limited_models: [
+    { model: 'glm-5.3', kind: 'rate_limit', reset_at: resetAt, until: until },
+    { model: 'glm-4.6', kind: 'rate_limit', reset_at: resetAt },
+    { model: 'glm-4', kind: 'rate_limit' },
+    { model: 'gone-model', kind: 'model_unavailable', until: until },
+  ],
+};
+const lockRow = { model: 'glm-5.3', realm: 'cn', total: 1, servable: 0, locked: 1, state: 'locked', unlock_at: until, fully_unlock_at: until, reason: '429 code 6004 该模型用量超限' };
+const failures = [];
+const step = (label, fn) => { try { fn(); } catch (e) { failures.push(label + ': ' + ((e && e.message) || e)); } };
+step('renderAccounts', () => api.renderAccounts([account]));
+step('renderModelLocks', () => api.renderModelLocks([lockRow]));
+step('renderExpirySnapshot', () => api.renderExpirySnapshot({
+  accounts: [account], balance_refresh_sec: 300, balance_refreshed_at: new Date(now).toISOString(),
+}));
+if (failures.length) {
+  console.log('RENDER FAIL:\n' + failures.join('\n'));
+  process.exit(1);
+}
+console.log('RENDER OK');
+process.exit(0);
+`
+	hf, err := os.CreateTemp(t.TempDir(), "render-*.cjs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := hf.WriteString(harness); err != nil {
+		t.Fatal(err)
+	}
+	hf.Close()
+	cmd := exec.Command(node, hf.Name(), "app.js")
+	cmd.Dir = "."
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("带模型级限流的账号池渲染崩溃: %v\n%s", err, out)
+	}
+	if !bytes.Contains(out, []byte("RENDER OK")) {
+		t.Fatalf("带模型级限流的账号池渲染未通过:\n%s", out)
 	}
 }

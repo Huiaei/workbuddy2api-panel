@@ -17,7 +17,7 @@ const src=fs.readFileSync(process.argv[2],'utf8');
 const start=src.indexOf('function checkinResultNote('),end=src.indexOf('// 可自动完成的任务');
 assert(start>=0&&end>start);
 const ctx={AUTO_TASKS:{chat_5:'chat'},GROWTH_TITLES:{}};
-vm.createContext(ctx);vm.runInContext(src.slice(start,end),ctx);
+vm.createContext(ctx);vm.runInContext("'use strict';\n" + src.slice(start,end),ctx);
 const global=ctx.taskRowPresentation({task_code:'first_chat',code:'first_chat',task_id:1,status:'available',progress_known:false,reward_known:false},{accept:false,claim:false,automate:false});
 assert.equal(global.code,'first_chat');assert.equal(global.progress,'未提供');assert.equal(global.reward,'未提供');assert.equal(global.action,'');
 const cn=ctx.taskRowPresentation({task_code:'chat_5',current:0,target:5,accept_status:'accepted'},{accept:true,claim:true,automate:true});
@@ -52,7 +52,7 @@ assert(balErr2.message.includes('余额刷新失败'),'签到完成+余额失败
 const summary=ctx.taskResultSummary([{status:'done'},{status:'awaiting_progress'},{status:'done',claim_error:'denied'},{status:'skipped'},{status:'error'}]);
 assert(summary.message.includes('已完成 1 项'));assert(summary.message.includes('等待计分 1 项'));assert(summary.message.includes('领奖待重试 1 项'));assert.equal(summary.severity,'err');
 const gs=src.indexOf('function groupItems(d)'),ge=src.indexOf('const ST_WORDS');
-vm.runInContext(src.slice(gs,ge),ctx);
+vm.runInContext("'use strict';\n" + src.slice(gs,ge),ctx);
 const groups=ctx.groupItems({accounts:[{uid:'global',skipped:true,skip_reason:'国际区只读'},{uid:'bad',growth_error:'upstream unavailable'}]});
 assert.equal(groups.length,2);assert.equal(groups[0].rows[0].status,'skipped');assert.equal(groups[1].rows[0].status,'error');
 assert(!src.includes('全部账号的成长任务与开学季活动都已完成'));
@@ -83,7 +83,7 @@ assert(start>=0&&end>start);
    api:async()=>({restart_required:[],api_key_env_managed:managed}),
    localStorage:{setItem:(_,value)=>{saved=value}},LS_KEY:'key',toast(){},loadOverview(){},
    loadConfig:async()=>{assert.equal(saved,managed?'environment-key':'submitted-key')},JSON};
-  vm.createContext(ctx);vm.runInContext(src.slice(start,end),ctx);
+  vm.createContext(ctx);vm.runInContext("'use strict';\n" + src.slice(start,end),ctx);
   await hosts.cfgForm.onsubmit({preventDefault(){}});
   assert.equal(saved,managed?'environment-key':'submitted-key');
  }

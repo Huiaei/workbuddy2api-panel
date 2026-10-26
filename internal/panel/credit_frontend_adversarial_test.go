@@ -49,7 +49,7 @@ const els = {};
 const $ = id => (els[id] || (els[id] = { innerHTML: '', textContent: '' }));
 const ctx = { Date, Number, String, Math, RegExp, isNaN, $ };
 vm.createContext(ctx);
-vm.runInContext(src.slice(escStart, escEnd) + src.slice(start, end) +
+vm.runInContext("'use strict';\n" + src.slice(escStart, escEnd) + src.slice(start, end) +
   '\nthis.renderCreditHistory=renderCreditHistory;', ctx);
 const t = new Date(2026, 8, 28, 14, 5, 6).toISOString();
 const out = {};
@@ -159,7 +159,7 @@ const end = src.indexOf('function creditLimitValue');
 if (start < 0 || end < 0) throw new Error('credit history helpers not found');
 const ctx = { Date, Number, String, Math, RegExp, isNaN };
 vm.createContext(ctx);
-vm.runInContext(src.slice(start, end) + '\nthis.creditEntryText=creditEntryText;', ctx);
+vm.runInContext("'use strict';\n" + src.slice(start, end) + '\nthis.creditEntryText=creditEntryText;', ctx);
 process.stdout.write(JSON.stringify({
   bad: ctx.creditEntryText({ time: 'not-a-date', uid: 'u1', delta: 1, before: 0, after: 1 }),
   empty: ctx.creditEntryText({ time: '', uid: 'u1', delta: 1, before: 0, after: 1 }),
