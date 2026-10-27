@@ -126,7 +126,7 @@
 ### 这意味着什么
 
 - **代码未经传统意义上的人工逐行审阅**。虽然每批改动都通过了 `go build` / `go vet` / `go test ./...`
-  与 Windows CI 专项 job，但仍然可能存在**逻辑缺陷、边界遗漏、错误假设与风格问题**。
+  与 Windows 交叉编译专项检查（`GOOS=windows go vet` + `go test -c`），但仍然可能存在**逻辑缺陷、边界遗漏、错误假设与风格问题**。
 - **行为异常时请以「代码事实」为准**。如果你在文档里读到的行为和实际表现不符，
   **那几乎总是 bug，而不是「刻意设计」**——请直接提 issue。
 - **关键路径请自行复核**。涉及账号安全、积分计费、对外暴露的部署，落地前请自行验证关键路径，
@@ -141,7 +141,7 @@
 | 用 `displayMsg` / `displayTips` 等**提示文案**做判据 | 判据只用**主文案**（`body.msg` → `body.error.message` → …），否则一次安全提示就会让**整个网关降级** |
 | 探针单次采样 ⇒ 把噪声当结论 | 本项目所有关键结论均以 **K≥3 次重复**验证后才写入文档 |
 | 手写近似请求体 ⇒ 证明不了真实形态 | CN-400 根因排查中，前 8 批「手写近似 body」的探针**全部失败**；破局点是用**网关真实代码 + 真实会话实录**打真实上游 |
-| 跨平台假设（POSIX 语义直接搬到 Windows） | Windows 上 `os.Open` 不带 `FILE_SHARE_DELETE` ⇒ 手写 tmp+rename 必失败；统一走 `internal/atomicfile`，并有 `windows-latest` CI job 兜底 |
+| 跨平台假设（POSIX 语义直接搬到 Windows） | Windows 上 `os.Open` 不带 `FILE_SHARE_DELETE` ⇒ 手写 tmp+rename 必失败；统一走 `internal/atomicfile`，并用 `GOOS=windows` 交叉编译 + `go test -c` 兜底 |
 
 ### 提交与评审
 
@@ -265,7 +265,7 @@ WorkBuddy2API 是一个自托管的 **OpenAI 兼容反向代理网关**，将腾
 | 粘性按模型判活 | 会话绑定的账号被 6004 模型级限额后，换模型请求自动解绑重分配（治"限额后换不动号"）；`/healthz` 探活计入模型豁免形态（治"全号被单模型限流探活误报 503"） |
 | report 增强 | `ReportChatActivity` 支持独立 `requestID`（同会话多轮上报各条可区分） |
 
-未吸收（明确不做）：脚本体系（task_runner/school 脚本—我们已有更完整的纯 API 实现）、governance/CI workflow、成本账本选号（依赖 usage.credit 观测，收益待验证）。
+未吸收（明确不做）：脚本体系（task_runner/school 脚本—我们已有更完整的纯 API 实现）、governance/CI workflow（本仓库已主动关闭 Actions，改手工构建，见 [`BUILD.md`](BUILD.md)）、成本账本选号（依赖 usage.credit 观测，收益待验证）。
 
 > 上游仓库此后已删除，上述第二轮（`ea8b1e5`）即其**删库前的最后一次更新**，本分支已完整吸收。此后本仓库与上游不再有同步关系，演进以本仓库为准。
 
@@ -305,7 +305,7 @@ WorkBuddy2API 是一个自托管的 **OpenAI 兼容反向代理网关**，将腾
 | #221 | 区分模型权限错误（11158）并展示 Global 模型可用性 | `internal/upstream/client.go`、`internal/panel/app.js` |
 | #223 | 支持从环境变量读取代理 | `internal/upstream/transport.go` |
 | #225 | `models.hidden` 黑名单 | `internal/livecfg/livecfg.go` |
-| #230 | Go 下载源改为国内源 | `Dockerfile`、CI |
+| #230 | Go 下载源改为国内源 | `Dockerfile`、`BUILD.md` |
 | #232 | 裸模型名跨域回退（默认关闭） | `internal/pool/realm.go` |
 | #233 | 11-128 通道校验分流 + 始终发送 `X-Conversation-ID` | `internal/upstream/headers.go`（本分支改成**业务码优先**，比上游更宽，见下文「与上游的差异」） |
 
@@ -398,7 +398,7 @@ Go 的 `os.Open` 在 Windows 上**不传 `FILE_SHARE_DELETE`** ⇒ 任何进程�
 `MoveFileEx(..., MOVEFILE_REPLACE_EXISTING)` 必返 `ERROR_ACCESS_DENIED`。上游手写的
 tmp + rename 把它当致命错误 ⇒ **后台任务状态在 Windows 上永远存不下去**。本 fork 统一走
 `internal/atomicfile`：唯一暂存名 + 原地覆盖降级 + 忙重试（40 次 × 5ms），并覆盖
-配置、账号凭证、任务状态、任务日志四条落盘路径。CI 增加 `windows-latest` job。
+配置、账号凭证、任务状态、任务日志四条落盘路径。Windows 侧用 `GOOS=windows go test -c` 交叉编译验证。
 
 #### 上游交互细节
 
@@ -451,9 +451,17 @@ flowchart LR
 - 一个或多个已注册的 CodeBuddy 账号，用于 OAuth 登录
 - 宿主机 Go ≥ 1.22（仅从源码构建时需要）
 
+> 🔧 **本仓库已关闭 GitHub Actions**（无自动构建、无自动发版、无自动镜像推送）。
+> 想自己编译或打包发布，见 [`BUILD.md`](BUILD.md)「构建与发布说明」。
+
 ### 方式〇：GHCR 镜像（免克隆免构建）
 
-CI 会自动构建多架构镜像（`amd64` / `arm64`）并发布到 GHCR，`git clone` 之外的部署路径：
+> ⚠️ **本仓库已关闭 GitHub Actions**，镜像**不再自动构建与推送**。
+> 下列镜像由上游 `linguo2625469/workbuddy2api-panel` 发布，其构建口径可能与本 fork 的代码不一致；
+> 要用**本 fork 的代码**，请走**方式〇之二：本地构建镜像**（见下），或按 [`BUILD.md`](BUILD.md) 手工构建。
+> `ghcr.io/huiaei/workbuddy2api-panel` 这个地址下**没有镜像**（上游 Actions 同样已停）。
+
+`git clone` 之外的部署路径（**上游镜像**）：
 
 ```bash
 # 1. 准备配置与数据目录
@@ -473,8 +481,8 @@ curl -s http://localhost:7863/healthz
 > **首次发布后须将包设为公开**：GitHub 仓库页 → Packages → `workbuddy2api-panel` →
 > Package settings → Change visibility → Public，否则拉取需要 `docker login ghcr.io`。
 >
-> 镜像 tag 规则：`main` 分支推送 `latest` / `main` / `sha-xxxxxx`；打 `v*` tag 额外发布
-> `1.2.3` / `1.2` / `1` 语义化版本；PR 仅构建验证、不推送。
+> 镜像 tag 规则（**上游仓库的历史规则，本 fork 不再自动推送**）：`main` 分支推送 `latest` / `main` / `sha-xxxxxx`；
+> 打 `v*` tag 额外发布 `1.2.3` / `1.2` / `1` 语义化版本。
 
 ### 方式〇之二：本地构建（本 fork 的修复版镜像）
 
