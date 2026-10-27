@@ -1,9 +1,9 @@
 package guard
 
 import (
+	"os"
 	"path/filepath"
 	"testing"
-	"os"
 	"time"
 )
 
