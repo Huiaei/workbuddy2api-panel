@@ -103,7 +103,7 @@ const sandbox = new Proxy({
 sandbox.window = sandbox; sandbox.globalThis = sandbox;
 vm.createContext(sandbox);
 try {
-  vm.runInContext(src, sandbox, { filename: 'app.js' });
+  vm.runInContext("'use strict';"+src, sandbox, { filename: 'app.js' });
   console.log('SMOKE OK');
   process.exit(0);
 } catch (e) {
@@ -148,7 +148,7 @@ if (start < 0 || end < 0) throw new Error('credit helpers not found');
 const ctx = { Number, String, RegExp };
 vm.createContext(ctx);
 vm.runInContext(
-  src.slice(start, end) +
+  "'use strict';"+src.slice(start, end) +
   '\nthis.fmtCredit=fmtCredit; this.fmtCreditRatio=fmtCreditRatio; this.fmtModelRate=fmtModelRate;',
   ctx
 );
@@ -249,7 +249,7 @@ if ([escStart, escEnd, fmtStart, fmtEnd, reqStart, reqEnd].some(v => v < 0)) thr
 const ctx = { Date, Number, String, Math, RegExp, isNaN };
 vm.createContext(ctx);
 vm.runInContext(
-  src.slice(escStart, escEnd) + src.slice(fmtStart, fmtEnd) + src.slice(reqStart, reqEnd) +
+  "'use strict';"+src.slice(escStart, escEnd) + src.slice(fmtStart, fmtEnd) + src.slice(reqStart, reqEnd) +
   '\nthis.requestLogText=requestLogText;',
   ctx
 );
@@ -301,7 +301,7 @@ if ([start, end].some(v => v < 0)) throw new Error('stall tag helper not found')
 const ctx = { Number, String };
 vm.createContext(ctx);
 vm.runInContext(
-  src.slice(start, end) +
+  "'use strict';"+src.slice(start, end) +
   '\nthis.reqStallTag=reqStallTag;',
   ctx
 );
@@ -359,7 +359,7 @@ if (start < 0 || end < 0) throw new Error('credit history helpers not found');
 const ctx = { Date, Number, String, Math, RegExp, isNaN };
 vm.createContext(ctx);
 vm.runInContext(
-  src.slice(start, end) +
+  "'use strict';"+src.slice(start, end) +
   '\nthis.creditEntryText=creditEntryText;this.creditHistoryNote=creditHistoryNote;',
   ctx
 );
@@ -1350,7 +1350,7 @@ if (start < 0 || end < 0) throw new Error('remark helpers not found');
 const ctx = { String, RegExp, Number };
 vm.createContext(ctx);
 vm.runInContext(
-  src.slice(escStart, escEnd) + src.slice(start, end) +
+  "'use strict';"+src.slice(escStart, escEnd) + src.slice(start, end) +
   '\nconst REM = {abcdef12: "JTOL", deadbeef: "<b>x</b>"};' +
   '\nfunction remarksAll() { return REM; }' +
   '\nthis.remarkKey=remarkKey; this.remarkName=remarkName;',
@@ -1639,7 +1639,7 @@ const sandbox = {
 };
 sandbox.window = sandbox; sandbox.globalThis = sandbox;
 vm.createContext(sandbox);
-vm.runInContext(src, sandbox, { filename: 'app.js' });
+vm.runInContext("'use strict';"+src, sandbox, { filename: 'app.js' });
 const accounts = JSON.parse(process.env.ACC_JSON);
 sandbox.renderAccounts(accounts);
 const html = elById('accBody').innerHTML;
