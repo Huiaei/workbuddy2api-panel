@@ -362,6 +362,35 @@ WorkBuddy2API 是一个自托管的 **OpenAI 兼容反向代理网关**，将腾
 | 「错峰使用 / 夜间折扣」类优惠只有 hover 文案、无机器可读 `factor` | 客户端拿牌价，错峰实付 `x0.085` 却显示 `x0.17`（选型被误导） | 从文案派生时段与折扣，`/v1/models` 透出 `promo_*` 一组；派生值标 `promo_derived` 区分置信度（上游 PR #237） |
 | 试用/限免模型免费期**静默结束**（无通知） | 照常发请求、继续扣分 | 可选**自动熔断**：`usage.credit > 0` 或 `promo_valid_until` 到点即持久禁用；上游延长则自动复活（同一份已证伪的声明不再用于复活）。**默认名单留空**——不配置即完全不动（上游 PR #238，落盘改走 `atomicfile`） |
 
+#### 思考强度档位透出
+
+**症状**：客户端（magpie / Codex 目录口径）请求模型时**看不到任何可选的思考强度档位**，
+只能用一个默认档。
+
+**根因**：不是能力缺失，是**字段名错**。客户端读的是 `supported_reasoning_levels`
+（magpie 的模型列表结构里就是这个字段），读不到就当模型没有档位 ⇒ 模型选择器里
+根本不出现档位选项。本项目此前只写了自造的 `reasoning_supported_efforts`——
+客户端不认这个字段名，于是全部信息被丢弃。
+
+**修复**：`/v1/models` 同时写两个名字，载荷形态与 Codex 目录一致：
+
+```jsonc
+"cn:deepseek-v4.1-flash": {
+  "supported_reasoning_levels": [ {"effort": "low"}, {"effort": "high"}, {"effort": "max"} ],
+  "default_reasoning_level": "high",
+  "reasoning_supported_efforts": ["low", "high", "max"],  // 旧名，保留给已按旧名对接的客户端
+  "reasoning_default_effort": "high"
+}
+```
+
+新名（`supported_reasoning_levels` / `default_reasoning_level`）是客户端真正认的；
+旧名保留是为了不打断已按旧名对接的客户端。**载荷形态错一个字节客户端就当没有档位**
+（`levelsOf` 接受纯字符串数组与对象数组两种写法，给对象数组是因为 Codex 目录本身就是
+这么写的），所以形状由测试钉死（`TestModelsDynamic`）。
+
+> 档位来源仍是「远端 `supportedEfforts` 权威 → 静态兜底表」两级（`upstream.EffortListing`），
+> 本次只修「透出给客户端的那一层的字段名与载荷形态」。
+
 #### 上游渠道校验对身份句的逐字黑名单
 
 2026-10-21 起，CN 域上游对**本产品（DeepSeek Harness）的身份句**新增逐字黑名单，命中即
