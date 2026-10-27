@@ -229,12 +229,12 @@ func main() {
 		ExpiringSoonWindow: cfg.ExpiringSoonDur,
 		// 周期保活只刷新临期凭证（默认 7 天窗口）；面板手动全量保活不受影响。
 		KeepaliveRefreshWindow: cfg.KeepaliveRefreshWindowDur,
-		CheckinDisabled:    !cfg.Schedule.CheckinEnabled,
-		TravelDisabled:     !cfg.Schedule.TravelEnabled,
-		ActivityDisabled:   !cfg.Schedule.ActivityEnabled,
-		KeepaliveDisabled:  !cfg.Schedule.KeepaliveEnabled,
-		BlackcatDisabled:   !cfg.Schedule.BlackcatEnabled,
-		GrowthDisabled:     !cfg.Schedule.GrowthEnabled,
+		CheckinDisabled:        !cfg.Schedule.CheckinEnabled,
+		TravelDisabled:         !cfg.Schedule.TravelEnabled,
+		ActivityDisabled:       !cfg.Schedule.ActivityEnabled,
+		KeepaliveDisabled:      !cfg.Schedule.KeepaliveEnabled,
+		BlackcatDisabled:       !cfg.Schedule.BlackcatEnabled,
+		GrowthDisabled:         !cfg.Schedule.GrowthEnabled,
 		// 保号类四任务是否覆盖禁用账号（缺省 false = 禁用即跳过，保持既有行为）。
 		IncludeDisabledInTasks: cfg.Schedule.IncludeDisabledInTasks,
 	})
