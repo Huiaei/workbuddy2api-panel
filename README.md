@@ -269,6 +269,72 @@ WorkBuddy2API 是一个自托管的 **OpenAI 兼容反向代理网关**，将腾
 
 > 上游仓库此后已删除，上述第二轮（`ea8b1e5`）即其**删库前的最后一次更新**，本分支已完整吸收。此后本仓库与上游不再有同步关系，演进以本仓库为准。
 
+### 合并自其他分支的内容（来源清单）
+
+本分支不是一次性写成的：它是把**上游 PR、若干第三方 fork、以及本项目自己的多条工作分支**
+的内容合并到同一条 v1.13.0 基线上得到的。下表逐项说明**合并了什么、从哪来、现在在哪**。
+
+#### 来自上游 `linguo2625469/workbuddy2api-panel` 的 PR
+
+上游共 105 个 PR。**28 个在 v1.13.0 之后合并进上游 `main`（`73a7560`）的 PR，全部已吸收**：
+
+| 上游 PR | 内容 | 本分支中的位置 |
+|---|---|---|
+| #123 | 还原模型原生工具调用标记，修 Codex 回合空转（DSML） | `internal/upstream/dsml.go`（并修了上游 `[]map[string]any` 守卫失效、会被还原调用覆盖真实调用的 bug） |
+| #133 | 无 `conversation_id` 时 `prompt_cache_key` 回退会话 key | `internal/server/handler.go` |
+| #138 | 运行日志下新增「积分历史」，逐账号记录余额变动 | `internal/panel/` + `internal/credithist/` |
+| #143 | 手机端适配（抽屉侧栏 + 宽表卡片化 + 窄屏时序图） | `internal/panel/mobile.css`、`mobile.js` |
+| #144 | 出站 DNS 可指定（`dns_servers` / `WB2A_DNS`） | `internal/upstream/dns.go` |
+| #148 | 剔除 `function.name` 为空的 `tool_call`（修线上 11133） | `internal/upstream/tool_pairing.go` |
+| #152 | 积分到期提醒卡片默认可见，用 overview 快照渲染 | `internal/panel/index.html` |
+| #158 | 按地区独立配置轮询与顺序耗尽调度 | `internal/pool/strategy.go` |
+| #159 | 剥离 `content` 里的 `reasoning_text` 片段 | `internal/upstream/payload.go` |
+| #162 | 识别企业切换会话（`token_source=enterprise_switch`） | `internal/auth/auth.go` |
+| #178 | 账号备注与积分到期提醒折叠 | `internal/panel/app.js` |
+| #185 | `6021 queue.full` 归类为渠道级忙碌 | `internal/upstream/client.go`、`hint.go` |
+| #196 | 补偿状态可观测化（先查后领 + 截止倒计时 + 面板入口） | `internal/scheduler/compensation.go` |
+| #199 | 缓存告警假阳性——miss 显式存在时对称反推 hit | `internal/server/logging.go` |
+| #202 | 软冷却到期后不再透出过期 `reason` | `internal/pool/state.go` |
+| #203 | 模型级 6004 双时钟 | `internal/panel/app.js` |
+| #204 | 一键完成遇「已达标未领」先补领再跳过 | `internal/panel/autotask.go` |
+| #205 | 任务补领清扫（周期幂等） | `internal/panel/tasksweep.go` |
+| #212 | 到期提醒快照与「检查」同口径，按日聚合到期批次 | `internal/pool/cooldown.go`、`internal/panel/` |
+| #213 | 接入 WorkBuddy 联网搜索端点 `POST /v1/search/messages` | `internal/server/` + `internal/upstream/` |
+| #217 | 同账号 refresh 单飞，避免 RT 复用撞 12153 掉登录 | `internal/upstream/client.go` |
+| #220 | 新增 `cn.chat_base` | `cmd/server/config.go` |
+| #221 | 区分模型权限错误（11158）并展示 Global 模型可用性 | `internal/upstream/client.go`、`internal/panel/app.js` |
+| #223 | 支持从环境变量读取代理 | `internal/upstream/transport.go` |
+| #225 | `models.hidden` 黑名单 | `internal/livecfg/livecfg.go` |
+| #230 | Go 下载源改为国内源 | `Dockerfile`、CI |
+| #232 | 裸模型名跨域回退（默认关闭） | `internal/pool/realm.go` |
+| #233 | 11-128 通道校验分流 + 始终发送 `X-Conversation-ID` | `internal/upstream/headers.go`（本分支改成**业务码优先**，比上游更宽，见下文「与上游的差异」） |
+
+**上游停更后新开的 8 个 PR（#244 / #246 / #247 / #248 / #249 / #250 / #251 / #252）**——
+上游在 2026-10-21 声明停止维护，这些 PR 无人合并。逐个核验后的处置：
+
+| 上游 PR | 内容 | 处置 |
+|---|---|---|
+| #244 | 按临期窗口刷新 token | **已采纳**（`868757b`） |
+| #246 | 修账号池表体整表空白 + 渲染异常不再静默（issue #241） | **已采纳**（`96181ba`，我方本就有同一缺陷，先修） |
+| #247 | 企业形态判定收敛为 `enterpriseId`，不再误挡个人版账号（issue #240） | **未采纳**——与本分支 2026-10-12 的一手实测结论冲突；双方证据与分歧点见 [UPSTREAM-MERGE-NOTES.md](UPSTREAM-MERGE-NOTES.md) |
+| #248 | 清掉上行请求体/请求头里的项目自证标识（issue #239） | 功能**早已等价落地**；补了守护测试（`aac0e71`） |
+| #249 | README 补「客户端接入」一节 | **已采纳**（README「客户端接入」章节） |
+| #250 | 模型级限流导致账号池 / 模型锁池 / 积分到期提醒整块空白 | **已采纳**（`96181ba` 的三块渲染隔离） |
+| #251 | 补齐 `rateLimitMeta` 未声明的 `detail` | **已采纳**（`96181ba`） |
+| #252 | 前端冒烟测试 + 请求体解析收敛 | **已采纳思路**（`b2c3ba3`：25 处切片测试纳入严格模式） |
+
+#### 来自第三方 fork 与本项目工作分支
+
+| 来源 | 合并了什么 | 现在在哪 |
+|---|---|---|
+| 报告者 fork（`misakano7545/workbuddy2api-panel`） | 官方客户端出站指纹对齐（双版本真机抓包）、首条消息恒为 system、企业额度「不限量」哨兵不污染权重、突发积分与低缓存率两道快速闸、14003 模型繁忙独立短窗口 | `internal/upstream/headers.go`、`internal/prompt/prompt.go`、`internal/pool/`、`internal/server/budget*.go` |
+| 本项目 `fix/all-known-issues-v1.13.0` 分支 | 早先基于上游 `main` 做的 200+ 项修复中的**自研部分**（错误分类、账号池、面板可观测性、Windows 落盘加固） | 已全部并入本分支；该分支不再单独维护 |
+| 本项目 `feat/rebase-on-main` 分支 | Codex Responses / Anthropic Messages 原生协议与官方检索透传 | `4db668d` → `internal/server/responses.go`、`messages.go` |
+| 本项目 `sweep/*` 分支（7 条） | #104 后台任务+计费、#213 搜索端点、#237/#238 优惠与试用熔断、#244 临期刷新 | 已全部并入；这些分支**零独有提交** |
+| 本项目 `triage/*` 分支 | 20 条无 PR 覆盖的 issue 的修复（软冷却 reason、到期卡片快照、企业额度解析口径等） | 已全部并入 |
+
+> 本分支保留的**唯一**分支是 `main`——它与上游 `main`（`73a7560`）保持完全同步，**只作对照**，不接收修复。所有修复都进 `fix/all-known-issues`（默认分支）。
+
 ### 2026-10 之后的修复集（本 fork 独有）
 
 上游 `linguo2625469/workbuddy2api-panel` 于 2026-10-21 停止维护。本 fork 在其停止前
@@ -538,6 +604,103 @@ curl -s http://localhost:7863/v1/search/messages \
   -d '{"model":"deepseek-v4-flash","tools":[{"type":"web_search_20250305","name":"web_search"}],
        "messages":[{"role":"user","content":"Perform a web search for the query: OpenAI 最新模型"}]}'
 ```
+
+## 客户端接入
+
+网关对外暴露 **OpenAI 兼容**（`/v1/chat/completions`）、**Anthropic Messages 兼容**
+（`/v1/messages`、`/messages`）与 **Responses 兼容**（`/v1/responses`）三套入站协议，
+都指向同一个上游池。
+
+### 端点一览
+
+| 端点 | 协议 | 说明 |
+|---|---|---|
+| `POST /v1/chat/completions` | OpenAI Chat Completions | 通用入口，绝大多数客户端走这里 |
+| `POST /v1/messages`、`POST /messages` | Anthropic Messages | 官方 SDK 用 `x-api-key`；`Authorization: Bearer` 也接受 |
+| `POST /v1/responses` | OpenAI Responses | `instructions` → system 消息，`input[]` → messages |
+| `POST /v1/search/messages`、`POST /v1/search` | Anthropic 风格的联网搜索 | 走上游 `/agenttool/v1/search`，**不是**对话转发 |
+| `GET /v1/models` | OpenAI Models | 返回带 `cn:` / `global:` 前缀的模型 id |
+| `GET /status`、`GET /healthz` | — | 账号池汇总 / 探活 |
+
+> `/v1/search/messages` 是**搜索**端点，与 Anthropic 的 `/v1/messages` 对话端点**不要混淆**。
+
+### Claude Code（Anthropic Messages 协议）
+
+Claude Code 发的是 Anthropic Messages 形态。本网关**原生支持** `/v1/messages`，
+所以可以直接指过去，不需要任何协议翻译中间层：
+
+```json
+{
+  "ANTHROPIC_BASE_URL": "http://127.0.0.1:7863",
+  "ANTHROPIC_AUTH_TOKEN": "your-api-key",
+  "ANTHROPIC_MODEL": "cn:deepseek-v4-pro"
+}
+```
+
+> 若你的 Claude Code 版本硬编码只发 `/v1/messages` 而不带前缀、或需要 OpenAI 形态，
+> 才需要 `claude-code-router` 做翻译。走翻译器时 `api_base_url` 要写到**完整路径**
+> `http://127.0.0.1:7863/v1/chat/completions`（不是只到 `/v1`）。
+
+### OpenAI 兼容客户端
+
+Cherry Studio、NextChat、LobeChat、Open WebUI、dsh 等原生支持 OpenAI 形态，
+直接指 `http://127.0.0.1:7863/v1` + 本网关的 `api_key` 即可，无需中间层：
+
+```bash
+curl -s http://127.0.0.1:7863/v1/chat/completions \
+  -H "Authorization: Bearer your-api-key" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"cn:deepseek-v4-pro","messages":[{"role":"user","content":"hi"}]}'
+```
+
+### 模型名必须带 `cn:` / `global:` 域前缀
+
+`GET /v1/models` 返回的模型 id 形如 `cn:glm-5.3`、`global:deepseek-v4.1-flash`。
+**调用时也必须带同样的前缀**：
+
+| 写法 | 含义 |
+|---|---|
+| `cn:glm-5.3` | 显式国内域 |
+| `global:glm-5.3` | 显式国际域 |
+| `glm-5.3`（裸名） | **按国内域处理** |
+
+前缀解析规则（`internal/server/resolve_model.go`）：取第一个 `:`，前段恰为
+`cn` / `global` 才剥离；其余一律当裸名走国内域。大小写敏感（必须是精确的小写枚举）。
+
+**这是最容易踩的坑**，而且报错信息有很强的误导性。池里只有国际版账号时，写裸名
+`glm-5.3` 会被派到国内域找号，一个都没有，于是返回：
+
+```json
+{"error":{"code":"no_healthy_account",
+  "gateway_hint":"no healthy account available in pool; check /status or retry later"}}
+```
+
+这个报错读起来像「账号全挂了 / 池子空了」，实际只是**模型名少了前缀**。
+
+同样要注意：池里**两域都有**账号时，裸名也能正常跑通（默认走国内域）——所以症状
+会随账号池组成变化，看起来像「时好时坏」。
+
+> 想让裸名在首选域选不到号时自动改用另一域，可开启 `pool.cross_domain_fallback`
+> （默认关闭，因为它会消耗另一个域的额度）。
+
+### 常见错误对照表
+
+| 现象 | 原因 | 处置 |
+|---|---|---|
+| `no_healthy_account` | 模型名缺 `cn:`/`global:` 前缀，域路由错 | 按上表加前缀 |
+| `no_healthy_account` | 账号全在冷却 / 熔断 / 禁用 | 看面板首页状态列与 `/status` |
+| `model_unavailable` + `11158` | 账号档位不支持该模型（如免费个人号用 GPT-6.x） | 换该档位支持的模型，或换号 |
+| `model_unavailable` + `11102` | 上游该后端无此模型 | 换模型 |
+| 400 + 内容审核文案 | 上游逐字匹配误杀官方 system 模板 | 网关已有降级重试，见「内容拦截误报与降级重试」 |
+| 400 + `code=11-128` | 上游渠道校验未通过（请求形态问题，**不是账号问题**） | 网关已归类为「账号无过错」，会自动换号重试；仍失败则看客户端请求体形状 |
+| 工具调用丢失 | 客户端与网关的 tool schema 形态不匹配 | 确认客户端发标准 OpenAI `tools` 字段 |
+| claude-code-router 连不上 | `api_base_url` 写成了 `/v1` 而非完整路径 | 改成 `/v1/chat/completions` |
+
+### Windows 注意点
+
+- 网关的工作目录必须是**仓库根**（`config.json` / `auths/` / `data/` 都是相对路径解析）；
+- `.bat` 脚本需 **CRLF** 换行（LF 会导致 Windows 解析异常）；
+- 若用 `claude-code-router`，`node` 需在 `PATH` 里。
 
 ## 配置说明
 

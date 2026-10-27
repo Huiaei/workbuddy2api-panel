@@ -58,6 +58,14 @@ body {
   transition: color .15s, border-color .15s;
 }
 .brand .ai-badge:hover { color: var(--ink); border-color: var(--ink-3); }
+/* 禁商用徽标：本项目是学习项目、禁止一切商业行为。链接到仓库的使用声明。 */
+.brand .nc-badge {
+  display: inline-flex; align-items: center; gap: 4px; margin-top: 6px; padding: 3px 8px;
+  border: 1px solid var(--line-soft); border-radius: 999px; background: var(--surface-2);
+  color: var(--ink-3); font-size: 10.5px; line-height: 1.5; text-decoration: none;
+  transition: color .15s, border-color .15s;
+}
+.brand .nc-badge:hover { color: var(--ink); border-color: var(--ink-3); }
 .nav ul { list-style: none; padding: 10px 8px; flex: 1; }
 .nav a {
   display: flex; align-items: center; gap: 10px; padding: 8px 11px; margin-bottom: 2px;
@@ -637,6 +645,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
       <div class="name">WorkBuddy2API</div>
       <div class="sub" id="navSub">控制台</div>
       <a class="ai-badge" href="https://github.com/Huiaei/workbuddy2api-panel#-%E6%9C%AC%E9%A1%B9%E7%9B%AE%E6%98%AF%E4%B8%80%E4%B8%AA-ai-%E9%A1%B9%E7%9B%AE" target="_blank" rel="noopener" title="本项目自 2026-10 起的修复与维护由 AI 主导完成，详见 README 顶部声明">🤖 AI 项目</a>
+      <a class="nc-badge" href="https://github.com/Huiaei/workbuddy2api-panel/blob/main/NOTICE.md" target="_blank" rel="noopener" title="本项目为学习项目，禁止一切商业行为；发现商业利用将直接把仓库私有化。详见 NOTICE.md">🚫 禁商用 · 学习项目</a>
     </div>
     <ul>
       <li><a href="#accounts" data-view="accounts" class="on">
