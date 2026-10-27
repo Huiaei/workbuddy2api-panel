@@ -88,6 +88,8 @@ func sanitizeText(text string) string {
 	}
 	// 本产品身份句改写（2026-10-21 CN 渠道校验黑名单，见 dshProductNameRe）。
 	text = sanitizeDSHProductName(text)
+	// 「@ 路径引用协议」文案黑名单（2026-10-28 CN 渠道校验加严，见 sanitize_pathref.go）。
+	text = sanitizePathRefProtocol(text)
 	if sanitizeHdrRe.MatchString(text) {
 		text = sanitizeHdrRe.ReplaceAllString(text, "")
 	}
@@ -120,6 +122,11 @@ func hasFingerprint(text string) bool {
 	// 全小写/首字母大写等变体，净化被整段跳过 ⇒ 变体原样出站 ⇒ 必然被拦。
 	// 这里用已编译的 (?i) 正则兜底（dshProductNameRe）。
 	if dshProductNameRe.MatchString(text) {
+		return true
+	}
+	// 「@ 路径引用协议」文案：上游按大小写不敏感逐字匹配，预检必须同样不敏感，
+	// 否则大小写变体会让整段净化被跳过 ⇒ 变体原样出站 ⇒ 必然被拦。
+	if pathRefFingerprintRe.MatchString(text) {
 		return true
 	}
 	return sanitizeBareHdrRe.MatchString(text)
