@@ -376,6 +376,28 @@ func fmtCreditsPrefix(raw string) string {
 	return "[" + s + " credit]"
 }
 
+// effortLevels 把档位列表转成 supported_reasoning_levels 的载荷形态。
+//
+// 字段名 supported_reasoning_levels 是 magpie / Codex 目录唯一认的档位字段：
+// magpie 的 liveModel 读的就是它（magpie-live.go 的 Levels any
+// `json:"supported_reasoning_levels"`），levelsOf 接受两种写法——纯字符串
+// 数组 ["high"]，或对象数组 [{"effort":"high"}]。这里给对象数组，因为
+// Codex 目录本身就是这么写的（{"effort":…}），两种客户端都认。
+//
+// 载荷形态错一个字节客户端就当没有档位：magpie 读不到就是 Efforts=nil，
+// 模型选择器里根本不出现思考强度选项（这正是本字段存在的意义）。
+func effortLevels(efforts []string) []map[string]any {
+	out := make([]map[string]any, 0, len(efforts))
+	for _, e := range efforts {
+		e = strings.TrimSpace(e)
+		if e == "" {
+			continue
+		}
+		out = append(out, map[string]any{"effort": e})
+	}
+	return out
+}
+
 // applyModelInfoFields 把上游模型对象全字段（ModelInfo）按「空值省略」写出规则
 // 合入 /v1/models 条目：name/description/credits/tags/vendor/能力旗标/
 // max_allowed_size/reasoning_effort/reasoning_summary。CN 动态分支与 global
@@ -536,10 +558,18 @@ func (h *Handler) modelList() []map[string]any {
 		entry = applyModelInfoFields(entry, mi)
 		// effort 能力透出——远端 supportedEfforts 权威，缺失落到 CN 静态兜底表
 		// （客户端可发现档位，不再盲传）。无档位 → 省略字段。
+		//
+		// 字段名必须是 supported_reasoning_levels：这是 magpie（以及它读的
+		// 其它 OpenAI 兼容客户端）唯一认的档位字段——magpie 的 liveModel 结构
+		// 读的就是 supported_reasoning_levels，读不到就是 Efforts=nil，于是
+		// 模型选择器里根本不出现思考强度档位。旧的 reasoning_supported_efforts
+		// 是本项目自造的名字，客户端不认；两个都写，新旧客户端都能发现。
 		if efforts, def := upstream.EffortListing("cn", mi.ID, mi.Efforts, mi.DefaultEffort); efforts != nil {
+			entry["supported_reasoning_levels"] = effortLevels(efforts)
 			entry["reasoning_supported_efforts"] = efforts
 			if def != "" {
 				entry["reasoning_default_effort"] = def
+				entry["default_reasoning_level"] = def
 			}
 		}
 		out = append(out, entry)
@@ -579,9 +609,11 @@ func (h *Handler) modelList() []map[string]any {
 				entry["max_output_tokens"] = mo
 			}
 			if efforts, def := upstream.EffortListing("global", id, globalEfforts[id], globalDefaults[id]); efforts != nil {
+				entry["supported_reasoning_levels"] = effortLevels(efforts)
 				entry["reasoning_supported_efforts"] = efforts
 				if def != "" {
 					entry["reasoning_default_effort"] = def
+					entry["default_reasoning_level"] = def
 				}
 			}
 			out = append(out, entry)

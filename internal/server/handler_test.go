@@ -1024,6 +1024,22 @@ func TestModelsDynamic(t *testing.T) {
 			if mm["default_effort"] != "medium" {
 				t.Errorf("dyn-model-a default_effort=%v want medium", mm["default_effort"])
 			}
+			// 客户端真正认的档位字段：magpie 读 supported_reasoning_levels
+			// （读不到就没有档位可选），载荷是 [{"effort":…}] 对象数组。
+			lvls, ok := mm["supported_reasoning_levels"].([]any)
+			if !ok || len(lvls) != 3 {
+				t.Fatalf("dyn-model-a supported_reasoning_levels=%v want 3 levels", mm["supported_reasoning_levels"])
+			}
+			for i, want := range []string{"low", "medium", "high"} {
+				lv := lvls[i].(map[string]any)
+				if lv["effort"] != want {
+					t.Errorf("supported_reasoning_levels[%d].effort=%v want %v", i, lv["effort"], want)
+				}
+			}
+			// 默认档位同样要落在客户端认的名字上
+			if mm["default_reasoning_level"] != "medium" {
+				t.Errorf("dyn-model-a default_reasoning_level=%v want medium", mm["default_reasoning_level"])
+			}
 		case "dyn-model-b":
 			// 上游未返回 reasoning → 两个档位字段都省略（客户端按自身默认）
 			if _, has := mm["supported_efforts"]; has {
@@ -1031,6 +1047,9 @@ func TestModelsDynamic(t *testing.T) {
 			}
 			if _, has := mm["default_effort"]; has {
 				t.Errorf("dyn-model-b default_effort should be omitted")
+			}
+			if _, has := mm["supported_reasoning_levels"]; has {
+				t.Errorf("dyn-model-b supported_reasoning_levels should be omitted")
 			}
 		case "glm-9.9":
 			if mm["context_length"].(float64) != 262144 {
