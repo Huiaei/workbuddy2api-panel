@@ -510,13 +510,16 @@ flowchart LR
 - 一个或多个已注册的 CodeBuddy 账号，用于 OAuth 登录
 - 宿主机 Go ≥ 1.22（仅从源码构建时需要）
 
-> 🔧 **本仓库已关闭 GitHub Actions**（无自动构建、无自动发版、无自动镜像推送）。
-> 想自己编译或打包发布，见 [`BUILD.md`](BUILD.md)「构建与发布说明」。
+> 🔧 **本仓库已关闭 GitHub Actions**（无自动构建、无自动发版、无自动镜像推送），
+> **并且不再向 GitHub Release 上传任何二进制资产**。
+> 想自己编译，见 [`BUILD.md`](BUILD.md)「构建说明」——**本仓库不发布预编译产物，请自行构建**。
 
 ### 方式〇：GHCR 镜像（免克隆免构建）
 
-> ⚠️ **本仓库已关闭 GitHub Actions**，镜像**不再自动构建与推送**。
-> 下列镜像由上游 `linguo2625469/workbuddy2api-panel` 发布，其构建口径可能与本 fork 的代码不一致；
+> ⚠️ **本仓库已关闭 GitHub Actions**，镜像**不再自动构建与推送**；
+> **本仓库也不向任何镜像仓库推送自己的镜像**。
+> 下列镜像由上游 `linguo2625469/workbuddy2api-panel` 发布，其构建口径与本 fork 的代码**不一致**
+> （是**未修复**的旧版：会误禁健康账号等）；
 > 要用**本 fork 的代码**，请走**方式〇之二：本地构建镜像**（见下），或按 [`BUILD.md`](BUILD.md) 手工构建。
 > `ghcr.io/huiaei/workbuddy2api-panel` 这个地址下**没有镜像**（上游 Actions 同样已停）。
 
@@ -595,8 +598,10 @@ docker compose down             # 停止并移除容器（数据在 ./auths 与 
 
 ### 方式二：Windows 单文件运行（无需 Docker）
 
+> **本仓库不提供预编译二进制**，请自行构建（详见 [BUILD.md](BUILD.md)）。
+
 ```powershell
-# 1) 下载 Release 中的 wb2api.exe，或从源码构建
+# 1) 从源码构建（需 Go 1.26.10+）
 go build -trimpath -ldflags="-s -w" -o wb2api.exe ./cmd/server
 
 # 2) 直接运行：首次启动自动生成 config.json（含随机 api_key，日志打印一次）
@@ -1344,7 +1349,9 @@ python3 scripts/probe_max_tokens.py   --base http://127.0.0.1:7863/v1 --key sk-x
 
 ### 3. 发布来源与合规边界
 
-- **无预编译 release**：仓库无 Release / tag，产物 = 源码自构建（Dockerfile 多阶段在本地构建时完成）
+- **不提供预编译产物**：本仓库**不向 GitHub Release 上传任何二进制资产**，
+  产物一律由构建者本机生成（Dockerfile 多阶段在本地构建时完成）。详见 [BUILD.md](BUILD.md)。
+  （历史 v1.13.2 / v1.13.3 / v1.13.4 曾发布过含二进制的 Release，自 v1.13.4 之后不再新增、不再更新。）
 - 登录 / 签到 / 积分工具：`./login.sh` / `./signin.sh` / `./credit.sh`
 - **无产物校验和**：`go.sum` 仅约束 Go 模块依赖；Docker 镜像由本地 `docker compose build` 生成，未引用第三方镜像
 - 上游 CodeBuddy 属腾讯系商业产品，本项目是其**非官方 OpenAI 兼容网关**；使用其账号做 API 网关涉及目标平台服务条款与账号风险，作者不对账号封禁、条款违约或使用结果负责
