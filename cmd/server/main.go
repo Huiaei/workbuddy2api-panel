@@ -42,7 +42,7 @@ import (
 // 1.13.2-panel = 本 fork 在 1.13.0 发行版之上的修复版。CI（.github/workflows/go-binaries.yml）
 // 会断言「打 tag 的版本号 == 源码 appVersion（剥掉 -panel 后缀）」，所以发布前必须先改这里，
 // 否则任何 v* tag 都会在发布作业里失败。
-const appVersion = "1.13.4-panel"
+const appVersion = "1.13.5-panel"
 
 // usagePathFor 由 state 文件路径推出用量文件路径：同目录、文件名 usage.json。
 // 这样 config 里改 state_file 时用量数据跟着走，不需要额外配置项。
