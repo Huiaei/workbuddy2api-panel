@@ -1047,6 +1047,8 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	allowExtraIteration := false
 	// busyWaited：本次请求是否已经为「全池被 14003 挡住」等过一次（只等一次）。
 	busyWaited := false
+	// slotWaited：本次请求是否已经为「号都在途占满」等过一次名额（只等一次）。
+	slotWaited := false
 	for attempt := 0; rotateUsed < h.cfg.MaxRotate || allowExtraIteration; attempt++ {
 		allowExtraIteration = false
 		// 退避序号：随尝试次数指数增长（backoffAfter 内部有封顶）。停摆重试也
@@ -1133,6 +1135,23 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 						continue
 					}
 				}
+			}
+			// 上游 issue #117：全池该模型没号，但原因不是冷却/停牌，而是**号都在途
+			// 占满**——两号池里一号撞 6004 锁模型后只剩 3 个名额，第 4 个并发请求
+			// 必然 503，其实只差几百毫秒就有名额。此时等一个名额再重选一次，
+			// 而不是立刻 503「没有可用账号」。
+			//
+			// 放在 14003 busy-wait 之后：那是有解封时刻的确定性等待，优先级更高。
+			// 只等一次；等待期间不占在途名额；等待不算一次换号（i-- 后重试）。
+			if !slotWaited && h.cfg.Pool.SlotWaitForRealm(bareModel, realm) {
+				slotWaited = true
+				log.Printf("INFO: [server] model=%s realm=%q: all healthy accounts at in-flight cap, waiting up to %s then retry once (issue #117)",
+					bareModel, realm, slotWaitCap)
+				if !waitForSlot(r.Context(), h.cfg.Pool, bareModel, realm) {
+					break // 客户端已断连：不必再等
+				}
+				attempt-- // 等待不算一次尝试：名额留给真正的尝试
+				continue
 			}
 			st.status = http.StatusServiceUnavailable
 			// 记下"是不是模型级阻塞"。选号返回 nil 有两种完全不同的成因：
@@ -1544,6 +1563,21 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		rc.Close()
 		if err != nil {
 			recordAttempt(acct.UID, pool.TokenUsageDelta{}, 0, false, attemptStarted, 0)
+			// 调用方先走了（前置 CDN 回源超时、客户端自带 timeout、用户点停止）：
+			// 上游当时还在正常输出，网关本身没出错。此前一律记 502 upstream_parse，
+			// 把「别人掐断」报成「上游故障」——运维看到的是一天十几次的 502，
+			// 实际全是前置 CDN（EdgeOne 回源默认 15s 超时）掐的。
+			//
+			// 499 = nginx 的 client closed request，与真 5xx 一眼可分；连接已关，
+			// 不写响应体（写了也发不出去）。上游真断（ctx 没取消、读到 EOF/畸形帧）
+			// 仍走下面的 502 分支。
+			if cerr := r.Context().Err(); cerr != nil {
+				log.Printf("WARN: [server] sync acct=%s model=%s: 调用方断开（%v），上游输出已丢弃（CDN 回源超时常见于 EdgeOne 默认 15s）",
+					logfmt.Label(acct.UID, acct.Nickname), bareModel, cerr)
+				st.status = 499
+				st.outcome = reqlog.OutcomeInterrupted
+				return
+			}
 			// 上游流解析失败：客户端还没看到任何输出，回 502 并告知原因。
 			writeOpenAIError(w, http.StatusBadGateway, "upstream_parse", err.Error())
 			st.status = http.StatusBadGateway

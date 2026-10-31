@@ -7,6 +7,8 @@ import (
 	"context"
 	"math/rand/v2"
 	"time"
+
+	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
 )
 
 // rotateBackoffBase 轮转退避基数（对齐官方 intl CLI computeRequestRetryDelayMs
@@ -60,6 +62,33 @@ func backoffAfter(n int) time.Duration {
 // sleepCtx 可取消的等待：ctx 取消立即返回 false（客户端断连/优雅停机不必等退避
 // 睡醒），等满返回 true。d<=0 立即放行。与 scheduler.sleepCtx 同模式（该函数未
 // 导出且 scheduler 不宜被 server 反向依赖，按任务书「等价物」口径在消费侧实现）。
+// slotPoll 等在途名额的轮询间隔：名额是按请求收尾释放的，几十毫秒内必有一次，
+// 不必更密。
+const slotPoll = 50 * time.Millisecond
+
+// slotWaitCap 「号都在途占满」时单个请求愿意等待的上限。与 14003 的 busy-wait
+// 用同一预算量级（modelBusyWaitMax=10s），不引入新开关。
+var slotWaitCap = 10 * time.Second
+
+// waitForSlot 在「号都在途占满」时等一个空名额：轮询 slotPoll，上限 slotWaitCap。
+// 返回 false = 客户端已断连（不必再等）。
+//
+// 与 14003 busy-wait 的区别：14003 是**有确定解封时刻**的模型级冷却，等的是
+// 那个时刻；这里等的是「任意一个在途请求收尾」，没有确定时刻，只能轮询。
+// 等到名额、或池况变成别的原因（冷却/停牌）都提前收手——由调用方重选一次定论。
+func waitForSlot(ctx context.Context, p *pool.Pool, model, realm string) bool {
+	deadline := time.Now().Add(slotWaitCap)
+	for time.Now().Before(deadline) {
+		if !sleepCtx(ctx, slotPoll) {
+			return false
+		}
+		if !p.SlotWaitForRealm(model, realm) {
+			return true // 名额空出来了（或池况变成别的），让调用方重选
+		}
+	}
+	return true
+}
+
 func sleepCtx(ctx context.Context, d time.Duration) bool {
 	if d <= 0 {
 		return ctx.Err() == nil

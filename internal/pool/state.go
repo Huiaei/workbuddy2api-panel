@@ -610,6 +610,37 @@ func (p *Pool) ServableForRealm(realm string) bool {
 	return false
 }
 
+// SlotWaitForRealm 报告「此刻选不到号**只是**因为号都在途占满」：本域存在对该模型
+// 健康（未冷却/未停牌/未手动关闭/未触发燃尽熔断）的账号，只是名额已满。
+//
+// 这与「号在冷却」不同——冷却要等到已知的解封时刻，而在途占满只要有一个在途请求
+// 收尾就好，通常几十毫秒到几秒。调用方据此决定「等一个名额」还是直接 503
+// （上游 issue #117：两号池里一号撞 6004 锁模型后只剩 3 个名额，第 4 个并发请求
+// 必然 503，而它只差几百毫秒就有名额）。
+//
+// 口径与选号路径（pick）保持一致：realm 过滤 + healthyForModel + 燃尽熔断 +
+// 积分保底。**积分保底挡住的号不算「只差名额」**——等下去不会变好，不该让请求干耗。
+func (p *Pool) SlotWaitForRealm(model, realm string) bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	now := time.Now()
+	for _, e := range p.byUID {
+		if realm != "" && e.a.Realm() != realm {
+			continue
+		}
+		if !e.healthyForModel(now, model) || p.burnBlocked(e, now) {
+			continue
+		}
+		if p.floorBlockedForRealmModel(e, model, realm, now) {
+			continue // 积分保底：等下去也不会变好
+		}
+		if p.inFlightFull(e) {
+			return true
+		}
+	}
+	return false
+}
+
 // List 返回所有账号状态（按 UID 排序，稳定输出）。
 func (p *Pool) List() []Status {
 	p.mu.RLock()

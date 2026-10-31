@@ -44,7 +44,7 @@ const (
 	ErrWafBlock                      // 403 + 非业务信封体（APISIX WAF 拦截页/空体）→ 账号软冷却 + 抖动退避
 	ErrPromptTooLong                 // 11115「prompt is too long」→ 请求级错误（上下文超限是请求的问题非账号的问题）：不罚号、不轮转，末端透传原文
 	ErrImageInvalid                  // 图片请求格式/数据无效 → 请求级错误：不罚号、不轮转，末端透传原文
-	ErrUpstreamBusy                  // 6021「queue.full.title」渠道级容量满载（非账号问题）→ 不罚号、不轮转，末端 503 + upstream_busy
+	ErrUpstreamBusy                  // 6020「queue.waiting.title」/ 6021「queue.full.title」渠道级排队/队列满（非账号问题）→ 不罚号、不轮转，末端 503 + upstream_busy
 	ErrClient                        // 其他 4xx / 业务错误
 )
 
@@ -138,6 +138,14 @@ var sessionDeadMarkers = []string{"Offline user session not found", "12153"}
 // 用完整固定文案（"queue.full"），避免与普通限流文案误撞。
 func isQueueFullBody(lower string) bool {
 	return strings.Contains(lower, "queue.full") || strings.Contains(lower, "queue full")
+}
+
+// isQueueWaitingBody 判定渠道级排队等待文案（6020 queue.waiting.title 家族）。
+// 与 6021「queue.full」同族：排队等待中，同样是**上游容量信号**而非账号限流。
+// 6020 之前没有单独判，落进 429 兜底 → ErrSoftRate → 账号级软冷却 600s，
+// 且同号其他模型一并不可调度（2026-10-24 实案：单次 6020 即整号冻结 10 分钟）。
+func isQueueWaitingBody(lower string) bool {
+	return strings.Contains(lower, "queue.waiting") || strings.Contains(lower, "queue waiting")
 }
 
 // accountFaultMarkers 账号级授权/配额故障关键词（大小写不敏感子串匹配）。
@@ -923,13 +931,16 @@ func Classify(status int, body string) ErrKind {
 	if status == http.StatusTooManyRequests && hasBusinessCode(body, "14018") {
 		return ErrHardCredit
 	}
-	// 6021「queue.full.title」是**渠道级容量满载**（上游推理集群排队队列打满），
-	// 不是账号问题：同一时刻换任何账号都会撞同一堵墙。必须先于通用 429 兜底，
-	// 否则会按 ErrSoftRate 逐号软冷却——实测 2 秒内即可把整池健康号全部误杀
-	// 冷却（2026-10-15 实案），且换号白撞放大请求量。429 + 结构化 code 为主判据
-	// （与 14018 同口径）；"queue.full" 固定文案单列为外卡——该文案是上游 i18n
+	// 6020「queue.waiting.title」/ 6021「queue.full.title」是**渠道级排队/容量满载**
+	// （上游推理集群排队队列打满或等待中），不是账号问题：同一时刻换任何账号都会
+	// 撞同一堵墙。必须先于通用 429 兜底，否则会按 ErrSoftRate 逐号软冷却——
+	// 6021 实测 2 秒内即可把整池健康号全部误杀冷却（2026-10-15 实案），6020 同理
+	// 单次就把整号冻 600s 且同号其他模型一并不可调度（2026-10-24 实案），
+	// 且换号白撞放大请求量。429 + 结构化 code 为主判据（与 14018 同口径）；
+	// "queue.full"/"queue.waiting" 固定文案单列为外卡——该文案是上游 i18n
 	// key 原文，语义唯一，非 429 状态码出现同样归本类（防上游换状态码）。
-	if (status == http.StatusTooManyRequests && hasBusinessCode(body, "6021")) || isQueueFullBody(lower) {
+	if (status == http.StatusTooManyRequests && (hasBusinessCode(body, "6020") || hasBusinessCode(body, "6021"))) ||
+		isQueueFullBody(lower) || isQueueWaitingBody(lower) {
 		return ErrUpstreamBusy
 	}
 	// status==429 先于 hardMarkers：限流响应 body 高频携带 "quota exceeded"/
