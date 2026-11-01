@@ -817,6 +817,7 @@ curl -s http://127.0.0.1:7863/v1/chat/completions \
 | `upstream.header_timeout_seconds` | 回落 `timeout_seconds` | 聊天首字节前（响应头）上限 |
 | `upstream.idle_timeout_seconds` | `300` | 聊天流中空闲上限（活跃续命，静默断流） |
 | `upstream.user_agent` | 空 | 出站 User-Agent 覆盖（空 = 现状 `CLI/2.63.2 CodeBuddy/2.63.2`）。官网「使用端」列按出站 UA 服务端归因；官方 WorkBuddy 桌面 UA 为 `WorkBuddy/<version>`，需要时可配 |
+| `upstream.tls_fingerprint` | `node` | **出站 ClientHello 指纹档位**：`node` = 复刻官方 Node/OpenSSL 形态（JA3 md5 `71dc8c533dd919ae9f4963224a4ba8fd`、JA4 `t13d0a1200_5d04281c6031_b76c5ee2507d`，与官方真机一致，CN 与 GL 同值）；`go` = crypto/tls 原生形态（排障/回滚用）。**为什么需要它**：请求头对齐只解决 HTTP 层，TLS 握手发生在更早，现代风控先看 JA3/JA4。非法值启动即报错（不静默回落）。**已知边界**：走 HTTP 代理时指纹不生效（代理隧道不经过本仓的 TLS 拨号钩子），此时退回 Go 原生形态。改动需重启 |
 | `features.sanitize_blacklist_fingerprints` | `true` | 出站请求体黑名单指纹脱敏 |
 | `models.hidden` | `[]` | 模型黑名单：不对外暴露的模型。裸名=两域都藏；`"cn:xxx"`/`"global:xxx"`=只藏该域。`GET /v1/models` 列表过滤 + `POST /v1/chat/completions` 点名拒绝（400 `model_unavailable`）。面板保存后热生效 |
 | `prompt.mode` | `passthrough` | 系统提示词模式：`custom` = 网关用自有提示词替换客户端 system；`append` = 开头连续 system/developer 块后插网关提示词（既有消息逐字不动）；`passthrough` = 透传客户端原始 system（降级重试仍切中性提示词） |
@@ -885,7 +886,7 @@ curl -s http://127.0.0.1:7863/v1/chat/completions \
 
 加载顺序：JSON 文件 → `WB2A_*` 环境变量（变量非空才覆盖）：
 
-`WB2A_LISTEN` · `WB2A_API_KEY` · `WB2A_AUTH_DIR` · `WB2A_STATE_FILE` · `WB2A_DNS`(逗号分隔多个) · `WB2A_MAX_BODY_MB` · `WB2A_SOFT_RATE`(duration) · `WB2A_SOFT_RATE_MAX`(duration) · `WB2A_TIMEOUT_SECONDS` · `WB2A_HEADER_TIMEOUT_SECONDS` · `WB2A_IDLE_TIMEOUT_SECONDS` · `WB2A_USER_AGENT` · `WB2A_SANITIZE_FINGERPRINTS`(bool) · `WB2A_PROMPT_MODE` · `WB2A_PROMPT_FILE`
+`WB2A_LISTEN` · `WB2A_API_KEY` · `WB2A_AUTH_DIR` · `WB2A_STATE_FILE` · `WB2A_DNS`(逗号分隔多个) · `WB2A_MAX_BODY_MB` · `WB2A_SOFT_RATE`(duration) · `WB2A_SOFT_RATE_MAX`(duration) · `WB2A_TIMEOUT_SECONDS` · `WB2A_HEADER_TIMEOUT_SECONDS` · `WB2A_IDLE_TIMEOUT_SECONDS` · `WB2A_USER_AGENT` · `WB2A_TLS_FINGERPRINT` · `WB2A_SANITIZE_FINGERPRINTS`(bool) · `WB2A_PROMPT_MODE` · `WB2A_PROMPT_FILE`
 
 试用/限免模型自动熔断（默认关闭，见「试用与限免模型的自动熔断」）：`TRIAL_GUARD_ENABLED`(bool) · `TRIAL_GUARD_WATCH`(逗号分隔模型名) · `TRIAL_GUARD_STATE`(状态文件路径) · `TRIAL_GUARD_WINDOWS`(`模型|HH:MM-HH:MM|[星期1-7,可省]|[block\|allow]`)
 
