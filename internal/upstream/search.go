@@ -201,7 +201,7 @@ func (c *Client) SearchRaw(ctx context.Context, a *auth.Auth, query string, maxR
 // （实测会把 15003 变成 "upstream client (http 0)" 之类的含糊文案，调用方看不到真因）。
 // ErrNone 表示「这是请求级错误，换号无意义」→ 上层直接原文透传。
 func (c *Client) doSearchRaw(req *http.Request) ([]byte, error) {
-	resp, err := c.HTTP.Do(req)
+	resp, err := c.do(req, false)
 	if err != nil {
 		return nil, err
 	}
@@ -235,7 +235,7 @@ func (c *Client) doSearchRaw(req *http.Request) ([]byte, error) {
 //   - 2xx 但 code != 0 → 业务错误（ErrNone 时兜底 ErrClient），同样包成 *Error
 //   - 读体失败 → 普通 error（半截 body 不参与账号惩罚）
 func (c *Client) doSearch(req *http.Request) (*SearchOutcome, error) {
-	resp, err := c.HTTP.Do(req)
+	resp, err := c.do(req, false)
 	if err != nil {
 		return nil, err
 	}
