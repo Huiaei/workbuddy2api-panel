@@ -484,3 +484,31 @@ func TestHealthzDoesNotLogTableRow(t *testing.T) {
 		t.Errorf("healthz/models/status must not emit table rows:\n%s", out)
 	}
 }
+
+// chat 流水行必须带 request_id：此前只有 images 路径设过，chat 行因此永远缺
+// `rid= | out= | try= | credit= ` 这一段——上游末帧 usage.credit（本次真实扣费）
+// 与付费/免费判断在流水里完全看不到，只能翻归档对 rid（上游 issue #128）。
+func TestChatRowCarriesRequestID(t *testing.T) {
+	withChatLog(t)
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		return 200, sseOK, true
+	})
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	// 请求日志记账器是 request_id 的唯一来源（生产恒开），故测试也要挂上。
+	h := NewHandler(Config{Pool: p, Upstream: up, RequestLog: reqlog.New(reqlog.Config{})})
+
+	out := captureStdout(t, func() {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
+			strings.NewReader(`{"model":"glm-5.2","messages":[]}`)))
+	})
+	if !strings.Contains(out, "rid=") {
+		t.Errorf("chat row must carry request_id:\n%s", out)
+	}
+	// rid 段存在时，扩展字段（结果/重试/积分）应一并出现。
+	for _, want := range []string{"out=", "try=", "credit="} {
+		if !strings.Contains(out, want) {
+			t.Errorf("chat row missing %q alongside rid:\n%s", want, out)
+		}
+	}
+}
