@@ -229,6 +229,12 @@ func (c *Client) CommonHeaders(req *http.Request, a *auth.Auth) {
 	req.Header.Set("User-Agent", c.userAgent(a))
 	// X-CodeBuddy-Request: 1（官方客户端风控闸门头，所有 API 请求必带，D1）。
 	req.Header.Set("X-CodeBuddy-Request", "1")
+	// Accept-Encoding 对齐官方真机四段：gzip, compress, deflate, br。
+	// 显式声明会关闭 net/http 的透明解压，所以必须配套自己的解压层
+	// （decode.go：wrapDecodedBody 挂在 do() 出口一次覆盖全部读法）。
+	// chat 流式链路在 ChatHeaders 里把这个头删掉，交回 net/http 自动 gzip
+	// —— SSE 长流解压要动 idle 监控/首包计时三处，收益小风险大。
+	req.Header.Set("Accept-Encoding", officialAcceptEncoding)
 	// Accept-Language 按 realm 切（D5）：CN zh-CN，global en-US。官方客户端按账号域
 	// 发对应语言标识，对齐避免上游风控按语言缺失误判。
 	req.Header.Set("Accept-Language", acceptLanguageFor(a))
@@ -329,6 +335,10 @@ func (c *Client) ChatHeaders(req *http.Request, a *auth.Auth, clientIP string, m
 	c.CommonHeaders(req, a)
 	// chat 流式 Accept 覆盖 CommonHeaders 的非流式默认（D6）。
 	req.Header.Set("Accept", "application/json, text/event-stream")
+	// chat 流式**不要**自解 Accept-Encoding：显式声明四段会关掉 net/http 的透明
+	// gzip，而 SSE 长流的解压要同时改 idle 监控、首包计时与正文读取三处，容易
+	// 出半死连接。这里删掉该头交回 net/http（它会自动加 gzip 并透明解压）。
+	req.Header.Del("Accept-Encoding")
 	// AccessToken 加锁快照：keepalive 定时刷新会在 a.mu 内改写它，锁外直读构成数据竞争
 	// （见 auth.AccessTokenValue 注释）。
 	if at := a.AccessTokenValue(); at != "" {
@@ -525,6 +535,9 @@ func (c *Client) BillingHeaders(req *http.Request, a *auth.Auth) {
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Content-Type", "application/json")
 	c.injectCodeBuddyRequest(req)
+	// Accept-Encoding 对齐官方真机四段（billing 域不走 CommonHeaders，单独注入）。
+	// 配套解压层见 decode.go。
+	req.Header.Set("Accept-Encoding", officialAcceptEncoding)
 	// Accept-Language 按 realm 切（D5，billing 域未走 CommonHeaders，单独注入）。
 	req.Header.Set("Accept-Language", acceptLanguageFor(a))
 	if c != nil && c.UserAgent != "" {

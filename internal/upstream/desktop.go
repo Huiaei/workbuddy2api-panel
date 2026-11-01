@@ -326,11 +326,18 @@ func DesktopAutomationCreateEvent(name string) DesktopEvent {
 	}
 }
 
-// ReportWebEvent 以 Web 端指纹向 www.workbuddy.cn/v2/report 上报单事件。
-// 与桌面指纹（copilot 域）不同：web 域事件是浏览器形状（os/machineId/userAgent），
-// 用于 Library_read 等页面行为类任务（实测 library_doc_intro_click 4 秒点亮）。
+// ReportWebEvent 向 /v2/report 上报单事件。
+//
+// 头族按官方真机夹具逐项对齐（2026-11-01 双版抓包，11 个头，无浏览器语义）：
+// 没有 sec-ch-ua / Sec-Fetch-* / Origin / Referer / x-client-platform。
+// 旧实现造的是「Chrome/152 UA + Origin + Referer」的第三族请求，官方客户端
+// 从不发；且 Chrome/152 是不可能的版本（Electron 37 内置 Chromium 138），
+// 是个显眼的非官方指纹。
+//
+// body 保持 web 事件形状不动——那条路径的业务载荷没有真机样本可比对，
+// 改头不动体是拿证据能支撑的最小改动。
 func (c *Client) ReportWebEvent(a *auth.Auth, eventCode, pageURL, elementID, elementName string) error {
-	ua := "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36"
+	ua := c.userAgent(a)
 	ev := map[string]any{
 		"eventCode": eventCode, "timestamp": time.Now().UnixMilli(), "reportDelay": 0,
 		"pageURL": pageURL, "elementId": elementID, "elementName": elementName,
@@ -342,20 +349,31 @@ func (c *Client) ReportWebEvent(a *auth.Auth, eventCode, pageURL, elementID, ele
 	if err != nil {
 		return err
 	}
-	req, err := http.NewRequest(http.MethodPost, c.webBase(a)+"/v2/report", bytes.NewReader(raw))
+	base := c.webBase(a)
+	req, err := http.NewRequest(http.MethodPost, base+"/v2/report", bytes.NewReader(raw))
 	if err != nil {
 		return err
 	}
-	req.Header.Set("Authorization", "Bearer "+a.AccessTokenValue())
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json")
-	req.Header.Set("x-client-platform", "web")
-	req.Header.Set("Origin", c.webBase(a))
-	req.Header.Set("Referer", pageURL)
+	req.Header.Set("Accept", "application/json, text/plain, */*")
+	req.Header.Set("Content-Type", "application/json;charset=UTF-8")
 	req.Header.Set("User-Agent", ua)
+	// X-Request-ID 用**纯随机 32 hex**（NewTraceID），不是 UUIDv7：
+	// 真机 report 样本 `4891f0b179cc4959be94b2c867c16e3c` 解不出时间位，
+	// 而同一客户端的 chat 请求才带毫秒前缀——两条链的 ID 规则不同。
+	req.Header.Set("X-Request-ID", session.NewTraceID())
+	req.Header.Set("X-Product", "SaaS")
+	req.Header.Set("Authorization", "Bearer "+a.AccessTokenValue())
+	// Accept-Encoding：同 /v2/report 真机族（四段全声明），解压层见 decode.go。
+	req.Header.Set("Accept-Encoding", officialAcceptEncoding)
 	if a.UID != "" {
 		req.Header.Set("X-User-Id", a.UID)
 	}
+	// X-Domain 是**裸主机名**（真机 `X-Domain: www.workbuddy.cn`），不是 URL。
+	host := strings.TrimSuffix(strings.TrimPrefix(strings.TrimPrefix(base, "https://"), "http://"), "/")
+	if u, perr := url.Parse(base); perr == nil && u.Hostname() != "" {
+		host = u.Hostname()
+	}
+	req.Header.Set("X-Domain", host)
 	_, err = c.doJSON(req)
 	return err
 }

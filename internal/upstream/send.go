@@ -47,6 +47,11 @@ func applyConnectionHeader(req *http.Request) {
 //
 // 头名拼写在这里统一纠正（headcase.go），Connection 在这里补发（官方必发，
 // Go 默认不发）。挂一次即覆盖全部出站，避免漏点。
+//
+// 响应解压也在这里统一挂（decode.go）：因为我们自己显式声明了官方那四段
+// Accept-Encoding，net/http 的透明解压已被关闭，不自解的话 doJSON 会拿到
+// 压缩字节直接 json.Unmarshal。挂一次覆盖全部读 body 的路径（含 400 分支的
+// Classify），未来新增出站点自动受益。
 func (c *Client) do(req *http.Request, chat bool) (*http.Response, error) {
 	req = normalizeHeaderSpelling(req)
 	applyConnectionHeader(req)
@@ -54,5 +59,10 @@ func (c *Client) do(req *http.Request, chat bool) (*http.Response, error) {
 	if chat {
 		client = c.chatHTTP()
 	}
-	return client.Do(req)
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	wrapDecodedBody(resp)
+	return resp, nil
 }
