@@ -62,6 +62,8 @@
     "device_token": "",
     "device_token_file": "",
     "passthrough_ip": false,
+    "_comment_tls_fingerprint": "tls_fingerprint: 出站 ClientHello 指纹档位。node = 复刻官方 Node/OpenSSL 形态（JA3/JA4 与真机一致，缺省）；go = crypto/tls 原生形态（排障/回滚用）。请求头对齐只解决 HTTP 层，TLS 握手发生在更早，现代风控先看 JA3/JA4。非法值启动即报错。",
+    "tls_fingerprint": "node",
     "_comment_tool_stall": "tool_stall_retry: 非流式请求声明了 tools 却收到「只回正文 + stop 收尾」时的自动重试次数（issue #149）。0 = 关闭重试（仍记录观测）。重试换号进行，不罚账号（上游行为缺陷，不是账号问题）。缺省 1。",
     "tool_stall_retry": 1
   },

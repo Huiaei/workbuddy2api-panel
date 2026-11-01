@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -1063,6 +1064,14 @@ type Client struct {
 	// 面板保存配置热改 + chat 热路径并发读写，用 atomic.Bool 消除数据竞争。
 	SanitizeFingerprints atomic.Bool
 
+	// TLSFingerprint 出站 ClientHello 指纹档位（"node" 复刻官方 Node/OpenSSL /
+	// "go" 用 crypto/tls 原生）。缺省 "node"（生产默认）；见 tlsfingerprint.go。
+	// 运行期可改（SetTLSFingerprint），改后重建拨号闭包立即生效。
+	TLSFingerprint string
+
+	// dialer 出站拨号器（可由 SetDNSDialer 换成指定 DNS 的拨号器）。
+	dialer *net.Dialer
+
 	// UserAgent 出站 User-Agent 显式覆盖（非空时全路径生效，优先于默认三段式）。
 	// 空 = 默认官方形态：chat/refresh/FetchModels 走
 	// `WorkBuddy/<ver> WorkBuddy/<ver> CLI/<cliVer>`；billing 走 `WorkBuddy/<ver>`
@@ -1139,6 +1148,8 @@ func New() *Client {
 		// GlobalEnabled 缺省 true（与 config global.enabled 缺省 true 一致；纯 CN 部署行为不变：
 		// CN 账号恒判 cn，global base 只在 realm=global 的账号上被使用）。
 		GlobalEnabled: true,
+		// TLS 指纹缺省复刻官方 Node/OpenSSL 形态（生产默认）。
+		TLSFingerprint: TLSFingerprintNode,
 	}
 	c.SanitizeFingerprints.Store(true)
 	return c

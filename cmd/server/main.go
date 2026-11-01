@@ -192,6 +192,11 @@ func main() {
 	up.DeviceToken = cfg.Upstream.DeviceToken
 	up.DeviceTokenFile = cfg.Upstream.DeviceTokenFile
 	up.PassthroughIP = cfg.Upstream.PassthroughIP
+	// 出站 ClientHello 指纹档位（node=复刻官方 / go=原生回滚）。
+	// cfg 已 normalize（缺省 node，非法值启动即报错）。
+	if err := up.SetTLSFingerprint(cfg.Upstream.TLSFingerprint); err != nil {
+		log.Fatalf("config: %v", err)
+	}
 	// global realm 路由（config global 段）：上游侧开关（第一道闸）+ base 覆盖；
 	// auth 侧开关（auth.SetGlobalEnabled）是第二道闸，两者同 config global.enabled。
 	up.GlobalEnabled = cfg.Global.Enabled
@@ -712,6 +717,9 @@ func restartRequiredFields(current, next *Config) []string {
 	changed("upstream.device_token", current.Upstream.DeviceToken, next.Upstream.DeviceToken)
 	changed("upstream.device_token_file", current.Upstream.DeviceTokenFile, next.Upstream.DeviceTokenFile)
 	changed("upstream.passthrough_ip", current.Upstream.PassthroughIP, next.Upstream.PassthroughIP)
+	// upstream.tls_fingerprint 装配期写进出站 client 的拨号闭包，进程内不再读取
+	// ——改了必须重启才生效（漏列会让面板显示「已保存」却不生效）。
+	changed("upstream.tls_fingerprint", current.Upstream.TLSFingerprint, next.Upstream.TLSFingerprint)
 	// 零 tool_calls 停摆重试（issue #149）：装配期读进 server.Config，进程内不再
 	// 读取——改了必须重启才生效（漏列会让面板显示「已保存」却不生效）。
 	changed("upstream.tool_stall_retry", current.Upstream.ToolStallRetry, next.Upstream.ToolStallRetry)

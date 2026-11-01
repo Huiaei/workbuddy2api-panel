@@ -189,6 +189,17 @@ type Config struct {
 		DeviceTokenFile string `json:"device_token_file"`
 		// PassthroughIP 是否透传客户端 IP 给上游（默认 false，反代安全边界）。
 		PassthroughIP bool `json:"passthrough_ip"`
+		// TLSFingerprint 出站 ClientHello 指纹档位：
+		//   - "node"（缺省）= 复刻官方 Node/OpenSSL 形态（JA3/JA4 与真机一致）；
+		//   - "go" = crypto/tls 原生形态（排障/回滚用）。
+		//
+		// 为什么需要它：请求头做到 100% 一致也只能骗过 HTTP 层，现代风控在
+		// HTTP 之前就完成了 TLS 握手，JA3/JA4 才是第一道指纹。官方桌面端走
+		// Node 主进程，Go 默认 ClientHello 的 cipher 顺序（TLS1.3 三件套在末尾）
+		// 与扩展集都与真机不同，一眼可辨。
+		//
+		// 取值非法时启动即报错，不静默回落——静默回落等于用户以为复刻生效了。
+		TLSFingerprint string `json:"tls_fingerprint"`
 		// ToolStallRetry 非流式请求命中「声明了 tools 却零 tool_calls 且 stop 收尾」
 		// 时的自动重试次数（issue #149）。0 = 关闭重试（仍记录观测）。
 		//
@@ -629,6 +640,7 @@ func (c *Config) EnvironmentManagedFields() []string {
 		{"WB2A_CLIENT_VERSION", "upstream.client_version", ""}, {"WB2A_CLI_VERSION", "upstream.cli_version", ""},
 		{"WB2A_CLIENT_NAME", "upstream.client_name", ""}, {"WB2A_DEVICE_TOKEN", "upstream.device_token", ""},
 		{"WB2A_DEVICE_TOKEN_FILE", "upstream.device_token_file", ""}, {"WB2A_PASSTHROUGH_IP", "upstream.passthrough_ip", "bool"},
+		{"WB2A_TLS_FINGERPRINT", "upstream.tls_fingerprint", ""},
 		{"WB2A_SANITIZE_FINGERPRINTS", "features.sanitize_blacklist_fingerprints", "bool"},
 		{"WB2A_PROMPT_MODE", "prompt.mode", ""}, {"WB2A_PROMPT_FILE", "prompt.file", ""},
 		{"WB2A_EXPIRING_SOON", "pool.expiring_soon", ""}, {"WB2A_PREFER_EXPIRING", "pool.prefer_expiring", "bool"},
@@ -746,6 +758,16 @@ func (c *Config) normalize() error {
 	}
 	if c.Upstream.ToolStallRetry > 3 {
 		c.Upstream.ToolStallRetry = 3
+	}
+	// 出站 TLS 指纹档位（node/go）。空 = 缺省 node（复刻官方）。
+	// 非法取值直接报错而不是回落——静默回落等于用户以为复刻生效了。
+	switch strings.ToLower(strings.TrimSpace(c.Upstream.TLSFingerprint)) {
+	case "":
+		c.Upstream.TLSFingerprint = "node"
+	case "node", "go":
+		c.Upstream.TLSFingerprint = strings.ToLower(strings.TrimSpace(c.Upstream.TLSFingerprint))
+	default:
+		return fmt.Errorf("upstream.tls_fingerprint: 取值 %q 无效（可选 node / go）", c.Upstream.TLSFingerprint)
 	}
 	// 积分燃尽熔断（issue #229）：阈值 <= 0 = 关闭（默认，零回归）。
 	if c.Pool.BurnGuardLimit < 0 {

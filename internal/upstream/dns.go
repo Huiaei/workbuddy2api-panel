@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"net"
-	"net/http"
 	"time"
 )
 
@@ -40,17 +39,17 @@ func NewDNSDialer(servers []string) *net.Dialer {
 	return d
 }
 
-// SetDNSDialer 把拨号器换到已有的两个 http.Client 上（只覆盖 Transport.DialContext）。
+// SetDNSDialer 把拨号器换到已有的两个 http.Client 上。
+//
+// 注意：设了 Transport.DialTLSContext 之后，Transport 走 TLS 时**不会**调用
+// DialContext——TLS 拨号整条链由 DialTLSContext 自己负责（它内部才调
+// d.DialContext）。所以这里必须同时重建 DialTLSContext，否则自定义 DNS
+// 服务器会被整个绕过，Android 那类「无 /etc/resolv.conf」的部署会退回系统
+// 解析器、域名解析再次全失败。
 func (c *Client) SetDNSDialer(d *net.Dialer) {
 	if d == nil {
 		return
 	}
-	for _, cl := range []*http.Client{c.HTTP, c.ChatHTTP} {
-		if cl == nil {
-			continue
-		}
-		if t, ok := cl.Transport.(*http.Transport); ok {
-			t.DialContext = d.DialContext
-		}
-	}
+	c.dialer = d
+	c.rebuildTLSDialer()
 }
