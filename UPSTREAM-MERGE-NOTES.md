@@ -118,6 +118,44 @@
 前三项需要独立评估（第二项会改排程语义、第三项是新包），**本次未并入**；
 第四项是纯前端优化，成本低但收益也低。
 
+### 报告者 fork 2026-10-24 ~ 2026-11-01 新增提交的逐条处置
+
+报告者 fork 在 2026-10-24 之后又补了一批提交（截至 2026-11-01 累计领先 609 个提交），
+逐项核对后处置如下。**结论：绝大部分我方已等价或更强**，真正要补的是「出站头对齐」
+这一整条线。
+
+| 提交 / issue | 内容 | 我方处置 |
+|---|---|---|
+| `6562731` / #125 | 6020 带 `retry_after` 时不换号重打 | **已等价**（更强）：我方 6020/6021 都走 `ErrUpstreamBusy` 分支，本身 fail-fast 不轮转，并把 `Retry-After` 原样写进响应头 |
+| `192267a` / #128 | chat 流水行补 `request_id` | **已补**（`e06e1ce`）：此前 `chatStat.requestID` 字段存在但全仓无赋值点，`rid=` 段永不出现 |
+| `bd0cc1d` / #129 | 登录 client 禁 h2 + 纯传输失败重试 | **已补**（`3891094`） |
+| `47d1e2f` / #126 | 运行日志增量游标改用单调序号 `seq` | **不做**：我方 reqlog 是整表拉取的另一设计，`internal/panel/ring.go` 的 `LogEntry` 无 `Seq` 字段（加它要改整个 Ring 与 Snapshot），非同一缺口 |
+| `771da0f` / #132 | 事件日志区分客户端原始档位与网关补档 | **不做**：我方 reqlog 与行日志都无 effort 字段，属「思考档位可观测」的新维度而非缺陷修复，成本中等、收益待定 |
+| `9b9174b` / #127 | `model_fallback` 支持带域前缀的键 | **不做**：我方无 `model_fallback` 功能（全仓 grep 0 命中），属新功能 |
+| `4b7a805` / #130 | 域名被路由策略拒绝（15021）时跨域兜底 | **不做**：我方无 fetch 端点，全仓无 15021 |
+| `39fba11` / #131 | 配置页分域编辑 `cn`/`global` 的 `chat_base`/`billing_base` | **已覆盖**：`cmd/server/config.go:153` `Global.ChatBase`、`:163` `CN.ChatBase` |
+| `4d7d1e6` / #134 | usage 跨段合并 prompt 取末段值 | **不做**：我方无 `internal/server/continue.go`，无对应功能 |
+| `fbe8d3f` / `5677928` / `ee5467c` / `dd2ec95` / `56f479d` / `c8241cc` / `80e275e` | **出站头对齐整条线**：官方真机头夹具、头名逐字拼写、头发送顺序、`Connection` 头、`Accept-Encoding` 四段、真实 TLS 连接复用、**TLS ClientHello 指纹复刻（JA3+JA4）** | **已全部并入**，见下表 |
+
+出站头对齐各段的落地提交与要点：
+
+| 段 | 提交 | 要点 |
+|---|---|---|
+| 头名逐字拼写 + `Connection` 头 | `61c4463` | 45 个真机头名的大小写映射（`X-Conversation-ID` 而非 `X-Conversation-Id`、`x-stainless-*` 全小写等）。**刻意不做「全部小写化」**——Go 的 `Request.write` 对 `User-Agent`/`Host`/`Content-Length`/`Accept-Encoding` 特判 canonical key，小写会让 UA 回落成 `Go-http-client/1.1`、`Content-Length` 重复发送 |
+| `Accept-Encoding` 四段 + report 形态纠偏 | `cd527a8` | `gzip, compress, deflate, br` 会关掉 net/http 的透明解压 ⇒ 必须配套自解压层（`internal/upstream/decode.go`，deflate 同时兼容 zlib 与裸 flate）。chat 链路例外：`ChatHeaders` 显式 `Del` 该头交回 net/http 自动 gzip（SSE 长流解压要动首包计时/空闲监控三处，风险大于收益）。report 事件同步改成官方 Node 形态（原 UA 写死 `Chrome/152`，而 Electron 37 内置的是 Chromium 138，是不可能值） |
+| 头发送顺序 + **TLS 指纹复刻** | `a44dd1e` | uTLS 手搓官方 Node/OpenSSL 形态的 ClientHello：18 个 cipher（TLS1.3 三件套排最前）、9 项 sigalgs、groups `[x25519,p256,p384]`、10 个扩展按真机顺序、ALPN 留空。实测 JA3 md5 = `71dc8c533dd919ae9f4963224a4ba8fd`、JA4 = `t13d0a1200_5d04281c6031_b76c5ee2507d`，与官方真机一致（CN 与 GL 同值）。接线要点：**必须接管整条 TLS 拨号**（`DialTLSContext`）——标准库在 `DialContext` 之上自己握手，写进 conn 的是加密记录，那一层看不到也改不了请求头；只有自己握手才拿得到明文 conn，头顺序重排才有落点 |
+
+出站头对齐这一条线为什么重要：**请求头做到 100% 一致也只能骗过 HTTP 层**。TLS 握手
+发生在 HTTP 之前，现代风控先看 JA3/JA4 再看 header，所以三段必须一起做。
+
+新增配置项 `upstream.tls_fingerprint`（`node`/`go`，缺省 `node`）：
+- `node` = 复刻官方 Node/OpenSSL 形态（生产默认）；
+- `go` = crypto/tls 原生形态（排障/回滚用，运行期可切，不必发版）；
+- 取值非法**启动即报错**，不静默回落——静默回落等于用户以为复刻生效了。
+
+已知边界：**走 HTTP 代理时指纹不生效**（代理隧道走标准库 `addTLS` 路径，不经过
+`DialTLSContext`），此时退回 Go 原生形态。
+
 ## 六、上游停更后的维护口径
 
 1. **上游 `main` 只作对照**：本仓库的 `main` 分支与上游 `73a7560` 完全同步，
