@@ -603,13 +603,18 @@ docker compose down             # 停止并移除容器（数据在 ./auths 与 
 ```powershell
 # 1) 从源码构建（需 Go 1.26.10+）
 go build -trimpath -ldflags="-s -w" -o wb2api.exe ./cmd/server
-
-# 2) 直接运行：首次启动自动生成 config.json（含随机 api_key，日志打印一次）
-.\wb2api.exe -config config.json
-
-# 3) 浏览器打开面板添加账号
-#    http://127.0.0.1:7863/panel/
 ```
+
+然后**双击 `wb2api.exe` 就行，不需要任何启动脚本**：程序会自动读 **exe 同目录的
+`config.json`**，并在同目录建 `auths/`（凭证）与 `data/`（状态）。
+首次启动没有 `config.json` 会自动生成一份推荐配置（含随机 `api_key`）。
+
+之后浏览器打开面板添加账号：http://127.0.0.1:7863/panel/
+
+> **路径语义**：所有相对路径（`config.json` / `./auths` / `./data`）都相对
+> **配置文件所在目录**解析，不是相对「你从哪儿敲的命令」。所以从快捷方式、
+> 从资源管理器、从别的目录双击启动，结果完全一样。想指定别的配置仍然可以：
+> `wb2api.exe -config D:\path\to\config.json`。
 
 exe 为**单文件自包含**（前端资源已 embed 进二进制），拷到任意 Windows 机器即可运行，只需保证 `auths/`（凭证）与 `data/`（状态）目录可写。
 
@@ -621,9 +626,9 @@ exe 为**单文件自包含**（前端资源已 embed 进二进制），拷到�
 ```powershell
 # -tags tray 启用系统托盘；-H=windowsgui 把 PE 子系统改成 GUI（不弹控制台）
 go build -tags tray -trimpath -ldflags="-s -w -H=windowsgui" -o wb2api-tray.exe ./cmd/server
-
-.\wb2api-tray.exe -config config.json
 ```
+
+托盘版**同样不需要启动脚本**：双击 `wb2api-tray.exe` 即可，配置读取规则一致。
 
 托盘版的行为：
 
@@ -797,8 +802,9 @@ curl -s http://127.0.0.1:7863/v1/chat/completions \
 
 ### Windows 注意点
 
-- 网关的工作目录必须是**仓库根**（`config.json` / `auths/` / `data/` 都是相对路径解析）；
-- `.bat` 脚本需 **CRLF** 换行（LF 会导致 Windows 解析异常）；
+- 网关的**配置文件所在目录**就是它的「根目录」（`config.json` / `auths/` / `data/`
+  都是相对它解析的）——程序启动时会自动把工作目录切到那里，所以**双击 exe 即可，
+  不需要任何启动脚本，也不依赖你从哪个目录敲的命令**；
 - 若用 `claude-code-router`，`node` 需在 `PATH` 里。
 
 ## 配置说明

@@ -84,6 +84,14 @@ go build -tags tray -trimpath -ldflags="-s -w -H=windowsgui" -o wb2api-tray.exe 
 powershell -ExecutionPolicy Bypass -File scripts\build-windows.ps1 -Mode All
 ```
 
+**产物直接双击即可运行，不需要任何 `.bat` 启动脚本**：托盘版会自动读 **exe 同
+目录的 `config.json`**，并把 `auths/`（凭证）、`data/`（状态）、`logs/`（日志）
+都建在同目录。所有相对路径都相对「配置文件所在目录」解析，所以从快捷方式
+启动、从资源管理器双击、还是从命令行启动，结果完全一致。
+
+想指定别的配置文件仍然可以：`wb2api-tray.exe -config D:\path\to\config.json`
+（显式给了 `-config` 就以你给的为准，不会被默认规则改写）。
+
 也可以在 Linux 上交叉编译（**不要在 Windows 上执行编译出的 exe**，只做交叉编译）：
 
 ```bash

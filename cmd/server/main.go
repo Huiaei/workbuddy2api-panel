@@ -41,7 +41,7 @@ import (
 // 1.13.2-panel = 本 fork 在 1.13.0 发行版之上的修复版。CI（.github/workflows/go-binaries.yml）
 // 会断言「打 tag 的版本号 == 源码 appVersion（剥掉 -panel 后缀）」，所以发布前必须先改这里，
 // 否则任何 v* tag 都会在发布作业里失败。
-const appVersion = "1.13.7-panel"
+const appVersion = "1.13.8-panel"
 
 // usagePathFor 由 state 文件路径推出用量文件路径：同目录、文件名 usage.json。
 // 这样 config 里改 state_file 时用量数据跟着走，不需要额外配置项。
@@ -96,22 +96,35 @@ func run() error {
 	defer sinks.Close()
 	sinks.init()
 
-	cfgPath := flag.String("config", "config.json", "配置文件路径（默认当前目录 config.json；不存在时自动生成推荐配置）")
+	cfgPath := flag.String("config", "", "配置文件路径（默认：托盘版读 exe 同目录的 config.json，控制台版读当前目录的 config.json；不存在时自动生成推荐配置）")
 	flag.Parse()
 
-	cfg, err := Load(*cfgPath)
+	// 用户是否显式给了 -config（显式意图不该被改写）。
+	explicitConfig := false
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == "config" {
+			explicitConfig = true
+		}
+	})
+	resolvedCfg := resolveConfigPath(*cfgPath, explicitConfig)
+	// 把工作目录锚到配置所在目录：配置里的 ./auths、./data 这类相对路径
+	// 必须相对「配置所在目录」解析，否则双击 exe（工作目录不一定是 exe 目录）
+	// 会找不到账号与状态文件。
+	anchorWorkingDir(resolvedCfg)
+	log.Printf("配置文件: %s", describeConfigPath(resolvedCfg))
+	cfg, err := Load(resolvedCfg)
 	if err != nil {
 		// errors.Is 才能看穿 Load 里 fmt.Errorf("%w") 的包装；os.IsNotExist 不行。
 		if errors.Is(err, fs.ErrNotExist) {
 			// 首次运行：目录下没有配置 → 自动落一份推荐配置（含随机 api_key）再加载。
 			// 双击 exe / 裸跑 docker 即开，无需先手工复制样例。
-			if key, werr := WriteDefault(*cfgPath); werr == nil {
-				log.Printf("config %s 不存在，已生成推荐配置（api_key=%s，记录在该文件里，可自行修改）", *cfgPath, key)
-				cfg, err = Load(*cfgPath)
+			if key, werr := WriteDefault(resolvedCfg); werr == nil {
+				log.Printf("config %s 不存在，已生成推荐配置（api_key=%s，记录在该文件里，可自行修改）", resolvedCfg, key)
+				cfg, err = Load(resolvedCfg)
 			}
 			if err != nil {
 				// 生成失败（目录只读等）：退回纯默认 + env（旧行为兜底），不阻塞启动。
-				log.Printf("config %s not found (auto-generate failed), using defaults+env: %v", *cfgPath, err)
+				log.Printf("config %s not found (auto-generate failed), using defaults+env: %v", resolvedCfg, err)
 				cfg, err = Load("")
 			}
 		}
@@ -426,14 +439,14 @@ func run() error {
 		// 模型上限探测数据（scripts/probe_max_tokens.py --panel-out 写入）：
 		// 与 state 文件同目录，缺省 data/output_probes.json。
 		ProbeFile:  stateSibling(cfg.StateFile, "output_probes.json"),
-		ConfigPath: *cfgPath,
+		ConfigPath: resolvedCfg,
 		LoadConfig: func() (any, error) {
-			return Load(*cfgPath)
+			return Load(resolvedCfg)
 		},
 		SaveConfig: func(raw []byte) ([]string, error) {
 			configSaveMu.Lock()
 			defer configSaveMu.Unlock()
-			return saveConfig(raw, *cfgPath, live, p, up, sch, cfg, fallbackDirs(cfg.StateFile)...)
+			return saveConfig(raw, resolvedCfg, live, p, up, sch, cfg, fallbackDirs(cfg.StateFile)...)
 		},
 		// 积分历史账本（只读展示；写入由上面的余额观察者完成）。
 		CreditHistory: creditHist,
