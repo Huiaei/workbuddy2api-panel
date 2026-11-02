@@ -156,6 +156,40 @@
 已知边界：**走 HTTP 代理时指纹不生效**（代理隧道走标准库 `addTLS` 路径，不经过
 `DialTLSContext`），此时退回 Go 原生形态。
 
+### 上游 PR #67（Windows 托盘构建）——已吸收并重做
+
+上游 PR #67（`upstream-pr/67`，28 文件 +1090/-28）是我方唯一「有实质代码增量而
+此前没有」的未采纳上游 PR。它的目标是消除 Windows 上启动时残留的命令行窗口，
+用户侧也确实提了同样的诉求（m18291：「现有的程序通过命令启动，会保留一个命令行
+窗口」）。
+
+**上游做法**：`go build -tags tray -ldflags "-s -w -H=windowsgui"` 产出 GUI
+子系统二进制，运行时用 `github.com/energye/systray` 常驻系统托盘，右键菜单
+「打开Panel」「退出程序」；另带 `wb2api.manifest` / `wb2api.rc` /
+`wb2api_windows_amd64.syso`（需 windres 生成）与自建的 `internal/applog/daily.go`
+（按天轮转日志）。
+
+**我方没有照搬，重写了三处**：
+
+| 上游做法 | 我方做法 | 为什么 |
+|---|---|---|
+| `TaskDialogIndirect` 手工打包做「以后不再显示」复选框 | 改用 `MessageBox`（是/否两按钮表达同一意思） | TaskDialog 需要程序清单声明 comctl32 v6，清单要编译进 `.syso` 资源；无 windres 的构建环境生成不出这个资源，`TaskDialogIndirect` 会直接失败降级。MessageBox 是系统原生、永远可用 |
+| 自建 `internal/applog/daily.go` 按天轮转 | 复用已有的 `internal/logfile`（按体积上限轮转追加写） | 仓库里已经有能用的轮转日志实现，没必要再引入第二个 |
+| 固定「exe 同目录 daily 文件」作唯一 base sink | `cmd/server/logsinks.go`：`logSinks` 抽象 + `safeWriter` 包裹控制台输出 | GUI 子系统没有可靠的控制台句柄，写 `os.Stderr` 会返回「句柄无效」；而 `io.MultiWriter` 遇到第一个写失败就**提前中断**，后面的 sink（面板环形缓冲、日志文件）就再也收不到内容——用户在面板里会看到一片空白而不是错误信息。`safeWriter` 吞掉写错误是这条链路的必要条件 |
+
+**另外三处我方主动改造**：
+
+1. `cmd/server/main.go`：`main()` 拆成 `run() error`，启动失败不再只 `log.Fatalf`
+   （托盘版没有控制台，失败信息会彻底丢失），改为弹 `MessageBox`；先 `net.Listen`
+   再 `Serve`，端口占用能明确报错而不是静默失败；托盘菜单「退出程序」触发优雅停机。
+2. 单实例互斥体 `Local\WorkBuddy2API-Panel-Singleton`：重复双击时第二个实例直接
+   打开面板并退出，不会抢端口。
+3. 首次启动提示（告知「右键托盘图标」），选「是」后写标记文件
+   `.startup-notice-disabled` 到 exe 同目录。
+
+落地提交：`c85140e`（远端 `105130a`）。构建入口 `scripts/build-windows.ps1`
+（`-Mode Console|Tray|All`），文档见 `BUILD.md` §2.0 与 README「方式二」。
+
 ## 六、上游停更后的维护口径
 
 1. **上游 `main` 只作对照**：本仓库的 `main` 分支与上游 `73a7560` 完全同步，
