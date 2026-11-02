@@ -613,6 +613,33 @@ go build -trimpath -ldflags="-s -w" -o wb2api.exe ./cmd/server
 
 exe 为**单文件自包含**（前端资源已 embed 进二进制），拷到任意 Windows 机器即可运行，只需保证 `auths/`（凭证）与 `data/`（状态）目录可写。
 
+#### 不想要命令行窗口？用托盘版
+
+上面这个 `wb2api.exe` 是**控制台程序**，启动后会一直留一个黑色命令行窗口。
+想要「双击就启动、不弹窗」的体验，构建**托盘版**：
+
+```powershell
+# -tags tray 启用系统托盘；-H=windowsgui 把 PE 子系统改成 GUI（不弹控制台）
+go build -tags tray -trimpath -ldflags="-s -w -H=windowsgui" -o wb2api-tray.exe ./cmd/server
+
+.\wb2api-tray.exe -config config.json
+```
+
+托盘版的行为：
+
+- **常驻系统托盘**，右键图标有「打开面板」「打开日志目录」「退出程序」；
+- **首次启动弹一次提示窗**（告知右键托盘图标），选「是」后不再显示；
+- **日志自动落盘**到 exe 同目录 `logs/wb2api.log`（配置里没写 `logging.log_file` 时）；
+- **单实例**：重复启动时第二个实例直接打开面板并退出，不会抢端口。
+
+一次构建两种：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\build-windows.ps1 -Mode All
+```
+
+详见 [BUILD.md](BUILD.md)「2.0 Windows 托盘版（无命令行窗口）」。
+
 ### 方式三：源码运行（开发调试）
 
 ```bash

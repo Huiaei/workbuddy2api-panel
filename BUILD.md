@@ -66,6 +66,55 @@ CGO_ENABLED=0 GOOS=darwin  GOARCH=amd64  go build -trimpath -ldflags="-s -w" -o 
 CGO_ENABLED=0 GOOS=darwin  GOARCH=arm64  go build -trimpath -ldflags="-s -w" -o dist/wb2api-darwin-arm64   ./cmd/server
 ```
 
+### 2.0 Windows 托盘版（无命令行窗口）
+
+普通构建出来的 `wb2api.exe` 是**控制台程序**：双击或用 start 脚本启动时，
+会一直留一个黑色命令行窗口。托盘版没有这个窗口，程序常驻系统托盘，
+右键托盘图标可以「打开面板」「打开日志目录」「退出程序」。
+
+```powershell
+# Windows 本机（PowerShell）
+set CGO_ENABLED=0
+go build -tags tray -trimpath -ldflags="-s -w -H=windowsgui" -o wb2api-tray.exe ./cmd/server
+```
+
+或者用仓库里的脚本（一次构建两种）：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\build-windows.ps1 -Mode All
+```
+
+也可以在 Linux 上交叉编译（**不要在 Windows 上执行编译出的 exe**，只做交叉编译）：
+
+```bash
+CGO_ENABLED=0 GOOS=windows GOARCH=amd64 \
+  go build -tags tray -trimpath -ldflags="-s -w -H=windowsgui" -buildvcs=false \
+  -o dist/wb2api-tray-windows-amd64.exe ./cmd/server
+```
+
+两个关键参数：
+
+| 参数 | 作用 |
+|---|---|
+| `-tags tray` | 启用系统托盘（图标 + 右键菜单）与「无控制台」的日志策略 |
+| `-H=windowsgui` | PE 子系统改为 GUI（2），启动时不弹命令行窗口 |
+
+验证产物确实是 GUI 子系统（subsystem=2，不是 3）：
+
+```bash
+python3 -c 'import struct,sys; d=open(sys.argv[1],"rb").read(); o=struct.unpack_from("<I",d,0x3c)[0]; print("subsystem", struct.unpack_from("<H",d,o+0x5c)[0])' dist/wb2api-tray-windows-amd64.exe
+# 期望：subsystem 2
+```
+
+托盘版的几个行为差异：
+
+- **日志落盘**：没有控制台可看，配置里没写 `logging.log_file` 时自动落到
+  exe 同目录 `logs/wb2api.log`（按体积轮转）。
+- **单实例**：重复双击时第二个实例直接打开面板并退出，不会抢端口。
+- **启动提示**：首次启动弹一次提示窗；选「是」后不再显示（标记文件
+  `.startup-notice-disabled` 落在 exe 同目录）。
+- 托盘版的依赖 `github.com/energye/systray` 是纯 Go 实现，不需要 cgo。
+
 ### 2.1 版本串断言（必做）
 
 `cmd/server/main.go` 里的 `appVersion` 是**版本唯一事实源**，面板 `/panel/api/overview` 与发版 tag 都取它。

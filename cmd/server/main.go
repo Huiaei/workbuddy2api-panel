@@ -7,9 +7,9 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"io"
 	"io/fs"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -25,7 +25,6 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/credithist"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/guard"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/livecfg"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/logfile"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/panel"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/redisstore"
@@ -42,7 +41,7 @@ import (
 // 1.13.2-panel = 本 fork 在 1.13.0 发行版之上的修复版。CI（.github/workflows/go-binaries.yml）
 // 会断言「打 tag 的版本号 == 源码 appVersion（剥掉 -panel 后缀）」，所以发布前必须先改这里，
 // 否则任何 v* tag 都会在发布作业里失败。
-const appVersion = "1.13.6-panel"
+const appVersion = "1.13.7-panel"
 
 // usagePathFor 由 state 文件路径推出用量文件路径：同目录、文件名 usage.json。
 // 这样 config 里改 state_file 时用量数据跟着走，不需要额外配置项。
@@ -77,6 +76,26 @@ func fallbackDirs(stateFile string) []string {
 }
 
 func main() {
+	if err := run(); err != nil {
+		// 托盘构建是 GUI 子系统，没有控制台窗口可看 —— 错误必须弹窗，
+		// 否则用户只会看到「双击了但什么都没发生」。
+		log.Printf("fatal: %v", err)
+		showFatalError("WorkBuddy2API 启动失败", err.Error())
+		os.Exit(1)
+	}
+}
+
+// run 是真正的启动流程；出错返回 error 而不是 log.Fatalf。
+//
+// 为什么改成返回 error：托盘版没有控制台，log.Fatalf 会直接 os.Exit(1)，
+// 用户看不到任何错误信息（既没有控制台窗口，托盘图标也还没建起来）。
+// 改成返回 error 后，main 统一弹窗告知。
+func run() error {
+	// 日志 sink 先挂上控制台（配置文件还没读，读到后再追加文件 sink）。
+	sinks := newLogSinks()
+	defer sinks.Close()
+	sinks.init()
+
 	cfgPath := flag.String("config", "config.json", "配置文件路径（默认当前目录 config.json；不存在时自动生成推荐配置）")
 	flag.Parse()
 
@@ -97,13 +116,29 @@ func main() {
 			}
 		}
 		if err != nil {
-			log.Fatalf("load config: %v", err)
+			return fmt.Errorf("load config: %w", err)
 		}
 	}
 
+	// 单实例守卫：托盘版重复双击时，第二次启动应当把面板打开后直接退出，
+	// 而不是再起一个进程抢同一个端口（第二个实例会在 listen 时报 address in use）。
+	instance, duplicate, err := acquireSingleInstance()
+	if err != nil {
+		return err
+	}
+	if duplicate {
+		url := panelURL(cfg.Listen)
+		log.Printf("已有实例正在运行，打开管理面板 %s", url)
+		if err := openPanelInBrowser(url); err != nil {
+			return err
+		}
+		return nil
+	}
+	defer instance.Close()
+
 	auths, err := auth.LoadDir(cfg.AuthDir)
 	if err != nil {
-		log.Fatalf("load auths: %v", err)
+		return fmt.Errorf("load auths: %w", err)
 	}
 	log.Printf("loaded %d account(s) from %s", len(auths), cfg.AuthDir)
 
@@ -195,7 +230,7 @@ func main() {
 	// 出站 ClientHello 指纹档位（node=复刻官方 / go=原生回滚）。
 	// cfg 已 normalize（缺省 node，非法值启动即报错）。
 	if err := up.SetTLSFingerprint(cfg.Upstream.TLSFingerprint); err != nil {
-		log.Fatalf("config: %v", err)
+		return fmt.Errorf("config: %w", err)
 	}
 	// global realm 路由（config global 段）：上游侧开关（第一道闸）+ base 覆盖；
 	// auth 侧开关（auth.SetGlobalEnabled）是第二道闸，两者同 config global.enabled。
@@ -413,30 +448,15 @@ func main() {
 	sch.SetTaskSweepHook(func() { pn.RunTaskSweepOnce() })
 	// 日志落盘（logging.log_file）：Windows 上没有控制台窗口时，出问题只能靠猜。
 	// 打不开文件就降级（只 WARN，不让网关起不来）——stderr 仍然有输出。
-	var logFile *logfile.Writer
-	if cfg.Logging.LogFile != "" {
-		lf, err := logfile.New(cfg.Logging.LogFile, cfg.Logging.LogFileMaxMB, cfg.Logging.LogFileBackups)
-		if err != nil {
-			log.Printf("WARN: 日志落盘不可用（仅输出到控制台）: %v", err)
-		} else {
-			logFile = lf
-			defer logFile.Close()
-		}
+	//
+	// 托盘构建（tray tag）额外兜底：配置里没写 log_file 时，落到 exe 同目录
+	// logs/wb2api.log —— 托盘版没有控制台，不落盘就等于完全看不到日志。
+	if err := sinks.attachFile(cfg.Logging.LogFile, cfg.Logging.LogFileMaxMB, cfg.Logging.LogFileBackups); err != nil {
+		log.Printf("WARN: 日志落盘不可用（仅输出到控制台）: %v", err)
 	}
-	var logWriters []io.Writer
-	logWriters = append(logWriters, os.Stderr, pn.Logs())
-	if logFile != nil {
-		logWriters = append(logWriters, logFile)
-	}
-	log.SetOutput(io.MultiWriter(logWriters...))
-	var chatWriters []io.Writer
-	chatWriters = append(chatWriters, os.Stdout, pn.Logs())
-	if logFile != nil {
-		chatWriters = append(chatWriters, logFile)
-	}
-	server.SetChatLogOutput(io.MultiWriter(chatWriters...))
-	if logFile != nil {
-		log.Printf("INFO: 日志落盘已启用: %s", logFile.Path())
+	sinks.attachPanel(pn.Logs())
+	if sinks.path != "" {
+		log.Printf("INFO: 日志落盘已启用: %s", sinks.path)
 	}
 
 	h := server.NewHandler(server.Config{
@@ -469,8 +489,12 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	// 派生可取消的 ctx：serve 意外退出时要能把它取消掉，否则托盘版会一直
+	// 挂在消息循环里（用户看到「程序还在，但面板打不开了」）。
+	runCtx, cancelRun := context.WithCancel(ctx)
+	defer cancelRun()
 	if err := pn.StartTaskJobs(ctx, stateSibling(cfg.StateFile, "task-jobs.json")); err != nil {
-		log.Fatalf("task jobs: %v", err)
+		return fmt.Errorf("task jobs: %w", err)
 	}
 	defer pn.StopTaskJobs()
 	pn.ResumeTaskJobs()
@@ -501,19 +525,50 @@ func main() {
 		// （长流式生成合法时长可达数分钟，全局 WriteTimeout 会误杀在途 SSE）。
 		IdleTimeout: 120 * time.Second,
 	}
+	// 先 listen 再 serve：托盘版需要在「端口已占用」这类启动失败时给出明确
+	// 报错（弹窗），而不是让 ListenAndServe 在后台异步报错后进程悄悄挂住。
+	listener, err := net.Listen("tcp", cfg.Listen)
+	if err != nil {
+		return fmt.Errorf("listen %s: %w", cfg.Listen, err)
+	}
+
+	var serveErr error
+	serveDone := make(chan struct{})
 	go func() {
-		<-ctx.Done()
-		p.Flush() // 信号触发：先落盘再做优雅停机
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		_ = srv.Shutdown(shutdownCtx)
+		serveErr = srv.Serve(listener)
+		if errors.Is(serveErr, http.ErrServerClosed) {
+			serveErr = nil
+		}
+		cancelRun() // serve 结束（含异常退出）时放行托盘消息循环
+		close(serveDone)
 	}()
 
 	log.Printf("workbuddy2api listening on %s (api_key=%v)，管理面板 http://127.0.0.1%s/panel/", cfg.Listen, cfg.APIKey != "", panelListenPath(cfg.Listen))
-	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		log.Fatalf("http: %v", err)
+
+	// 托盘版阻塞在系统托盘消息循环里，直到用户点「退出程序」或收到停止信号；
+	// 控制台版 runDesktop 退化成「等 ctx 取消」。两条路径最终都汇合到下面的
+	// 优雅停机。
+	desktopErr := runDesktop(runCtx, func() {
+		if err := openPanelInBrowser(panelURL(cfg.Listen)); err != nil {
+			log.Printf("打开管理面板失败: %v", err)
+		}
+	})
+
+	stop()    // 停掉 signal.NotifyContext，让 ctx.Done() 关闭
+	p.Flush() // 停机序：先落盘再做优雅停机
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	_ = srv.Shutdown(shutdownCtx)
+	cancel()
+	<-serveDone
+
+	if desktopErr != nil {
+		return desktopErr
+	}
+	if serveErr != nil {
+		return fmt.Errorf("http: %w", serveErr)
 	}
 	log.Printf("bye")
+	return nil
 }
 
 // warmModelRates 启动预热各域模型积分倍率表（供积分保底的目录兜底判定）。
