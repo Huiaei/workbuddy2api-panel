@@ -42,6 +42,26 @@ $('btnTheme').onclick = () => {
 };
 applyTheme();
 
+/* ── 面板密钥的「免手输」引导 ─────────────────────────────────────── */
+/* 托盘版右键菜单「打开面板」会把 api_key 放在 **URL 片段** 里带过来（#key=…）。
+   片段（# 之后）是纯客户端信息：**不进 HTTP 请求**（服务器日志/访问日志抓不到）、
+   **不经过 Referer 头外泄**，而且进来就立刻 replaceState 掉，浏览器历史里不留痕。
+   这样双击托盘打开面板时不用再手抄一遍 config.json 里的密钥。
+   手输路径完全保留：地址栏干净时（没有 #key=）什么都不做，照旧弹框问。 */
+(function () {
+  const h = String(location.hash || '');
+  const i = h.indexOf('key=');
+  if (i < 0) return;
+  let rest = h.slice(i + 4);
+  const amp = rest.indexOf('&');
+  if (amp >= 0) rest = rest.slice(0, amp);
+  let key = '';
+  try { key = decodeURIComponent(rest); } catch (e) { key = rest; }
+  try { history.replaceState(null, '', location.pathname + location.search + '#accounts'); } catch (e) { /* 历史不可写：保留片段，不影响鉴权 */ }
+  if (!key) return;
+  localStorage.setItem(LS_KEY, key);
+})();
+
 /* ── 请求 ─────────────────────────────────────────────────────────── */
 async function api(path, opts = {}) {
   const h = Object.assign({}, opts.headers || {});

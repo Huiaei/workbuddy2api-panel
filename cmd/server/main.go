@@ -140,8 +140,8 @@ func run() error {
 		return err
 	}
 	if duplicate {
-		url := panelURL(cfg.Listen)
-		log.Printf("已有实例正在运行，打开管理面板 %s", url)
+		url := panelURLWithKey(cfg.Listen, cfg.APIKey)
+		log.Printf("已有实例正在运行，打开管理面板 %s", panelURL(cfg.Listen))
 		if err := openPanelInBrowser(url); err != nil {
 			return err
 		}
@@ -562,7 +562,10 @@ func run() error {
 	// 控制台版 runDesktop 退化成「等 ctx 取消」。两条路径最终都汇合到下面的
 	// 优雅停机。
 	desktopErr := runDesktop(runCtx, func() {
-		if err := openPanelInBrowser(panelURL(cfg.Listen)); err != nil {
+		// 托盘菜单「打开面板」：密钥走 URL 片段（# 后半段不进 HTTP 请求），前端
+		// 拿到即存进 localStorage 并清掉片段，所以双击托盘打开面板不用再手抄密钥。
+		// 没设 api_key（cfg.APIKey == ""）时退化成不带片段的地址。
+		if err := openPanelInBrowser(panelURLWithKey(cfg.Listen, cfg.APIKey)); err != nil {
 			log.Printf("打开管理面板失败: %v", err)
 		}
 	})

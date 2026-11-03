@@ -72,6 +72,12 @@ CGO_ENABLED=0 GOOS=darwin  GOARCH=arm64  go build -trimpath -ldflags="-s -w" -o 
 会一直留一个黑色命令行窗口。托盘版没有这个窗口，程序常驻系统托盘，
 右键托盘图标可以「打开面板」「打开日志目录」「退出程序」。
 
+> 托盘菜单的「打开面板」会把 api_key 放在 URL 片段（`#…`）里带过去：片段是纯
+> 客户端信息，**不进 HTTP 请求**（服务器日志抓不到）、**不经过 Referer 外泄**，
+> 前端拿到即存进浏览器并清掉片段（历史里也不留）。所以双击托盘打开面板**不需要
+> 再手抄一遍 config.json 里的密钥**；从浏览器地址栏手动访问、或密钥改过，仍然
+> 照旧弹框问（安全兜底不变）。
+
 ```powershell
 # Windows 本机（PowerShell）
 set CGO_ENABLED=0
