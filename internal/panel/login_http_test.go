@@ -4,6 +4,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -139,5 +140,37 @@ func TestDoJSONDoesNotRetryHTTPError(t *testing.T) {
 	mu.Unlock()
 	if got != 1 {
 		t.Fatalf("HTTP 错误被调用 %d 次，want 1（不得重试）", got)
+	}
+}
+
+// TestLoginUAIsCurrentCLI 守护登录流的出站 UA 版本。
+//
+// 背景：登录用的是**旧的** CodeBuddy CLI UA（`CLI/<ver> CodeBuddy/<ver>`）——那是
+// 从旧版 CLI 抄来的形态，业务链路的 WorkBuddy 三段式 UA 是后来才对齐的。正因为
+// 「旧」是它本来的样子，这个版本号很容易在升级时被漏掉（上次就停在 2.63.2，
+// 上游 CLI 实际已到 2.179.2）。这里把当前目标版本钉进测试，升级时 CI 会提醒跟着改。
+//
+// 断言只看「版本是否跟得上 CLI 发布节奏」，不断言 UA 形态（形态变化是另一件事，
+// 由 fingerprint_test / useragent_test 覆盖）。
+func TestLoginUAIsCurrentCLI(t *testing.T) {
+	const currentCLIVer = "2.179.2" // https://www.codebuddy.cn/docs/cli/release-notes/v2.179.2
+
+	if !strings.Contains(clientUA, currentCLIVer) {
+		t.Errorf("登录流 clientUA = %q 不含当前 CLI 版本 %s（上游已更新，请同步版本号）", clientUA, currentCLIVer)
+	}
+	// 形态守护：必须是 CLI + CodeBuddy 双段，别在升级时顺手改成 WorkBuddy 三段式
+	// （登录端点和业务端点是两套 UA 家族，混了反而不是官方形态）。
+	if !strings.HasPrefix(clientUA, "CLI/") {
+		t.Errorf("登录流 clientUA = %q 应以 CLI/ 开头", clientUA)
+	}
+	if !strings.Contains(clientUA, "CodeBuddy/"+currentCLIVer) {
+		t.Errorf("登录流 clientUA = %q 应含 CodeBuddy/%s 段", clientUA, currentCLIVer)
+	}
+
+	// 同时确认 commonHeaders 真的把这个 UA 装上了（防止有人改成别处取值）。
+	req := &http.Request{Header: make(http.Header)}
+	commonHeaders(req, originRefererCN)
+	if got := req.Header.Get("User-Agent"); got != clientUA {
+		t.Errorf("commonHeaders UA = %q, want clientUA %q", got, clientUA)
 	}
 }

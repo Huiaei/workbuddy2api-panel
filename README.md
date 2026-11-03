@@ -259,7 +259,7 @@ WorkBuddy2API 是一个自托管的 **OpenAI 兼容反向代理网关**，将腾
 | 上游改动 | 吸收内容 |
 |---|---|
 | 净化增强 | `tool_calls.arguments` 盲区修复（content=null 的工具调用轮此前完全漏净化）、裸 `11128` 反探测改写、桌面版身份句（逗号形态）漏网修复、反馈句整句改写 |
-| 出站头族 | UA 对齐官方三段式 `WorkBuddy/<ver> WorkBuddy/<ver> CLI/<ver>`（默认 5.5.4/2.137.1，可配）；`X-IDE-*` 用量归属四头 + `X-Agent-Purpose`（`client_name` 配 `WorkBuddy` 即对齐官方桌面端）；`X-Device-Token` 设备风控头（auth 每号 / config / 文件三源）；`X-IDE-Version` 补齐 |
+| 出站头族 | UA 对齐官方三段式 `WorkBuddy/<ver> WorkBuddy/<ver> CLI/<ver>`（CN 默认 `5.8.3/2.161.0`，global 默认 `5.8.4/2.161.0`，均可配）；`X-IDE-*` 用量归属四头 + `X-Agent-Purpose`（`client_name` 配 `WorkBuddy` 即对齐官方桌面端）；`X-Device-Token` 设备风控头（auth 每号 / config / 文件三源）；`X-IDE-Version` 补齐 |
 | 并发修复 | 客户端 IP 改按请求参数传递（消除共享字段竞态）；billing 单段 UA 形态 |
 | 签到幂等 | `IsAlreadyCheckin` 识别"今天已签到"（code=10001/14001），调度日志不再把重复签到当失败 |
 | 粘性按模型判活 | 会话绑定的账号被 6004 模型级限额后，换模型请求自动解绑重分配（治"限额后换不动号"）；`/healthz` 探活计入模型豁免形态（治"全号被单模型限流探活误报 503"） |
@@ -852,7 +852,8 @@ curl -s http://127.0.0.1:7863/v1/chat/completions \
 | `upstream.timeout_seconds` | `120` | 短 RPC（刷新 / 签到 / 余额 / 模型列表）总时长上限 |
 | `upstream.header_timeout_seconds` | 回落 `timeout_seconds` | 聊天首字节前（响应头）上限 |
 | `upstream.idle_timeout_seconds` | `300` | 聊天流中空闲上限（活跃续命，静默断流） |
-| `upstream.user_agent` | 空 | 出站 User-Agent 覆盖（空 = 现状 `CLI/2.63.2 CodeBuddy/2.63.2`）。官网「使用端」列按出站 UA 服务端归因；官方 WorkBuddy 桌面 UA 为 `WorkBuddy/<version>`，需要时可配 |
+| `upstream.user_agent` | 空 | 出站 User-Agent 覆盖。空 = **按官方真机抓包形态对齐**（CN `WorkBuddy/5.8.3 WorkBuddy/5.8.3 CLI/2.161.0`，global `workbuddy-ai/5.8.4 workbuddy-ai/5.8.4 CLI/2.161.0`）。官网「使用端」列按出站 UA 服务端归因；需要时可配完全自定义值 |
+| `upstream.cli_version` | 空 | 出站 UA 的 `CLI/<ver>` 段。空 = 内置默认 `2.161.0`（对齐 CN 5.8.3 / global 5.8.4 分发包内置 CLI）。官方 CLI 单独发版很快（已到 2.179.x），此值与实际分发包会漂移；若上游开始校验 CLI 段版本，把它配成当前版本即可，无需改代码。环境变量 `WB2A_CLI_VERSION` |
 | `upstream.tls_fingerprint` | `node` | **出站 ClientHello 指纹档位**：`node` = 复刻官方 Node/OpenSSL 形态（JA3 md5 `71dc8c533dd919ae9f4963224a4ba8fd`、JA4 `t13d0a1200_5d04281c6031_b76c5ee2507d`，与官方真机一致，CN 与 GL 同值）；`go` = crypto/tls 原生形态（排障/回滚用）。**为什么需要它**：请求头对齐只解决 HTTP 层，TLS 握手发生在更早，现代风控先看 JA3/JA4。非法值启动即报错（不静默回落）。**已知边界**：走 HTTP 代理时指纹不生效（代理隧道不经过本仓的 TLS 拨号钩子），此时退回 Go 原生形态。改动需重启 |
 | `features.sanitize_blacklist_fingerprints` | `true` | 出站请求体黑名单指纹脱敏 |
 | `models.hidden` | `[]` | 模型黑名单：不对外暴露的模型。裸名=两域都藏；`"cn:xxx"`/`"global:xxx"`=只藏该域。`GET /v1/models` 列表过滤 + `POST /v1/chat/completions` 点名拒绝（400 `model_unavailable`）。面板保存后热生效 |
