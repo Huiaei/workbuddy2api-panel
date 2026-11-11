@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"sort"
 	"strings"
@@ -23,6 +24,22 @@ var errEmptyStream = errors.New("upstream stream contained no valid data events"
 // 在流式路径把空流记为失败观测（HTTP 头已发出只能 200，但日志/状态应收敛到
 // upstream_parse 同语义），与客户端断连类错误区分。
 func IsEmptyStreamError(err error) bool { return errors.Is(err, errEmptyStream) }
+
+// TruncationFinishReason 上游没有给出正常收尾时（既无 finish_reason 也无
+// data: [DONE] 就 EOF = 断流）如实上报的截断终态取值。
+//
+// 为什么是 "length"：OpenAI 协议的 finish_reason 词表里没有「上游断流」这一项，
+// 而客户端真正需要知道的事实是「这条输出是残缺的，别当完整结果用」——"length"
+// 是唯一既合法又能让三条适配器都如实标截断的取值：
+//   - chat：finish_reason="length"（客户端据此提示被截断）；
+//   - responses：response.incomplete + incomplete_details.reason=max_output_tokens
+//     （映射见 internal/server/responses.go 的 responsesStatusFromFinish）；
+//   - messages：stop_reason="max_tokens"（映射见 internal/server/messages.go 的
+//     anthropicStop）。
+//
+// 不给这个取值时，三条路径各自 default 成「正常完成」（空 finish_reason /
+// response.completed / end_turn），客户端把半截内容当完整答案落库——那是静默丢内容。
+const TruncationFinishReason = "length"
 
 // Aggregate 读取完整 SSE 流，聚合 delta.content 为单个 OpenAI chat.completion 响应。
 // 分片/半行由 bufio.Reader.ReadString 处理；遇到 "data: [DONE]" 结束。
@@ -641,6 +658,12 @@ func StreamHint(w http.ResponseWriter, r io.Reader, hintFn func(string) string, 
 	maxToolIdx := -1
 	toolFinishSent := false
 
+	// finishSeen 本轮是否已经发出过带 finish_reason 的收尾帧（上游自己发的、
+	// 标记修复展开出来的、以及兜底补的都算）。用途是判断「上游到底有没有给终态」：
+	// 上游既没发 data: [DONE]、也没发 finish_reason 才是断流；已经发过 finish 帧
+	// 就绝不能再补收尾，否则一轮里出现两个 finish 帧（假终态）。
+	finishSeen := false
+
 	// writeSSE 原样写出一帧并 flush。
 	writeSSE := func(payload string) error {
 		if _, werr := io.WriteString(w, "data: "+payload+"\n\n"); werr != nil {
@@ -669,6 +692,22 @@ func StreamHint(w http.ResponseWriter, r io.Reader, hintFn func(string) string, 
 	// 已用过的最大 tool_call index（供标记修复接续编号）。
 	// fallback 是规范化失败时的兜底原文（与修复前「marshal 失败即原样透传」一致）。
 	writeChunk := func(obj map[string]any, fallback string) error {
+		// finish 记账：本帧带非空 finish_reason ⇒ 本轮已有终态。必须在写字节之前
+		// 判断——后面补截断终态时要读这个状态（写完再记会漏掉自己补的那一帧）。
+		if !finishSeen {
+			if chs, ok := obj["choices"].([]any); ok {
+				for _, ci := range chs {
+					c, _ := ci.(map[string]any)
+					if c == nil {
+						continue
+					}
+					if fr, ok := c["finish_reason"].(string); ok && fr != "" {
+						finishSeen = true
+						break
+					}
+				}
+			}
+		}
 		// 先按 index 收敛 tool_calls name（每 index 仅首片保留，后续分片删 name 键），再规范化透传。
 		stripToolCallNames(obj, toolCallSeen)
 		// id 续传：首帧非空真实 id 缓存；后续帧缺 id / 空 id 一律用缓存值，
@@ -886,6 +925,26 @@ readLoop:
 				return werr
 			}
 		}
+	}
+	// 断流终态兜底：上游既没发 data: [DONE]（sawDone=false），也没给过任何
+	// finish_reason 帧（finishSeen=false）就 EOF = 流被截断。此时**不能**只补
+	// 一个 data: [DONE] 假装正常收尾——客户端会把半截内容当完整答案落库
+	// （静默丢内容且无感知）。按截断语义补一帧 finish_reason=length，让客户端
+	// 知道这条输出是残缺的（responses 侧映射成 response.incomplete +
+	// incomplete_details.reason=max_output_tokens，messages 侧映射成
+	// stop_reason=max_tokens）。
+	//
+	// 两个前提缺一不可：
+	//   - validFrames > 0：一个有效帧都没收到是**空流**，走下面的 empty upstream
+	//     stream 错误帧（HTTP 502 语义），不能同时再补一个 finish 帧（造出假终态）；
+	//   - !toolFinishSent：标记修复已经补过 finish_reason: tool_calls 收尾时，
+	//     本轮已有终态（finishSeen 也已被 writeChunk 记上），不再重复补。
+	if !sawDone && !finishSeen && !toolFinishSent && validFrames > 0 {
+		log.Printf("WARN: [upstream] stream 上游未给终态就结束（无 finish_reason、无 data: [DONE]，%d 个有效帧）→ 按截断收尾", validFrames)
+		if werr := writeChunk(finishOnlyFrame(map[string]any{}, TruncationFinishReason), ""); werr != nil {
+			return werr
+		}
+		finishSeen = true
 	}
 	// 空流（0 有效帧）：先写一帧 error（绕过 normalizeFrame 原样保留 error 字段），
 	// 再补 [DONE] 保证客户端能正常收尾，并返回非 nil error 供调用方记录。
