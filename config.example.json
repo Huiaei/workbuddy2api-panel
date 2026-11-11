@@ -102,7 +102,7 @@
     "idle_weight_per_hour": 0.5,
     "idle_weight_max": 5.0,
     "prefer_expiring": true,
-    "expiring_soon": "168h",
+    "expiring_soon": "720h",
     "cost_explore_interval": "30m",
     "credit_floor": 100,
     "cross_domain_fallback": false,
