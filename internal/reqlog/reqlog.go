@@ -8,9 +8,12 @@ package reqlog
 
 import (
 	"bufio"
+	"bytes"
 	"crypto/rand"
 	"encoding/json"
 	"fmt"
+	"io"
+	"log"
 	"os"
 	"path/filepath"
 	"sort"
@@ -80,10 +83,10 @@ type Event struct {
 	HasCredit        bool      `json:"credit_known"`
 	// CacheHitTokens / CacheMissTokens 上游前缀缓存命中/未命中 token（issue #92）。
 	// 上游未回该维度时两者皆零值省略；hit=0 + miss>0 即整段未命中。
-	CacheHitTokens  int64 `json:"cache_hit_tokens,omitempty"`
-	CacheMissTokens int64 `json:"cache_miss_tokens,omitempty"`
-	ClientIP         string    `json:"client_ip,omitempty"`
-	UserAgent        string    `json:"user_agent,omitempty"`
+	CacheHitTokens  int64  `json:"cache_hit_tokens,omitempty"`
+	CacheMissTokens int64  `json:"cache_miss_tokens,omitempty"`
+	ClientIP        string `json:"client_ip,omitempty"`
+	UserAgent       string `json:"user_agent,omitempty"`
 	// ToolStall 标记本次请求命中「零 tool_calls 停摆」（issue #149）：请求声明了
 	// tools，模型却只回正文并以 stop 收尾（工具一次没跑）。true = 命中。
 	// ToolStallText 是当时的正文字数（仅观测，不参与判定）。
@@ -536,16 +539,24 @@ func (w *archiveWriter) read(limit int, filter Filter) ([]Event, error) {
 	// os.ReadDir 的字典序又会把装着最早事件的基准文件 requests-<day>.jsonl 排在
 	// requests-<day>.N.jsonl 之后；目录被整体拷贝 / 恢复备份后 mtime 更不可信。
 	var out []Event
+	skippedTotal := 0
 	for _, entry := range entries {
 		name := entry.Name()
 		if entry.IsDir() || !strings.HasPrefix(name, "requests-") || !strings.HasSuffix(name, ".jsonl") {
 			continue
 		}
-		rows, err := readFile(filepath.Join(w.cfg.Dir, name), filter)
+		rows, skipped, err := readFile(filepath.Join(w.cfg.Dir, name), filter)
 		if err != nil {
 			return out, err
 		}
 		out = append(out, rows...)
+		skippedTotal += skipped
+	}
+	if skippedTotal > 0 {
+		// 一条脏行不该让整页失败，但不能悄悄吞掉：汇总成一行日志，便于看出是不是
+		// 开了 logging.request_archive_context、客户端又在请求里带了图片。
+		log.Printf("WARN: [reqlog] 跳过 %d 行超长事件（单行超过 %d 字节）；常见于开启 request_archive_context 且请求带图片",
+			skippedTotal, eventLineMaxBytes)
 	}
 	// 契约：按事件时间倒序返回最近 limit 条（同一时刻用 Stable 保留落盘先后）。
 	sort.SliceStable(out, func(i, j int) bool { return out[i].Time.After(out[j].Time) })
@@ -555,23 +566,86 @@ func (w *archiveWriter) read(limit int, filter Filter) ([]Event, error) {
 	return out, nil
 }
 
-func readFile(path string, filter Filter) ([]Event, error) {
+// eventLineMaxBytes 单条事件行的读取上限。
+//
+// 归档里一行事件通常几百字节；但启用 logging.request_archive_context 时，Event.Context
+// 会带上整轮 system+messages——客户端塞一张 base64 图片就是 1 MB 级（线上实测出现过
+// 1,098,299 字节的单行）。原先用 bufio.Scanner（上限 1<<20）读：超限时 Scan 返回 false、
+// Err() 得到 bufio.ErrTooLong，readFile 把错误原样上抛、read() 立刻中断，结果「一条脏行
+// → 整个请求事件日志页 500」。
+//
+// 现在分两层兜：上限抬到 16 MB（覆盖常见带图请求，这类行仍能正常解析），超过上限的行
+// 只丢该行、不打断同文件里其余事件；丢弃条数在 read() 里汇总成一行日志。
+var eventLineMaxBytes = 16 << 20
+
+// nextLine 从 r 切出下一行（不含行尾换行符）。
+//
+// 与 bufio.Scanner 的差别：某一行过长不会让 reader 报废——超限的部分照样读到换行、
+// 但内容丢弃（tooLong=true），调用方跳过后还能继续读下一行。
+func nextLine(r *bufio.Reader, max int) (line []byte, tooLong bool, err error) {
+	var buf []byte
+	for {
+		chunk, rerr := r.ReadSlice('\n')
+		if !tooLong {
+			if len(buf)+len(chunk) > max {
+				tooLong = true
+				buf = nil // 已经确定要丢，别再累积内存
+			} else {
+				buf = append(buf, chunk...)
+			}
+		}
+		if rerr == bufio.ErrBufferFull {
+			continue // 本行还没结束
+		}
+		if rerr != nil {
+			if rerr == io.EOF {
+				if tooLong {
+					return nil, true, io.EOF
+				}
+				if len(buf) == 0 {
+					return nil, false, io.EOF
+				}
+				return bytes.TrimRight(buf, "\r\n"), false, io.EOF
+			}
+			return nil, tooLong, rerr
+		}
+		if tooLong {
+			return nil, true, nil
+		}
+		return bytes.TrimRight(buf, "\r\n"), false, nil
+	}
+}
+
+// readFile 读一个归档文件，返回事件、跳过的超长行数、错误。
+func readFile(path string, filter Filter) ([]Event, int, error) {
 	f, err := os.Open(path)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	defer f.Close()
-	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 64<<10), 1<<20)
+
+	// 不能再用 bufio.Scanner：它一旦遇到超长行就报废整个 reader（Scan 返回 false、
+	// Err() 得到 bufio.ErrTooLong），没法「跳过这一行接着读」。
+	r := bufio.NewReaderSize(f, 64<<10)
 	var out []Event
-	for scanner.Scan() {
-		var e Event
-		if json.Unmarshal(scanner.Bytes(), &e) != nil || !filter.match(e) {
-			continue
+	skipped := 0
+	for {
+		line, tooLong, err := nextLine(r, eventLineMaxBytes)
+		if tooLong {
+			skipped++
+		} else if len(line) > 0 {
+			var e Event
+			if json.Unmarshal(line, &e) == nil && filter.match(e) {
+				out = append(out, e)
+			}
 		}
-		out = append(out, e)
+		if err != nil {
+			if err == io.EOF {
+				return out, skipped, nil
+			}
+			return out, skipped, err
+		}
 	}
-	return out, scanner.Err()
 }
 
 func (f Filter) match(e Event) bool {
