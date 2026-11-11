@@ -667,3 +667,33 @@ func TestFetchModelsOverlaysV3ConfigCapabilities(t *testing.T) {
 		t.Errorf("Efforts=%v want low,high,max", mi.Efforts)
 	}
 }
+
+// TestClassifyRealChannelRefusedBody 用上游**真实** 11-128 响应体（code 为字符串
+// "11-128"，带连字符）钉住通道校验分流。
+//
+// 护栏来历：上游 PR #233 提交时业务码字面量的连字符丢失（实现与测试同写成
+// 11128），双方自洽所以测试全绿，但线上永远命中不了真实业务码——11-128 会落到
+// ErrClient（不罚号但也不计入通道拒绝的分流语义）。本用例用**字节**构造业务码，
+// 防止「实现和测试一起写错」再次通过。
+//
+// 本 fork 的判定比上游更宽：同时接受带连字符的字符串形态与纯数字形态（上游两种
+// 端点分别吐这两种），故两种形态都必须归 ErrChannelRefused。
+func TestClassifyRealChannelRefusedBody(t *testing.T) {
+	hyphen := string([]rune{49, 49, 45, 49, 50, 56}) // "11-128"（带连字符，字符串形态）
+	digits := string([]rune{49, 49, 49, 50, 56})     // "11128"（纯数字形态）
+
+	for _, code := range []string{hyphen, digits} {
+		body := `{"code":"` + code + `","msg":"request illegal","requestId":"b1bc87ea","displayTips":{"en":"This call failed channel verification."}}`
+		if got := Classify(400, body); got != ErrChannelRefused {
+			t.Fatalf("Classify(real %q)=%v want ErrChannelRefused", code, got)
+		}
+		if got := Classify(403, `{"code":"`+code+`","msg":"request illegal"}`); got != ErrChannelRefused {
+			t.Fatalf("Classify(real %q, 403)=%v want ErrChannelRefused", code, got)
+		}
+		// 数字形态（JSON 里不带引号）也必须命中。
+		numBody := `{"code":` + code + `,"msg":"request illegal"}`
+		if got := Classify(400, numBody); got != ErrChannelRefused {
+			t.Fatalf("Classify(numeric %q)=%v want ErrChannelRefused", code, got)
+		}
+	}
+}
