@@ -561,12 +561,26 @@ func (p *Pool) expiringMultiplier(e *entry, now time.Time) float64 {
 
 // routingWeightOf 在普通账号权重上叠加快过期加权。prefer_expiring=false
 // 或账号无有效快过期批次时，倍率恒为 1，结果与旧 weightOf 完全一致。
+//
+// 第一条不变量：**开启到期加权永不低于关闭时的权重**（纯增益，不反降权）。
+// 这一点在参考实现里是被违反的——那边把余额项压到 creditScale=0.2 再乘紧迫度，
+// 窗口边缘的紧迫度只有 1.5，(1+2)×1.5=4.5 远低于基线 (1+10)=11，于是「落在窗口
+// 最后 22% 里，开了比不开还差」。本实现的倍率恒 ≥ expiringBaseMultiplier(1.5)、
+// 只做乘法，天然不会反降权；这里仍然显式取 max 并加测试钉住这条不变量，避免
+// 将来改成折算口径时把它悄悄破掉。
 func (p *Pool) routingWeightOf(e *entry, maxCredits int64, now time.Time) float64 {
-	w := p.weightOf(e, maxCredits, now)
-	if p.preferExpiring && expiringNow(e, now) {
-		return w * p.expiringMultiplier(e, now)
+	normal := p.weightOf(e, maxCredits, now)
+	if !p.preferExpiring {
+		return normal
 	}
-	return w
+	if !expiringNow(e, now) {
+		return normal
+	}
+	boosted := normal * p.expiringMultiplier(e, now)
+	if boosted < normal {
+		return normal
+	}
+	return boosted
 }
 
 // SetCredits 更新账号余额。
