@@ -1002,6 +1002,16 @@ func (w *responsesWriter) handleFrame(frame string) error {
 		_ = w.closeOpenItems()
 		return w.emitCompleted()
 	}
+	// SSE 注释帧（上游 ": heartbeat"、本层 ": keepalive"）：协议规定的 no-op，
+	// 但**必须透传给客户端**——它的唯一作用就是让连接「有字节流动」，吞掉等于
+	// 把上游的保活变成客户端可见的静默，CodeBuddy/Codex 的 stream idle 超时
+	// 会据此掐线（实测日志里 14 次 interrupted 与 8 次「段无 finish 结束」
+	// 时间上重合）。
+	//
+	// 注释不占 sequence_number（对事件序无感知），也不进事件流。
+	if strings.HasPrefix(frame, ":") {
+		return w.emitRaw(frame + "\n\n")
+	}
 	payload, ok := strings.CutPrefix(frame, "data: ")
 	if !ok {
 		return nil
@@ -1470,13 +1480,21 @@ func (w *responsesWriter) emitCompleted() error {
 	if w.x.status == "incomplete" {
 		typ, status = "response.incomplete", "incomplete"
 	}
+	// output 不能是 nil：Go 的 nil 切片会序列化成 null，而 Responses 客户端
+	// （CodeBuddy/Codex）拿到 completed 后会对 output 做 .map —— null 直接崩
+	// （实测 "Cannot read properties of null (reading 'map')"）。空输出是合法
+	// 响应（模型只思考不输出、或全部增量被上游吞掉），必须落成 []。
+	output := w.x.output
+	if output == nil {
+		output = []any{}
+	}
 	resp := map[string]any{
 		"id":         respID(w.x.id),
 		"object":     "response",
 		"status":     status,
 		"created_at": w.x.createdAt,
 		"model":      w.x.model,
-		"output":     w.x.output,
+		"output":     output,
 	}
 	if w.x.incompleteDetails != nil {
 		resp["incomplete_details"] = w.x.incompleteDetails
@@ -1503,6 +1521,24 @@ func (w *responsesWriter) emitFailed(errObj any) error {
 			"error":  errObj,
 		},
 	})
+}
+
+// emitRaw 原样写一段 SSE（注释帧等无语义载荷）：不进事件序号、不改写内容，
+// 只负责确保响应头已提交并 Flush。
+func (w *responsesWriter) emitRaw(s string) error {
+	if !w.hdrSent {
+		h := w.Header()
+		h.Set("Content-Type", "text/event-stream")
+		h.Set("Cache-Control", "no-cache")
+		h.Set("Connection", "keep-alive")
+		w.hdrSent = true
+		w.status = http.StatusOK
+	}
+	if _, err := io.WriteString(w.ResponseWriter, s); err != nil {
+		return err
+	}
+	w.Flush()
+	return nil
 }
 
 func (w *responsesWriter) emit(typ string, payload map[string]any) error {

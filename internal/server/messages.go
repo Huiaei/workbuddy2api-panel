@@ -841,6 +841,13 @@ func (w *messagesWriter) handleFrame(frame string) error {
 	if strings.HasPrefix(frame, "data: [DONE]") {
 		return w.closeAndStop()
 	}
+	// SSE 注释帧（上游 ": heartbeat"、本层 ": keepalive"）：协议规定的 no-op，
+	// 但**必须透传给客户端**——它的唯一作用就是让连接「有字节流动」，吞掉等于
+	// 把上游保活变成客户端可见的静默，客户端的 stream idle 超时会据此掐线。
+	// 注释不占事件下标（对事件序无感知）。
+	if strings.HasPrefix(frame, ":") {
+		return w.emitRaw(frame + "\n\n")
+	}
 	payload, ok := strings.CutPrefix(frame, "data: ")
 	if !ok {
 		return nil
@@ -1185,6 +1192,24 @@ func (w *messagesWriter) emitError(msg, typ string) error {
 	return w.emit("error", map[string]any{
 		"error": map[string]any{"type": typ, "message": msg},
 	})
+}
+
+// emitRaw 原样写一段 SSE（注释帧等无语义载荷）：不进事件序号、不改写内容，
+// 只负责确保响应头已提交并 Flush。
+func (w *messagesWriter) emitRaw(s string) error {
+	if !w.hdrSent {
+		h := w.Header()
+		h.Set("Content-Type", "text/event-stream")
+		h.Set("Cache-Control", "no-cache")
+		h.Set("Connection", "keep-alive")
+		w.hdrSent = true
+		w.status = http.StatusOK
+	}
+	if _, err := io.WriteString(w.ResponseWriter, s); err != nil {
+		return err
+	}
+	w.Flush()
+	return nil
 }
 
 func (w *messagesWriter) emit(event string, payload map[string]any) error {
