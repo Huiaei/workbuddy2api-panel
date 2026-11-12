@@ -923,6 +923,15 @@ readLoop:
 			if _, werr := io.WriteString(w, line); werr != nil {
 				return werr
 			}
+			// 末行可能没有换行（EOF 截断），先补齐行尾换行，再补帧分隔空行。
+			if !strings.HasSuffix(line, "\n") {
+				if _, werr := io.WriteString(w, "\n"); werr != nil {
+					return werr
+				}
+			}
+			if _, werr := io.WriteString(w, "\n"); werr != nil {
+				return werr
+			}
 			if fl != nil {
 				fl.Flush()
 			}
