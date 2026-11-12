@@ -812,9 +812,36 @@ func StreamHint(w http.ResponseWriter, r io.Reader, hintFn func(string) string, 
 
 	// writeFrame 把 payload 按规范白名单重建后以 data: 帧写出并 flush。
 	// 仅 JSON 解析成功时计数记为一次有效转发（JSON 解析失败照常降级原样写出，但不计数）。
-	writeFrame := func(payload string) (int, error) {
+	//
+	// 声明成可递归（先 var 后赋值）：上游偶发把两个 JSON chunk 粘进同一行 data
+	// （"data: {a} {b}"）。客户端按 SSE 规范把整行当**一份** JSON 解析，必然报
+	// "Unexpected non-whitespace character after JSON at position N"，整轮作废。
+	// 这里在解析失败时先尝试把粘连的 JSON 拆开，逐段递归走正常路径（拆出来的段
+	// 理论上还可能再粘帧，递归兜住；splitConcatenatedJSON 的 maxSplitParts 段数
+	// 上限同时限制了膨胀规模）。
+	var writeFrame func(payload string) (int, error)
+	writeFrame = func(payload string) (int, error) {
 		var obj map[string]any
 		if json.Unmarshal([]byte(payload), &obj) != nil {
+			// 粘帧修复：整行解析失败时，先看能不能切成多段**完整** JSON。
+			// 切不动（返回 1 段）⇒ 走下面的原样透传路径，行为与修复前一致。
+			if parts := splitConcatenatedJSON(payload); len(parts) > 1 {
+				log.Printf("WARN: [upstream] data 帧内含 %d 个 JSON 对象（上游粘帧）→ 拆成独立帧透传，首个 %.120q", len(parts), truncate(parts[0], 120))
+				n := 0
+				for _, part := range parts {
+					c, werr := writeFrame(part)
+					if werr != nil {
+						return n, werr
+					}
+					n += c
+				}
+				return n, nil
+			}
+			// 长得像 JSON 却解析不出来（被截断 / 字段损坏）：告警后原样透传，
+			// 不计数。长得不像 JSON（少数上游在 data 里塞纯文本）不告警。
+			if looksLikeJSON(payload) {
+				log.Printf("WARN: [upstream] data 帧不是合法 JSON → 原样透传 %.160q", truncate(payload, 160))
+			}
 			// 非 JSON 帧：原样降级写出，不计数（与修复前一致）。
 			if werr := writeSSE(payload); werr != nil {
 				return 0, werr
@@ -883,7 +910,16 @@ readLoop:
 				return werr
 			}
 		case trimmed != "":
-			// 注释/其他行：原样透传
+			// 注释/其他行：原样透传，并**补回帧分隔空行**。
+			//
+			// 背景：上游 workbuddy.cn 的 SSE 不规范——注释帧（如 ": heartbeat"）后面
+			// 不发空行就直接跟下一条 data 帧。本函数会吞掉所有空行（自己按 "\n\n"
+			// 产帧分隔），于是注释行只带一个 "\n" 写出去，下一条 data 帧就被粘成
+			// 同一个块（": heartbeat\ndata: {...}"）。下游按 "\n\n" 切块后拿到的块
+			// 没有 "data: " 前缀 → 整帧被丢弃（客户端表现为工具调用首帧消失、
+			// output 变 null）。
+			//
+			// 补一个 "\n" 即让注释帧成为合法的 "\n\n" 分隔帧，后续 data 帧不再被粘。
 			if _, werr := io.WriteString(w, line); werr != nil {
 				return werr
 			}
