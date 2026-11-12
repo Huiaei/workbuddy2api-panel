@@ -21,45 +21,68 @@ import (
 // reportPath 活跃上报通道（实测）。
 const reportPath = "/v2/report"
 
-// billingJSON 发 billing 域（billingBase，codebuddy.cn）请求并解信封；body 为 nil 时不带请求体。
-// 与 travel.go 的 growthJSON 对称（growth 域走 chatBase + BillingHeaders；billing 域走 billingBase）。
-// report/checkin 等 billing 端点共用：请求头统一 BillingHeaders，信封与错误语义同 doJSON。
-func (c *Client) billingJSON(a *auth.Auth, method, path string, body any) (json.RawMessage, error) {
+// billingJSONRaw 同 billingJSON，另外把信封与**原始响应体**一并交回。
+// 为什么需要：daily-checkin 的成功回执是**平铺**的（没有 {code,msg,data} 信封），
+// 只交 env.Data 会拿到 null，积分数就丢了（见 checkin_receipt.go 头注释）。
+func (c *Client) billingJSONRaw(a *auth.Auth, method, path string, body any) (apiEnvelope, []byte, error) {
 	var rdr io.Reader
 	if body != nil {
 		raw, err := json.Marshal(body)
 		if err != nil {
-			return nil, err
+			return apiEnvelope{}, nil, err
 		}
 		rdr = bytes.NewReader(raw)
 	}
 	req, err := http.NewRequest(method, c.billingBase(a)+path, rdr)
 	if err != nil {
-		return nil, err
+		return apiEnvelope{}, nil, err
 	}
 	c.BillingHeaders(req, a)
-	return c.doJSON(req)
+	return c.doJSONRaw(req)
+}
+
+// billingJSON 发 billing 域（billingBase，codebuddy.cn）请求并解信封；body 为 nil 时不带请求体。
+// 与 travel.go 的 growthJSON 对称（growth 域走 chatBase + BillingHeaders；billing 域走 billingBase）。
+// report/checkin 等 billing 端点共用：请求头统一 BillingHeaders，信封与错误语义同 doJSON。
+func (c *Client) billingJSON(a *auth.Auth, method, path string, body any) (json.RawMessage, error) {
+	env, _, err := c.billingJSONRaw(a, method, path, body)
+	return env.Data, err
 }
 
 // billingMeterJSON 仅对 /billing/meter 族端点（get-user-resource / daily-checkin）
 // 按 realm 走双路径 fallback：global 先无 /v2 前缀，ErrNotFound 时二次换有 /v2 前缀
 // （上游新旧路径分叉）；cn 单路径（有 /v2）现状不变。仅 global realm 才有多路径。
 func (c *Client) billingMeterJSON(a *auth.Auth, paths []string, method string, body any) (json.RawMessage, error) {
-	var lastErr error
+	env, _, err := c.billingMeterRaw(a, paths, method, body)
+	return env.Data, err
+}
+
+// billingMeterRaw 同 billingMeterJSON，另外把信封与原始 body 一并交回（签到回执要用
+// 平铺 body 里的 credit，见 checkin_receipt.go）。
+func (c *Client) billingMeterRaw(a *auth.Auth, paths []string, method string, body any) (apiEnvelope, []byte, error) {
+	var (
+		lastErr error
+		lastRaw []byte
+	)
 	for i, path := range paths {
-		data, err := c.billingJSON(a, method, path, body)
+		env, raw, err := c.billingJSONRaw(a, method, path, body)
 		if err == nil {
-			return data, nil
+			return env, raw, nil
 		}
-		lastErr = err
+		lastErr, lastRaw = err, raw
 		// 仅 404 换路径（路径不存在才值得 fallback）；其他错误直接返回。
 		var ue *Error
 		if !errors.As(err, &ue) || ue.Kind != ErrNotFound || i == len(paths)-1 {
-			return nil, err
+			return env, raw, err
 		}
 	}
-	return nil, lastErr
+	return apiEnvelope{}, lastRaw, lastErr
 }
+
+// billingProcessingMarkers 上游表示「请求处理中」的文案（中英双形态）。
+// 这是**临时状态**而非终态失败：签到/余额查询偶发命中，沉降后重试即可，
+// 因此回执层把它归成 pending（checkin_receipt.go），不落盘、不算拒签。
+var billingProcessingMarkers = []string{"请求处理中", "request is being processed", "request processing"}
 
 // billingRetryDelay 签到/余额等维护类计费调用瞬时错误重试的间隔基数。
 // 独立变量供测试缩短（生产固定 2s：第 1 次重试等 2s、第 2 次等 4s）。

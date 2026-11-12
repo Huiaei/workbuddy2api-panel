@@ -493,7 +493,7 @@ function renderAccounts(list) {
         // 国际区（global）账号无国内区签到体系，同样不渲染「签到」（#104）；但其
         // 「任务」按钮保留——国际区任务仅支持查询（写操作由后端返回 501 提示）。
         (noGrowthUI ? '' :
-          '<button class="xs ghost" data-a="checkin" data-u="' + esc(s.uid) + '"' + (s.checkin_done ? ' title="今日已签到；点击可重新签到并刷新余额"' : '') + '>' + (s.checkin_done ? '已签' : '签到') + '</button>') +
+          '<button class="xs ghost" data-a="checkin" data-u="' + esc(s.uid) + '"' + (s.checkin_done ? ' title="今日已签到：重复签发不了积分，点击只是重查状态并刷新余额"' : '') + '>' + (s.checkin_done ? '已签' : '签到') + '</button>') +
         '<button class="xs ghost" data-a="balance" data-u="' + esc(s.uid) + '"' + (noGrowth ? ' title="刷新企业版已分配额度（上游 get-enterprise-user-usage）"' : '') + '>' + (noGrowth ? '额度' : '余额') + '</button>' +
         (noGrowth ? '' :
           '<button class="xs ghost" data-a="tasks" data-u="' + esc(s.uid) + '">任务</button>') +
@@ -1727,19 +1727,27 @@ let taskJobsLoading = false;
 // 服务端状态与界面反馈共用的纯函数，避免把已提交/失败当成已完成。
 function checkinResultNote(r) {
   if (r.skipped) return { message: r.skip_reason || '该账号不适用签到', severity: '' };
-  const balance = r.credits != null ? '，积分 ' + r.credits + (r.credits_total > 0 ? '/' + r.credits_total : '') : '';
-  // balance_error 优先于 checkin_done 判断：企业账号没有签到体系
-  // （checkin_done 恒为 false、checkin_error 是固定的解释性文案），若先判
-  // checkin_done，用户永远只看到「签到未完成：企业账号无签到体系…」，**看不到
-  // 余额查询真正失败的原因**（例如上游返回 data:null → 「余额刷新失败」）。
-  if (r.balance_error) return { message: '余额刷新失败：' + r.balance_error, severity: 'err' };
-  // 跳过态（企业账号无签到体系）：**不是错误**。后端已用 checkin_skipped 显式
-  // 标记；此处也要兜住「后端还没升、只有 checkin_message 的企业号」——
-  // 否则健康的企业账号会被渲染成「签到未完成」红色报错。
-  if (r.checkin_skipped) return { message: (r.checkin_message || '该账号不适用签到') + balance, severity: '' };
+  const balance = r.credits != null ? '，当前积分 ' + r.credits + (r.credits_total > 0 ? '/' + r.credits_total : '') : '';
+  const state = r.checkin_state || (r.checkin_done ? 'checked' : 'failed');
+  // 跳过态（企业版 / 静态 API Key 无签到体系）**不是错误**：后端已用
+  // checkin_skipped + checkin_state=skipped 显式标记；这里同时兜住「后端还没升、
+  // 只有 checkin_message 的企业号」——否则健康账号会被渲染成红色「签到未完成」。
+  if (state === 'skipped' || r.checkin_skipped) return { message: (r.checkin_message || r.skip_reason || '该账号不适用签到') + balance, severity: '' };
+  // 兜底：后端还没升级（响应里没有 checkin_skipped / checkin_state）时，只要是企业号
+  // + 只有解释性文案、没有真错误，也不该渲染成 err —— 否则一排健康的企业账号全红。
   if (r.enterprise && !r.checkin_error && r.checkin_message) return { message: r.checkin_message + balance, severity: '' };
-  if (!r.checkin_done) return { message: '签到未完成：' + (r.checkin_error || r.checkin_message || '请稍后重试') + balance, severity: 'err' };
-  return { message: '签到已完成' + balance, severity: 'ok' };
+  if (state === 'already') return { message: '今天已签到，无需重复，上游不会再发积分' + balance, severity: '' };
+  if (state === 'pending') return { message: '签到未完成：上游还在处理，稍后重试' + balance, severity: 'warn' };
+  if (state !== 'checked') {
+    // balance_error 优先于「签到未完成」：企业账号没有签到体系（checkin_done 恒
+    // false、checkin_error 是固定的解释性文案）时，若先报签到，用户永远看不到
+    // 余额查询真正失败的原因（例如上游返回 data:null → 「余额刷新失败」）。
+    if (r.balance_error) return { message: '余额刷新失败：' + r.balance_error, severity: 'err' };
+    return { message: '签到未完成：' + (r.checkin_error || r.checkin_message || '请稍后重试') + balance, severity: 'err' };
+  }
+  const gain = typeof r.checkin_credit === 'number' ? '，+' + r.checkin_credit + ' 积分' : '';
+  if (r.balance_error) return { message: '签到成功' + gain + '；余额刷新失败：' + r.balance_error, severity: 'err' };
+  return { message: '签到成功' + gain + balance, severity: 'ok' };
 }
 
 function taskOutcomeStatus(item) {

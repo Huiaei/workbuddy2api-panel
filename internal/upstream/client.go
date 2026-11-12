@@ -1397,6 +1397,44 @@ func (c *Client) webBase(a *auth.Auth) string {
 	return "https://www.workbuddy.cn"
 }
 
+// doJSONRaw 同 doJSON，另外把解析出的信封与**原始响应体**一并交回。
+//
+// 为什么需要：签到回执的成功体是**平铺**的（`{"credit":100,"streak_days":44}`，没有
+// {code,msg,data} 信封），只交 env.Data 会拿到 null，积分数直接丢失；失败回执的 HTTP
+// 状态是 400，本函数在 >=400 时不解信封（与 doJSON 同口径），code/msg 也只能从 raw 读。
+// 两条都只有原始 body 能救，所以回执层（checkin_receipt.go）必须拿到它。
+func (c *Client) doJSONRaw(req *http.Request) (apiEnvelope, []byte, error) {
+	var env apiEnvelope
+	resp, err := c.do(req, false)
+	if err != nil {
+		return env, nil, err
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return env, nil, fmt.Errorf("read body: %w", err)
+	}
+	// 必须在 Classify / Unmarshal 之前解压：这两步都按文本处理 raw。
+	if raw, err = decodeResponseBody(resp, raw); err != nil {
+		return env, nil, err
+	}
+	if resp.StatusCode >= 400 {
+		kind := Classify(resp.StatusCode, string(raw))
+		return env, raw, &Error{Kind: kind, Status: resp.StatusCode, Msg: truncate(string(raw), 200)}
+	}
+	if err := json.Unmarshal(raw, &env); err != nil {
+		return env, raw, fmt.Errorf("parse failed: %w (body: %s)", err, truncate(string(raw), 120))
+	}
+	if env.Code != 0 {
+		kind := Classify(resp.StatusCode, env.Msg)
+		if kind == ErrNone {
+			kind = ErrClient
+		}
+		return env, raw, &Error{Kind: kind, Status: resp.StatusCode, Msg: fmt.Sprintf("code=%d msg=%s", env.Code, truncate(env.Msg, 160))}
+	}
+	return env, raw, nil
+}
+
 // doJSON 发请求并解信封；HTTP 非 2xx 或业务 code != 0 时返回带 body 片段的 *Error。
 // body 读失败（连接中断/空闲掐流/截断）返回普通错误（非 *Error）——半截 body 不进
 // Classify，不参与账号惩罚（传输层故障不该喂熔断误罚号）。
@@ -3226,11 +3264,11 @@ func packageRemainUsed(a respAccount) (remain, used, size int64) {
 // DailyCheckin 执行每日签到。已签到（业务 code 非 0）也返回错误，调用方按 msg 区分。
 // 偶发上游 5xx（code 10000）做有界重试（见 retryBillingTransient）——单次抖动不再
 // 让该账号整天漏签；「已签到」等业务错误不重试。
+// 需要区分「本次真签到 / 今天早就签过」的调用方用 CheckinReceipt，本函数只保留
+// error 语义给不关心回执的老调用方（调度器 / CLI）。
 func (c *Client) DailyCheckin(a *auth.Auth) error {
-	return c.retryBillingTransient(func() error {
-		_, err := c.billingMeterJSON(a, c.checkinMeterPaths(a), http.MethodPost, map[string]any{})
-		return err
-	})
+	_, err := c.CheckinReceipt(a)
+	return err
 }
 
 // IsAlreadyCheckin 报告 err 是否表示"今天已签到"（上游幂等拒绝重复签到）。
