@@ -17,6 +17,13 @@ import (
 // acceptBatchGap 批量接受的批间节流（对齐脚本 1.05s 口径，避免上游风控）。
 var acceptBatchGap = 1050 * time.Millisecond
 
+// noPersonalTaskMessage 账号无个人成长体系（企业版 / 静态 API Key）时的统一文案。
+//
+// 上游成长任务端点对这类账号直接 403「growth system is only available for
+// personal users」，行为事件（/v2/report）也会被静默丢弃——跑了也是零收益，
+// 还白耗真实对话配额。凡是能触发成长任务的地方都应先过这道门。
+const noPersonalTaskMessage = "该账号无个人成长体系（企业版或静态 API Key），不支持成长任务"
+
 // accountByUID 取账号凭证；不存在时写 404 并返回 nil。
 func (p *Panel) accountByUID(w http.ResponseWriter, uid string) *auth.Auth {
 	a := p.cfg.Pool.AuthByUID(uid)
