@@ -45,7 +45,7 @@ import (
 // 1.14.1-panel = 吸收上游停更后与报告者 fork（misakano7545）的新修复：11134 供应商
 // 过载不再误罚账号、请求级错误不再解绑会话粘性、SSE 断流补截断终态与粘帧拆分、
 // 企业版账号不再空跑成长任务、快过期加权保底等。
-const appVersion = "1.14.1-panel"
+const appVersion = "1.14.2-panel"
 
 // usagePathFor 由 state 文件路径推出用量文件路径：同目录、文件名 usage.json。
 // 这样 config 里改 state_file 时用量数据跟着走，不需要额外配置项。

@@ -328,7 +328,7 @@ WorkBuddy2API 是一个自托管的 **OpenAI 兼容反向代理网关**，将腾
 | 来源 | 合并了什么 | 现在在哪 |
 |---|---|---|
 | 报告者 fork（`misakano7545/workbuddy2api-panel`） | 官方客户端出站指纹对齐（双版本真机抓包）、首条消息恒为 system、企业额度「不限量」哨兵不污染权重、突发积分与低缓存率两道快速闸、14003 模型繁忙独立短窗口 | `internal/upstream/headers.go`、`internal/prompt/prompt.go`、`internal/pool/`、`internal/server/budget*.go` |
-| 报告者 fork（2026-11-01 之后的 fix 批次） | 11134 供应商过载归通道繁忙、请求级错误不解绑会话粘性、SSE 断流补截断终态 / 粘帧拆分 / 心跳注释帧换行、企业版不空跑成长任务、任务中心不显示幽灵账号作业、`web_search_result` 补齐 `encrypted_content`、签到回显真实 realm、快过期加权保底、请求日志超长行不再读不出来 | `internal/upstream/client.go`、`internal/upstream/sse.go`、`internal/server/handler.go`、`internal/panel/`、`internal/reqlog/`、`internal/pool/pick.go` |
+| 报告者 fork（2026-11-01 之后的 fix 批次） | 11134 供应商过载归通道繁忙、请求级错误不解绑会话粘性、SSE 断流补截断终态 / 粘帧拆分 / 心跳注释帧换行、企业版不空跑成长任务、任务中心不显示幽灵账号作业、`web_search_result` 补齐 `encrypted_content`、签到回显真实 realm、快过期加权保底、请求日志超长行不再读不出来、**上游服务端注入的身份指令（`identify yourself as …` / `<model_identity>`）回流清洗**（issue #187）、积分耗尽提示不再对国际版账号承诺「等签到恢复」 | `internal/upstream/client.go`、`internal/upstream/sse.go`、`internal/upstream/sanitize.go`、`internal/upstream/hint.go`、`internal/server/handler.go`、`internal/panel/`、`internal/reqlog/`、`internal/pool/pick.go` |
 | 本项目 `fix/all-known-issues-v1.13.0` 分支 | 早先基于上游 `main` 做的 200+ 项修复中的**自研部分**（错误分类、账号池、面板可观测性、Windows 落盘加固） | 已全部并入本分支；该分支不再单独维护 |
 | 本项目 `feat/rebase-on-main` 分支 | Codex Responses / Anthropic Messages 原生协议与官方检索透传 | `4db668d` → `internal/server/responses.go`、`messages.go` |
 | 本项目 `sweep/*` 分支（7 条） | #104 后台任务+计费、#213 搜索端点、#237/#238 优惠与试用熔断、#244 临期刷新 | 已全部并入；这些分支**零独有提交** |

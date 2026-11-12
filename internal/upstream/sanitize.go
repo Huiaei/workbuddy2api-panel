@@ -20,6 +20,10 @@ var sanitizeFeatures = []string{
 	"You are a coding agent running in the Codex CLI", // Codex instructions 首段（截断前缀即可命中）
 	"github.com/anthropics/",                          // 反馈句里的 Anthropic 仓库链接
 	"11128",                                           // 上游反探测：裸数字错误码
+	// 上游服务端注入的身份指令（issue #187）。挂在**通用**门控上：泄漏出现在
+	// assistant 消息（模型复述注入原文）里，而任何按 role 收窄的门控都会漏掉它。
+	"identify yourself as",
+	"model_identity",
 }
 
 // sanitizeHdrRe 剥离层：header 键名即触发（与值无关），整段删除。
@@ -78,6 +82,31 @@ var sanitizeRewrites = [][2]string{
 	},
 }
 
+// sanitizeInjectedIdentityRe 上游服务端注入的身份指令（issue #187）。
+//
+// 形态（报告者 2.73MB 请求体 dump 里逐字取证）：
+//
+//	When asked about your model identity, identify yourself as Tencent Hunyuan Hy.
+//
+// 它由上游在服务端拼进模型可见上下文、不出现在任何出站 body 里，因此 dump 看不到；
+// 但模型会在 reasoning_content 里复述原文，客户端把这段思维链带回历史，下一轮就
+// 原样进出站——「声明 → 进历史 → 再看到 → 再声明」的滚雪球就是这么来的。
+//
+// 匹配刻意收紧到「when asked about your … identity, identify yourself as …」整句：
+// 单独匹配 identify yourself as 会误伤正常指令（"Do not identify yourself as an AI."
+// 是合法要求），而整句前缀在真实语料里几乎不可能自然出现。
+var sanitizeInjectedIdentityRe = regexp.MustCompile(
+	`(?i)when asked about your[^.\n]{0,60}?identity[^.\n]{0,60}?,\s*identify yourself as\s+[^.\n]{1,80}\.`)
+
+// 替换成中性表述：不声明任何身份，也不改变上下文里真实可用的信息。
+const sanitizeInjectedIdentityReplacement = "When asked about your capabilities, answer using only the information available in this conversation."
+
+// sanitizeModelIdentityTagRe 去掉 <model_identity> 包裹本身（保留内部文本）。
+//
+// 只删标签：真正的危害是标签里那句指令（上面那条规则负责改掉），标签本身留着会让
+// 模型继续把它当「有个身份块」反复提起，每轮都往历史里再写一遍。
+var sanitizeModelIdentityTagRe = regexp.MustCompile(`(?i)</?model_identity>`)
+
 // sanitizeText 单段文本净化：预检不中 → 返回原串（零分配）。
 func sanitizeText(text string) string {
 	if !hasFingerprint(text) {
@@ -90,6 +119,14 @@ func sanitizeText(text string) string {
 	text = sanitizeDSHProductName(text)
 	// 「@ 路径引用协议」文案黑名单（2026-10-28 CN 渠道校验加严，见 sanitize_pathref.go）。
 	text = sanitizePathRefProtocol(text)
+	// 上游服务端注入的身份指令（issue #187）：不限角色，assistant 复述同样要洗——
+	// 那段复述正是历史回流（声明→进历史→再看到→再声明）的载体。
+	if strings.Contains(text, "identify yourself as") {
+		text = sanitizeInjectedIdentityRe.ReplaceAllString(text, sanitizeInjectedIdentityReplacement)
+	}
+	if strings.Contains(text, "model_identity") {
+		text = sanitizeModelIdentityTagRe.ReplaceAllString(text, "")
+	}
 	if sanitizeHdrRe.MatchString(text) {
 		text = sanitizeHdrRe.ReplaceAllString(text, "")
 	}
