@@ -328,6 +328,7 @@ WorkBuddy2API 是一个自托管的 **OpenAI 兼容反向代理网关**，将腾
 | 来源 | 合并了什么 | 现在在哪 |
 |---|---|---|
 | 报告者 fork（`misakano7545/workbuddy2api-panel`） | 官方客户端出站指纹对齐（双版本真机抓包）、首条消息恒为 system、企业额度「不限量」哨兵不污染权重、突发积分与低缓存率两道快速闸、14003 模型繁忙独立短窗口 | `internal/upstream/headers.go`、`internal/prompt/prompt.go`、`internal/pool/`、`internal/server/budget*.go` |
+| 报告者 fork（2026-11-01 之后的 fix 批次） | 11134 供应商过载归通道繁忙、请求级错误不解绑会话粘性、SSE 断流补截断终态 / 粘帧拆分 / 心跳注释帧换行、企业版不空跑成长任务、任务中心不显示幽灵账号作业、`web_search_result` 补齐 `encrypted_content`、签到回显真实 realm、快过期加权保底、请求日志超长行不再读不出来 | `internal/upstream/client.go`、`internal/upstream/sse.go`、`internal/server/handler.go`、`internal/panel/`、`internal/reqlog/`、`internal/pool/pick.go` |
 | 本项目 `fix/all-known-issues-v1.13.0` 分支 | 早先基于上游 `main` 做的 200+ 项修复中的**自研部分**（错误分类、账号池、面板可观测性、Windows 落盘加固） | 已全部并入本分支；该分支不再单独维护 |
 | 本项目 `feat/rebase-on-main` 分支 | Codex Responses / Anthropic Messages 原生协议与官方检索透传 | `4db668d` → `internal/server/responses.go`、`messages.go` |
 | 本项目 `sweep/*` 分支（7 条） | #104 后台任务+计费、#213 搜索端点、#237/#238 优惠与试用熔断、#244 临期刷新 | 已全部并入；这些分支**零独有提交** |
@@ -354,6 +355,8 @@ WorkBuddy2API 是一个自托管的 **OpenAI 兼容反向代理网关**，将腾
 | 判据来源 | 混用 `displayMsg` / `displayTips` | **只看主文案**（`body.msg` → `body.error.message` → `body.error.msg` → `body.message`）。此前用 `displayMsg` 判「安全策略拦截」会让**整个网关降级到次日 0 点** |
 | 流式 SSE error 帧 | 丢业务码 → 健康账号被误降级 10 分钟 | error 帧分类**保留完整业务信封**（含 `displayMsg` / `displayTips`） |
 | `6021` / `queue.full` | 池级冷却 | 渠道级忙碌 + 透传上游 `Retry-After`（**不伪造**） |
+| `11134`「模型供应商过载」（上游回 5xx + 业务码 `11134`） | 归 `ErrServer` → 喂熔断计数 → **同一批健康账号被供应商抖动集体打进 30 分钟冷却** | 归**通道级繁忙**（不罚账号、不换号、不解绑粘性）；等待口径优先读响应头 `Retry-After`，缺失时回落到 body 里的 `retry_policy.retry_after` |
+| 内容拦截 / prompt 超长 / 图片无效 / 参数错（**请求级**错误） | 释放在途租约的同时**解绑会话粘性** ⇒ 客户端重试换号 ⇒ 账号级前缀缓存从零重算（首字延迟 3~4 秒 → 10~20 秒），观感是「报错一次缓存就永远不生效」 | 只释放在途租约，**保留粘性绑定**（同 body 换任何账号都会撞同样的上游判定，换号没有意义） |
 
 #### 模型目录与优惠
 
@@ -448,6 +451,9 @@ DSH 的系统提示词第 23 行恰好逐字描述了同一套 @ 协议（`@` �
 - **燃尽熔断（burn guard）**：按时间窗的花费速率熔断；面板显示燃尽状态；
   「解冻」会一并清除熔断。
 - **软冷却到期后不再透出过期 reason**（修面板「可用 + 历史 429」并排）。
+- **快过期加权是纯增益**：`pool.prefer_expiring` 的加权后权重**永不低于**未加权时的基线
+  （倍率恒 ≥ 1.5 且只做乘法），不会出现「开了比不开还差」；默认窗口放宽到
+  `expiring_soon = 720h`（30 天）——奖励积分批次普遍排在 2~4 周后，7 天窗口常常一个号都不命中。
 - **402 硬冷却的到期时间跟上游时区走**，不跟部署机器本地时区。
 - **12153 连续 3 次才禁用**（与调度器口径一致），不再一次就封。
 
@@ -470,6 +476,12 @@ tmp + rename 把它当致命错误 ⇒ **后台任务状态在 Windows 上永远
 - **始终发送 `X-Conversation-ID`**（空则随机 32 hex），对齐官方客户端。
 - **裸模型名跨域回退**（默认关闭）。
 - **同账号 refresh 单飞**，避免并发刷新复用已消费的 RT 撞 12153 掉登录。
+- **SSE 断流不再伪装成正常收尾**：上游中途断流时补一个 `finish_reason=length` 的终态帧
+  （Responses 侧映射成 `response.incomplete`，Messages 侧映射成 `stop_reason=max_tokens`），
+  不再把半截内容当成「正常结束」。
+- **上游粘帧不再整轮作废**：一行 `data:` 里塞了多个 JSON 对象时逐个拆开透传
+  （最多 64 段，残缺则整行放弃拆分）；心跳注释帧补回帧分隔空行，不再把紧随其后的
+  data 帧粘走；注释帧原样透传给客户端，不占事件序号。
 - **`/v1/search` 与 `/v1/search/messages`** 搜索端点，且**计入在途租约**（不绕过 `max_in_flight`）。
 
 #### 可观测性
@@ -1044,6 +1056,19 @@ curl -s http://127.0.0.1:7863/v1/chat/completions \
 | `GET /activity/growth/*`（连登 / 旅行 / 热力图 / 抽奖）与 `GET /v2/activity/growth/tasks`（成长任务） | `403`「growth system is only available for personal users」 |
 
 因此网关对企业号**不发起**这五类调用（签到 / 活跃上报 / 猫猫旅行 / 夜猫子 / 连登管家），面板也不渲染「签到」「任务」按钮（只留「额度」）。判定（`auth.Auth.IsEnterprise()`）与既有 `IsGlobal()`（D4 门控）在**同一批引用处并列书写**，`upstream` 侧零改动。
+
+**后台成长任务同样跳过**：每日排程（`RunGrowthQueueOnce`）、新账号自动任务（`StartNewAccountTasks`）、
+进程恢复（`ResumeTaskJobs`）三处的共同入口 `StartAccountTaskJob` 与统一执行器
+`executeAutoTask` / `runAutoAllObserved` 都补了「无个人成长体系」的闸（企业版 /
+静态 API Key）。此前这三条路径只判了 `IsGlobal`，于是企业版账号每天都会被排上
+成长任务作业并真实打上游——上游直接 403、行为事件还会被静默丢弃，**零收益还白耗
+真实对话配额**，界面上却只看到任务一直 `0/x`、没有任何报错。手动入口返回 `422`
+并说明原因。
+
+**cockpit 导入的企业号识别**：导入文件里的 `enterprise_id`（snake_case）或
+`enterpriseId`（camelCase）任一带值即识别为企业版；导入时跳过企业号的 CN 签到
+（上游对企业号直接 `400 code 10001`），额度查询照常（企业额度走
+`get-enterprise-user-usage` 口径）。
 
 **企业版照常的能力**：选号派发、保活（token 刷新仍必需——不刷新同样会过期失效）、额度查询。
 
