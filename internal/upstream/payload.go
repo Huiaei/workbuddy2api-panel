@@ -80,6 +80,15 @@ func PrepareBodyOptWithEffortsAndDefault(src []byte, sanitize bool, efforts map[
 	// DeepSeek 多轮一致性：assistant 消息带 reasoning 痕迹时回填 reasoning_content
 	// （requiresReasoningContentOnAssistantMessages，见 thinking.go）。
 	backfillReasoningContent(obj)
+	// 出站前最后一道形状检查：空 text 段（11151）。
+	// 上游对每个 text 段判长度，空串/缺失即整条请求 400，且**不可自愈**——客户端重试
+	// 只重放同一段历史，换号也救不回来。位置必须在 mergeAdjacentToolCalls / repack /
+	// cleanup 之后：那三步会把字符串 content 挪到别的消息上，先补位再挪动等于漏掉被挪
+	// 过去的那一段。也必须排在 sanitize 之前——补的是一个空格，sanitize 的指纹净化
+	// 不会把它洗掉，先于 sanitize 才能保证最终出站内容里没有空段。
+	if msgs, ok := obj["messages"].([]any); ok {
+		guardEmptyTextParts(msgs)
+	}
 	if sanitize {
 		if msgs, ok := obj["messages"].([]any); ok {
 			sanitizeMessages(msgs)

@@ -163,7 +163,7 @@ func (h *Handler) search(w http.ResponseWriter, r *http.Request) {
 func requestLevelFailFastKind(kind upstream.ErrKind) bool {
 	switch kind {
 	case upstream.ErrBadParams, upstream.ErrPromptTooLong, upstream.ErrImageInvalid,
-		upstream.ErrContentBlocked, upstream.ErrModelBlocked:
+		upstream.ErrContentBlocked, upstream.ErrModelBlocked, upstream.ErrEmptyContent:
 		return true
 	}
 	return false

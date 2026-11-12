@@ -46,6 +46,7 @@ const (
 	ErrPromptTooLong                 // 11115「prompt is too long」→ 请求级错误（上下文超限是请求的问题非账号的问题）：不罚号、不轮转，末端透传原文
 	ErrImageInvalid                  // 图片请求格式/数据无效 → 请求级错误：不罚号、不轮转，末端透传原文
 	ErrUpstreamBusy                  // 6020「queue.waiting.title」/ 6021「queue.full.title」渠道级排队/队列满（非账号问题）、11134「模型供应商过载」（非账号问题）→ 不罚号、不轮转、不解绑粘性，末端 503 + upstream_busy
+	ErrEmptyContent                  // 11151「a message has empty content」→ 请求级空段（出站已补位，这里是兜底）：不罚号、不轮转、不解绑粘性，末端 400 透传原文
 	ErrClient                        // 其他 4xx / 业务错误
 )
 
@@ -77,6 +78,8 @@ func (k ErrKind) String() string {
 		return "image_invalid"
 	case ErrUpstreamBusy:
 		return "upstream_busy"
+	case ErrEmptyContent:
+		return "empty_content"
 	case ErrAccountFault:
 		return "account_fault"
 	case ErrChannelRefused:
@@ -1068,6 +1071,17 @@ func Classify(status int, body string) ErrKind {
 				return ErrImageInvalid
 			}
 		}
+	}
+	// 11151「a message has empty content」：某个 text 段是空串/缺失，上游判硬 400。
+	// 出站前 payload.go 的 guardEmptyTextParts 已经补位（含「字符串 content 被当 parts
+	// 嗅探」那种形态），走到这里说明补位没覆盖该端点。它仍然是**同一请求的错**：
+	// 换任何账号都会被同一处拒绝，轮转只会白打整池、喂连败，末端还会把必然失败的
+	// 请求伪装成「账号不可用，稍后重试」（503 no_healthy_account），客户端于是无限重试。
+	//
+	// 只认结构化业务码 11151，不认文案：文案 "empty content" 完全可能出现在用户自己的
+	// 消息里，按词判会把正常请求误分类成「不再轮转」。
+	if status == http.StatusBadRequest && hasBusinessCode(body, "11151") {
+		return ErrEmptyContent
 	}
 	// 内容策略拦截（HTTP 400 + 审核文案）：判在通用 ErrClient 之前。
 	// 这是误报信号，不罚账号，由网关降级重试处理（见 handler.applyErrorPolicy）。

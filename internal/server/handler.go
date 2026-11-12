@@ -1372,6 +1372,25 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				st.outcome = reqlog.OutcomeHTTPError
 				return
 			}
+			// 11151「a message has empty content」：某个 text 段是空串/缺失。出站前
+			// payload.go 的 guardEmptyTextParts 已经补位，走到这里是兜底（补位没覆盖的
+			// 端点/形态）。仍按请求级错误 fail-fast：同一 body 换任何账号都是同一处拒绝，
+			// 轮转只会白打整池并喂连败，末端还会把必然失败的请求伪装成「账号不可用、
+			// 稍后重试」（503 no_healthy_account），客户端于是无限重试。
+			// 客户端可操作的是删掉那条空消息或换新会话——hint 里已经写明。
+			if kind == upstream.ErrEmptyContent {
+				h.applyErrorPolicy(acct.UID, kind, string(respBody), bareModel, uerr)
+				failKeepBinding(acct.UID)
+				msg := string(respBody)
+				if strings.TrimSpace(msg) == "" {
+					msg = "a message in the request history has empty content"
+				}
+				writeOpenAIErrorHint(w, http.StatusBadRequest, "empty_content", msg,
+					h.hintOf(upstream.ErrEmptyContent, string(respBody), bareModel, reqHasImage, uerr))
+				st.status = http.StatusBadRequest
+				st.outcome = reqlog.OutcomeHTTPError
+				return
+			}
 			// 请求体解析失败（11101）：与 11115 / 图片无效同一哲学——同一 body 换任何
 			// 账号都是同样的解析结果，轮转只会放大无效请求（每号一次上游调用 +
 			// rotateBackoff 占用在途名额）。更要紧的是：继续轮转后末端会落到
@@ -2139,6 +2158,14 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 		// 不罚账号（无冷却/熔断/NoteError，同 ErrContentBlocked 待遇）；chatCompletions
 		// 已 fail-fast 400 透传原文、终止轮转——「换号可能有不同模型权限」属 11102
 		// （ErrModelBlocked）的分类域，与本类无关。
+	case upstream.ErrEmptyContent:
+		// 11151 空 text 段：请求内容的问题（历史里某个 text 段是空串/缺失），同一 body
+		// 换任何账号都是同样的拒绝。零动作（不冷却/不熔断/不 NoteError/不喂连败，同
+		// ErrBadParams 待遇）；出站前 empty_text_part.go 已补位，走到这里说明补位没覆盖
+		// 该形态/端点，chatCompletions 已 fail-fast 400 透传原文、终止轮转。
+		//
+		// 粘性绑定同样保留：空段是请求自身的问题，换号解决不了，解绑只会让客户端重试
+		// 落到另一个号上、把账号级前缀缓存从零重算。
 	case upstream.ErrUpstreamBusy:
 		// 6021「queue.full.title」渠道级容量满载 / 11134「模型供应商过载」：
 		// 账号余额健康、未限流、session 未死，换号也撞同一堵墙。零动作
