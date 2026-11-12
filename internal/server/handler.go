@@ -882,6 +882,19 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			unbindSticky()
 		}
 	}
+	// failKeepBinding：只释放在途租约，**不解绑会话粘性**。
+	//
+	// 用途：请求级错误（内容拦截 / prompt 超长 / 图片无效 / 参数错 / 空内容）。
+	// 这类错误与账号无关——同一个 body 换任何账号都会撞同样的上游判定。此时解绑
+	// 粘性是**净损失**：客户端重试会被分配到另一个账号，账号级前缀缓存（prompt
+	// cache）从零重算（几十万 token 的历史），首字延迟从 3~4 秒涨到 10~20 秒，
+	// 用户观感是「报错一次缓存就永远不生效」。
+	//
+	// 参考 reporter 提交 2b210e9。fail 保留给真正该罚号的分支（账号封禁、
+	// 上游 5xx 熔断、刷新失败等）。
+	failKeepBinding := func(uid string) {
+		releaseHeld()
+	}
 	// ttfb 首 token 等待（仅流式有观测；非流式传 0 = 无观测，速率不扣减）。
 	// 显式入参而不是读 st.ttfb：后者在流式分支里是**调用之后**才赋值的，
 	// 靠顺序传递会让将来重排代码时静默把速率算回旧的错口径。
@@ -1290,7 +1303,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				// error-passthrough：message 装上游 body 原文（code/msg/requestId 原样），
 				// 不再改写成网关固定文案——客户端必须看到真实错误才能排查。
 				h.applyErrorPolicy(acct.UID, kind, string(respBody), bareModel, uerr)
-				fail(acct.UID)
+				failKeepBinding(acct.UID)
 				msg := string(respBody)
 				if strings.TrimSpace(msg) == "" {
 					// 空 body 兜底：无上游原文可透传，保留可读分类文案（不编造原文）。
@@ -1337,7 +1350,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// 的错误信息，客户端必须看到，禁止固定词覆盖）。
 			if kind == upstream.ErrPromptTooLong {
 				h.applyErrorPolicy(acct.UID, kind, string(respBody), bareModel, uerr)
-				fail(acct.UID)
+				failKeepBinding(acct.UID)
 				writeOpenAIErrorHint(w, http.StatusBadRequest, "prompt_too_long", promptTooLongMessage(string(respBody)),
 					h.hintOf(upstream.ErrPromptTooLong, string(respBody), bareModel, reqHasImage, uerr))
 				st.status = http.StatusBadRequest
@@ -1348,7 +1361,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// 同一 body 换账号仍是同样的解析结果，轮转只会放大无效请求。
 			if kind == upstream.ErrImageInvalid {
 				h.applyErrorPolicy(acct.UID, kind, string(respBody), bareModel, uerr)
-				fail(acct.UID)
+				failKeepBinding(acct.UID)
 				msg := string(respBody)
 				if strings.TrimSpace(msg) == "" {
 					msg = "image request was rejected by upstream"
@@ -1366,7 +1379,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// 客户端于是对必然失败的请求无限重试。立即透传上游原文回 400。
 			if kind == upstream.ErrBadParams {
 				h.applyErrorPolicy(acct.UID, kind, string(respBody), bareModel, uerr)
-				fail(acct.UID)
+				failKeepBinding(acct.UID)
 				msg := string(respBody)
 				if strings.TrimSpace(msg) == "" {
 					msg = "chat request body was rejected by upstream"
