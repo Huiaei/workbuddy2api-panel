@@ -1384,7 +1384,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// 按 SDK 退避重试即可；等待窗口过去渠道恢复即成功。
 			if kind == upstream.ErrUpstreamBusy {
 				h.applyErrorPolicy(acct.UID, kind, string(respBody), bareModel, uerr)
-				fail(acct.UID)
+				// 只释放在途租约，**不解绑会话粘性**（参考 reporter 提交 4830686）。
+				// 6020/6021 排队满、11134 供应商过载都是渠道/供应商级容量信号，与账号
+				// 无关；解绑粘性会让客户端重试换号 ⇒ 账号级前缀缓存从零重算
+				// （几十万 token），首字延迟从 3~4 秒涨到 10~20 秒。
+				releaseHeld()
 				msg := string(respBody)
 				if strings.TrimSpace(msg) == "" {
 					msg = "upstream capacity is full (queue.full); retry after a short wait"
@@ -2123,10 +2127,10 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 		// 已 fail-fast 400 透传原文、终止轮转——「换号可能有不同模型权限」属 11102
 		// （ErrModelBlocked）的分类域，与本类无关。
 	case upstream.ErrUpstreamBusy:
-		// 6021「queue.full.title」渠道级容量满载：账号余额健康、未限流、session 未死，
-		// 换号也撞同一堵墙。零动作（不冷却/不熔断/不 NoteError/不喂连败，同
-		// ErrContentBlocked 待遇）；chatCompletions 已 fail-fast 503 透传原文、
-		// 终止轮转——该分支只为文档完备。
+		// 6021「queue.full.title」渠道级容量满载 / 11134「模型供应商过载」：
+		// 账号余额健康、未限流、session 未死，换号也撞同一堵墙。零动作
+		// （不冷却/不熔断/不 NoteError/不喂连败，同 ErrContentBlocked 待遇）；
+		// chatCompletions 已 fail-fast 503 透传原文、终止轮转——该分支只为文档完备。
 	case upstream.ErrModelBlocked:
 		// 11102「该后端无此模型」/11158「该账号类型无此模型权限」：
 		// (账号, 模型) 负缓存避让。复用 modelCooldowns 机制（与 6004 同域），

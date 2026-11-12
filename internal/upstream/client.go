@@ -45,7 +45,7 @@ const (
 	ErrWafBlock                      // 403 + 非业务信封体（APISIX WAF 拦截页/空体）→ 账号软冷却 + 抖动退避
 	ErrPromptTooLong                 // 11115「prompt is too long」→ 请求级错误（上下文超限是请求的问题非账号的问题）：不罚号、不轮转，末端透传原文
 	ErrImageInvalid                  // 图片请求格式/数据无效 → 请求级错误：不罚号、不轮转，末端透传原文
-	ErrUpstreamBusy                  // 6020「queue.waiting.title」/ 6021「queue.full.title」渠道级排队/队列满（非账号问题）→ 不罚号、不轮转，末端 503 + upstream_busy
+	ErrUpstreamBusy                  // 6020「queue.waiting.title」/ 6021「queue.full.title」渠道级排队/队列满（非账号问题）、11134「模型供应商过载」（非账号问题）→ 不罚号、不轮转、不解绑粘性，末端 503 + upstream_busy
 	ErrClient                        // 其他 4xx / 业务错误
 )
 
@@ -755,6 +755,50 @@ func isAllDigits(s string) bool {
 	return true
 }
 
+// parseQueueRetryAfter 从上游**响应体**解析排队/过载信号的等待时长（body 侧回落）。
+//
+// 上游在渠道级忙（6020/6021 排队满、11134 供应商过载）时，除了状态码还会把等待
+// 时长放在 body 里（形态：`data.retry_after` 或 `retry_policy.retry_after`）。
+// 头侧（Retry-After 等）缺失时，这些 body 字段是唯一的等待窗口来源——没有它，
+// 客户端只能自己瞎猜退避时间。
+//
+// ⚠️ 单位：按**秒**解释。这是**推断**，不是上游文档确认过的口径（上游同时用过
+// 毫秒字段名 Retry-After-Ms，本仓头侧解析也按头名区分秒/毫秒）。reporter 侧
+// （提交 4830686）同样标注「上游实际单位未能确认，按秒处理」。因此这里：
+//   - 只在头侧解析不出等待时长时回落使用（头侧优先级更高，语义更权威）；
+//   - 数值异常（≤0）直接判不可用，绝不臆造等待时长；
+//   - 上限用 retryAfterSanity 封顶（与头侧同量级，防上游异常大值把客户端钉死）。
+//
+// 返回 (0,false) = 上游没给可用等待时长，调用方应回落本地计算值。
+func parseQueueRetryAfter(body []byte) (time.Duration, bool) {
+	if len(body) == 0 {
+		return 0, false
+	}
+	var env struct {
+		Data struct {
+			RetryAfter int64 `json:"retry_after"`
+		} `json:"data"`
+		RetryPolicy struct {
+			RetryAfter int64 `json:"retry_after"`
+		} `json:"retry_policy"`
+	}
+	if err := json.Unmarshal(body, &env); err != nil {
+		return 0, false
+	}
+	secs := env.Data.RetryAfter
+	if secs <= 0 {
+		secs = env.RetryPolicy.RetryAfter
+	}
+	if secs <= 0 {
+		return 0, false
+	}
+	d := time.Duration(secs) * time.Second
+	if d > retryAfterSanity {
+		d = retryAfterSanity
+	}
+	return d, true
+}
+
 // parseRetryNumber 按头名口径把纯数字串折算成时长。x-ratelimit-reset 是
 // epoch 时刻而非时长：秒口径（10 位）与毫秒口径（13 位）都按「now+ 该时刻
 // 的剩余量」折算，已在过去则不可用。位数不足（8 位以下）无法判定 epoch
@@ -942,6 +986,32 @@ func Classify(status int, body string) ErrKind {
 	// key 原文，语义唯一，非 429 状态码出现同样归本类（防上游换状态码）。
 	if (status == http.StatusTooManyRequests && (hasBusinessCode(body, "6020") || hasBusinessCode(body, "6021"))) ||
 		isQueueFullBody(lower) || isQueueWaitingBody(lower) {
+		return ErrUpstreamBusy
+	}
+	// 11134「模型供应商过载」（上游 5xx + 业务码 11134，msg 形如 "the model provider
+	// is temporarily unavailable"）：这是**供应商容量**信号，不是账号信号——上游把
+	// 请求转给了模型供应商，供应商此刻过载，换任何账号都撞同一堵墙。
+	//
+	// 根因（参考 reporter 提交 4830686）：本仓原口径把 ≥500 一律归 ErrServer，
+	// handler 侧 applyErrorPolicy 的 ErrServer 分支会喂 h.cfg.Pool.NoteError(uid)
+	// ——连错 3 次即进 30 分钟熔断冷却，于是**一批健康账号被供应商抖动集体打冷**；
+	// 同时请求内换号重试仍在打同一个过载供应商，白耗在途名额（MaxInFlight），
+	// 还打断 session_sticky 的账号级前缀缓存（换号 ⇒ 缓存从零重算）。
+	//
+	// 归入 ErrUpstreamBusy 后：applyErrorPolicy 的该分支零动作（不冷却/不熔断/
+	// 不 NoteError），handler 侧 fail-fast 503 + upstream_busy + 透传上游原文，
+	// 并保留会话粘性绑定。
+	//
+	// 只认**结构化业务码** 11134，不认文案：文案是上游 i18n，会变（同 6021 的
+	// "queue.full.title" 形态见 isQueueFullBody），业务码才稳定。判据位置必须在
+	// 下方 `status >= 500 → ErrServer` 之前——否则 5xx 永远先被 ErrServer 吃掉，
+	// 这条判据形同虚设。
+	//
+	// 注意：本条**不**解放 6020/6021 的 status==429 限制（既有语义：排队满只在
+	// 429 状态码 + 结构化码同时命中时归忙），也不改成「轮转 + 末端 429」——本仓
+	// 对渠道级忙是 fail-fast 503（换号白撞，见 handler 的 ErrUpstreamBusy 分支），
+	// 语义比 reporter 的轮转实现更强，不改。
+	if hasBusinessCode(body, "11134") {
 		return ErrUpstreamBusy
 	}
 	// status==429 先于 hardMarkers：限流响应 body 高频携带 "quota exceeded"/
@@ -1641,8 +1711,16 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 				return nil, resp.StatusCode, raw, nil
 			}
 			ue := &Error{Kind: kind, Status: resp.StatusCode, Msg: truncate(string(raw), 200)}
+			// 等待时长来源优先级：响应头（Retry-After / Retry-After-Ms / X-Ratelimit-Reset，
+			// 语义最权威）→ 响应体（渠道级忙时上游把等待窗口放进 body 的
+			// data.retry_after / retry_policy.retry_after，单位按秒推断，见
+			// parseQueueRetryAfter 注释）。头侧存在时**不**看 body（既有语义不变）。
 			if d, ok := ParseRetryAfter(resp.Header); ok {
 				ue.RetryAfter = d
+			} else if kind == ErrUpstreamBusy {
+				if d, ok := parseQueueRetryAfter(raw); ok {
+					ue.RetryAfter = d
+				}
 			}
 			return nil, resp.StatusCode, raw, ue
 		}
