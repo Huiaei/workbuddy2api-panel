@@ -74,6 +74,7 @@ type summaryPackage struct {
 type packageDetail struct {
 	PackageCode         string    `json:"PackageCode"`
 	PackageName         string    `json:"PackageName"`
+	ResourceId          string    `json:"ResourceId"`       // 明细行唯一标识，paid/free 去重
 	DeductionEndTime    int64     `json:"DeductionEndTime"` // epoch 毫秒，真实扣费截止
 	ExpiredTime         string    `json:"ExpiredTime"`
 	CycleEndTime        string    `json:"CycleEndTime"`
@@ -143,66 +144,129 @@ func (c *Client) globalUserResource(a *auth.Auth, soon time.Duration) (remain, t
 		}
 	}
 	details := c.globalPackageDetails(a, codes)
-	// 同一 PackageCode 在明细里会出现**多条**（每个计量周期一条：ResourceCycleId 不同、
-	// CycleEndTime 逐月递推）。按码归并——每个包只该贡献一次余额，且只认该码**最早
-	// 的未来到期**那条（真正会先扣完的那一期）。不归并会把同一笔余额重复计入 N 次，
-	// 面板「到期提醒」于是显示一堆同额批次。
-	type pick struct {
-		d   packageDetail
-		end time.Time
+	// 到期批次按「明细行自身剩余 + 真实到期时刻」分布，与「检查」逐包口径同源。
+	// 旧实现按 PackageCode 塌缩到最早一行、把整码余额塞给那一天：global 号的 138 分
+	// 明明分散在 12-14~12-18 五天，快照却显示「明天到期 138（=全部余额）」，而
+	// 「检查」走逐包明细显示 12-14 起的真实批次，两条路径分叉。详见 globalExpiryBuckets。
+	expiring, earliestAt, buckets = globalExpiryBuckets(remainByCode, details, soon, now)
+	if len(buckets) > 0 {
+		earliestRemaining = buckets[0].Remain
 	}
-	best := make(map[string]pick, len(details))
+	return remain, total, expiring, earliestAt, earliestRemaining, buckets, nil
+}
+
+// globalExpiryBuckets 从 summary 的按码余额 + 明细行构造按自然日的到期批次。
+//
+// 根因：global 号的同一 PackageCode（如 007 Bonus Pack）在同一周期内有几十条明细，
+// 每条是独立发放批次（ResourceId 不同、DeductionEndTime 逐日递推），各自带
+// CycleCapacityRemain。summary 只给整码 remain 总额。旧实现 best[code] 只保留该码
+// 最早到期的一行，再把整码 remain 全记到那一天：huiaei 号「138 分分散在 12-14~12-18
+// 五天才到期」被显示成「明天 11-19 到期 138 分（=全部余额）」，而「检查」走逐包明细
+// 显示 12-14 起的真实批次。用户看到两种刷新方式余额不一致即源于此。
+//
+// 三条不变量：
+//  1. 每行用本周期剩余（cycleRemain，绝不 fallback 到整包 CapacityRemain——
+//     035 Free Plan 的 CapacityRemain=100 是周期已用完的整包额度，不是可作废余额）；
+//  2. 每码总额以 summary remain 为权威：明细合计显著超出才按比例缩放；summary 该码
+//     remain=0 则整码跳过；
+//  3. 明细拿不到 future 正余额行时不伪造批次（宁可少显示，不拿总额冒充最早一天）。
+func globalExpiryBuckets(
+	remainByCode map[string]int64,
+	details []packageDetail,
+	soon time.Duration,
+	now time.Time,
+) (expiring int64, earliestAt time.Time, buckets []ExpiryBucket) {
+	// paid/free 两份明细可能含同一行，按 ResourceId（缺失时用字段组合）去重。
+	seen := make(map[string]bool, len(details))
+	// code -> day -> 该日剩余（明细口径）；dayEnd 记该日最早的到期时刻。
+	byCodeDay := map[string]map[string]float64{}
+	dayEnd := map[string]map[string]time.Time{}
 	for _, d := range details {
+		key := d.ResourceId
+		if key == "" {
+			key = fmt.Sprintf("%s|%d|%v|%v", d.PackageCode, d.DeductionEndTime,
+				d.CycleCapacityRemainPrecise, d.CapacityRemainPrecise)
+		}
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
 		end, ok := packageEffectiveEnd(d.DeductionEndTime, d.ExpiredTime, "", d.CycleEndTime)
 		if !ok || !end.After(now) {
 			continue
 		}
-		cur, seen := best[d.PackageCode]
-		if !seen || end.Before(cur.end) {
-			best[d.PackageCode] = pick{d: d, end: end}
-		}
-	}
-	byDate := make(map[string]*ExpiryBucket)
-	for code, p := range best {
-		d := p.d
-		r, ok := remainByCode[code]
-		if !ok {
-			// summary 没列这个包（已用完/过期/不同周期）→ 明细自报剩余，但仅在为正时计。
-			r = int64(d.balanceRemain())
-		}
+		r := d.cycleRemain()
 		if r <= 0 {
 			continue
 		}
-		end := p.end
-		if earliestAt.IsZero() || end.Before(earliestAt) {
-			earliestAt = end
-		}
 		day := end.In(softRateResetLoc).Format("2006-01-02")
-		b, seen := byDate[day]
-		if !seen {
-			b = &ExpiryBucket{Date: day, ExpireAt: end}
-			byDate[day] = b
-		} else if end.Before(b.ExpireAt) {
-			b.ExpireAt = end
+		if byCodeDay[d.PackageCode] == nil {
+			byCodeDay[d.PackageCode] = map[string]float64{}
+			dayEnd[d.PackageCode] = map[string]time.Time{}
 		}
-		b.Remain += r
-		if soon > 0 && !end.After(now.Add(soon)) {
-			expiring += r
+		byCodeDay[d.PackageCode][day] += r
+		if cur, has := dayEnd[d.PackageCode][day]; !has || end.Before(cur) {
+			dayEnd[d.PackageCode][day] = end
 		}
 	}
-	dates := make([]string, 0, len(byDate))
-	for d := range byDate {
+	byDay := map[string]*ExpiryBucket{}
+	for code, days := range byCodeDay {
+		sr, known := remainByCode[code]
+		if !known || sr <= 0 {
+			continue
+		}
+		var detailSum float64
+		for _, r := range days {
+			detailSum += r
+		}
+		// 明细合计显著超过 summary（重复行/口径混入）才缩放；1 分容差内直接用明细，
+		// 避免 summary 截断小数后逐行缩放取整令合计反而不等于 summary。
+		scale := 1.0
+		if detailSum > float64(sr)+1 && detailSum > 0 {
+			scale = float64(sr) / detailSum
+		}
+		for day, r := range days {
+			v := int64(r * scale)
+			if v <= 0 {
+				continue
+			}
+			end := dayEnd[code][day]
+			if earliestAt.IsZero() || end.Before(earliestAt) {
+				earliestAt = end
+			}
+			b, has := byDay[day]
+			if !has {
+				b = &ExpiryBucket{Date: day, ExpireAt: end}
+				byDay[day] = b
+			} else if end.Before(b.ExpireAt) {
+				b.ExpireAt = end
+			}
+			b.Remain += v
+			if soon > 0 && !end.After(now.Add(soon)) {
+				expiring += v
+			}
+		}
+	}
+	dates := make([]string, 0, len(byDay))
+	for d := range byDay {
 		dates = append(dates, d)
 	}
 	sort.Strings(dates)
-	if len(dates) > 0 {
-		buckets = make([]ExpiryBucket, 0, len(dates))
-		for _, d := range dates {
-			buckets = append(buckets, *byDate[d])
-		}
-		earliestRemaining = buckets[0].Remain
+	buckets = make([]ExpiryBucket, 0, len(dates))
+	for _, d := range dates {
+		buckets = append(buckets, *byDay[d])
 	}
-	return remain, total, expiring, earliestAt, earliestRemaining, buckets, nil
+	return
+}
+
+// cycleRemain 明细行的本周期剩余：只取 Cycle 口径，不 fallback 到整包 Capacity。
+// 035 Free Plan 的 CapacityRemain=100 但 CycleCapacityRemain=0、summary 该码 remain=0
+// （本周期已用完），拿整包值当「到期作废」会凭空多出 100 分且落到 2035 年。
+func (d packageDetail) cycleRemain() float64 {
+	if d.CycleCapacityRemainPrecise > 0 {
+		return float64(d.CycleCapacityRemainPrecise)
+	}
+	return float64(d.CycleCapacityRemain)
 }
 
 // globalPackageDetails 拉 paid + free 两份明细并合并。
