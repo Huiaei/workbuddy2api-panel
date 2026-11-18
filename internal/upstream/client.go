@@ -427,6 +427,14 @@ var contentBlockedMarkers = []string{
 // 与账号健康无关——不罚号，但仍轮转（commit B）。
 var badParamsMarkerMsg = "Unmarshal chat params failed"
 
+// isToolSchemaRejected 判定「工具定义被上游整体拒收」：11129（schema 形态不合规）与
+// 11152（工具名不合规或重名）属同一类——错在客户端声明的 tools，换任何账号都会
+// 在同一处被拒。只认结构化业务码、不认文案（文案可能出现在用户自己的消息里，按词判
+// 会误分类）。归 ErrBadParams：不罚号、不轮转、400 透传原文。
+func isToolSchemaRejected(body string) bool {
+	return hasBusinessCode(body, "11129") || hasBusinessCode(body, "11152")
+}
+
 // invalidImageMarkers 图片请求格式/数据无效（HTTP 400）的**文案**形态。这类错误由
 // 请求内容决定，不是账号问题：换账号不会改变同一 body 的解析结果。上游常见形态包括
 // `Parse message failed: invalid image_url content`、invalid_image_data、
@@ -1082,6 +1090,13 @@ func Classify(status int, body string) ErrKind {
 	// 消息里，按词判会把正常请求误分类成「不再轮转」。
 	if status == http.StatusBadRequest && hasBusinessCode(body, "11151") {
 		return ErrEmptyContent
+	}
+	// 11129/11152：工具定义被上游整体拒收（schema 形态不合规 / 工具名不合规或重名）。
+	// 确定性请求错误——错在客户端声明的 tools，换任何账号都在同一处被拒；落通用
+	// ErrClient 会轮转全池、喂连败、末端伪装成 503 no_healthy_account。
+	// 归 ErrBadParams（fail-fast，不罚号不轮转，400 透传原文）。
+	if status == http.StatusBadRequest && isToolSchemaRejected(body) {
+		return ErrBadParams
 	}
 	// 内容策略拦截（HTTP 400 + 审核文案）：判在通用 ErrClient 之前。
 	// 这是误报信号，不罚账号，由网关降级重试处理（见 handler.applyErrorPolicy）。
