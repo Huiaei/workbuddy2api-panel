@@ -335,8 +335,56 @@ WorkBuddy2API 是一个自托管的 **OpenAI 兼容反向代理网关**，将腾
 | 本项目 `feat/rebase-on-main` 分支 | Codex Responses / Anthropic Messages 原生协议与官方检索透传 | `4db668d` → `internal/server/responses.go`、`messages.go` |
 | 本项目 `sweep/*` 分支（7 条） | #104 后台任务+计费、#213 搜索端点、#237/#238 优惠与试用熔断、#244 临期刷新 | 已全部并入；这些分支**零独有提交** |
 | 本项目 `triage/*` 分支 | 20 条无 PR 覆盖的 issue 的修复（软冷却 reason、到期卡片快照、企业额度解析口径等） | 已全部并入 |
+| 报告者 fork（2026-11-21 批次） | restrict 11140 连坐保护、responses 回放三处缺口、tasklive 实时任务、audio/speech 官方语音端点、narration+toolonly 续写救援 | 见下一小节「2026-11-21 批次：报告者 fork 五条功能线的并入清单」 |
 
 > 本分支保留的**唯一**分支是 `main`——它与上游 `main`（`73a7560`）保持完全同步，**只作对照**，不接收修复。所有修复都进 `fix/all-known-issues`（默认分支）。
+
+#### 2026-11-21 批次：报告者 fork 五条功能线的并入清单
+
+来源仓库 `misakano7545/workbuddy2api-panel`（报告者 fork），基线提交 `d629a8ca9d0e7d48700d9fd7e462dfdd2cc268ff`。下列五项逐条移植——**不是 cherry-pick**：本 fork 与报告者 fork 在 `handler.go` / `responses.go` / 面板结构上已经分叉，全部按本 fork 的结构重写，并各自补了变异验证（每条修复都做过「撤掉即变红」的核对）。
+
+按维护者要求，**campaign（运营活动领奖）与 updater（面板内自更新）明确不并入**，理由见本节末尾。
+
+| 功能线 | 来源提交 | 落点 | 默认状态 |
+|---|---|---|---|
+| restrict：11140 风控连坐保护 | `d3edea9`、`de24d38`、`7dcae8e` | `internal/upstream/restrict.go`、`internal/server/restrict.go`、`handler.go` 三处闸门 | 生效（`restriction_hold_seconds=1800`、`restriction_wave_div=10`） |
+| responses 回放三处缺口 | `94a6879`、`fdf05ea`、`f668215`、`5f56e59` | `internal/server/responses.go` 的 `convertInputItems` | 生效（无需配置） |
+| tasklive：面板「实时任务」只读视图 | `75b109c`、`3117026`、`8f8876c` | `internal/panel/tasklive.go`、`panel.go` 路由、`app.js` + `index.html` 卡片 | 生效（`GET /panel/api/tasks/live`，60s TTL） |
+| audio/speech：官方语音端点 | `08cb935`、`026f9c0`、`d5ce7de`（issue #277） | `internal/upstream/speech.go`、`internal/server/audio.go` | **默认关闭**（`tts_enabled=false`、`asr_enabled=false`） |
+| narration + toolonly：说半句就停的救援 | `7565394`、`3412082`、`85179d4`（issue #273/#245） | `internal/server/continue.go`（928 行）、`narration.go`、`toolonly.go` + `chat.narration_off` 开关 | 救援默认**启用** |
+
+**restrict（11140 连坐保护）**——上游把四种语义塞进同一个业务码 11140。本 fork 原有的 `IsAccountRestricted` 只认 `request illegal` 那一族（`11140` + 该文案 → 硬禁用），而「账号存在异常行为 / unusual activity」这一族**不带** `request illegal`，此前会一路滑到通用 4xx（`ErrClient`：只换号、不罚号）——同一个请求顺着轮转挨个号去撞，能在几十秒内把整池健康号送进风控。现在两道闸：
+
+1. **命中即停手**：识别限制文书 → 禁用该号 + 本请求不再换号，503 `account_restricted_hold` 并透传上游原文（含 requestId）。
+2. **按域连坐**：同一域（cn/global）短窗内被封号数达到阈值（= 该域可用号数 / `restriction_wave_div`，下限 2）就暂停该域派发 `restriction_hold_seconds`（30s 起 2 倍退避、封顶 600s，平静 30 分钟清零）。暂停期内请求直接 503 且**不消耗任何账号**。
+3. 流式首帧写出后发现（头已发、无法换号）只记账并禁用该号，同样计入连坐。
+
+判据必须是 `code + 文案` 双条件：只看 code 会把可自愈的模型级限流号永久禁用，只看文案会把「该模型已被限制使用」误判成账号封禁。两个配置项都在装配期读取，**改动需重启**。
+
+**responses 回放三处缺口**——三处都是「静默改写客户端历史」，不走这条端点的用户不受影响，一旦用 Codex/Responses 系客户端就会撞上：
+
+1. 客户端发的 Chat 形状 `role:"tool"` 消息此前不带 `tool_call_id`，于是 `cleanupOrphanToolCalls` 把调用与结果**成对删掉**；
+2. `web_search_call` / `image_generation_call` / `mcp_call` 这些既无 `role` 也无 `content` 的托管项会落进默认分支变成空 user 消息——它会把同批工具调用**拆开**（上游直接 11148）、把图片插进并行工具结果之间、清掉暂存的思考，并把 image_generation 的 base64 成品出站；
+3. compaction（历史压缩）项的 `encrypted_content` 是密文，解不出摘要时**不得**当摘要注入。
+
+跳过托管项的判断必须排在 flush **之前**：否则托管项会先把上一批 `tool_calls` 落成一条消息，等于自己制造拆批。
+
+**tasklive（实时任务）**——新增只读视图 `GET /panel/api/tasks/live`：逐个账号查一次任务表（国内用小程序口径 `ListTasksMP`，国际只用默认口径 `ListTasks`，与 `accountTasks` 保持同一契约），60 秒 TTL 缓存、单轮并发 4，`fresh=1`（手动刷新）带 15 秒下限。它**不改账号状态、不触发作业**，纯粹给看板一个「不需要先跑一遍」的数据源；失败只标在该账号那一行，不拖垮整块。
+
+**audio/speech（官方语音端点，默认关闭）**——`POST /v1/audio/speech`（返回 24kHz 单声道 16-bit WAV；`response_format=pcm` 时回裸 PCM）与 `POST /v1/audio/transcriptions`（multipart，字段认 `file` 或 `audio`，3MB 上限，超限 413 `audio_too_large`）。上游分别是 `POST {chatBase}/v2/audio/speech`（SSE，事件 `speech.audio.delta` / `speech.audio.done`）与 `POST {chatBase}/agenttool/v1/asr`。
+
+**默认关闭的原因**：这两个端点的协议来自官方桌面端包内 `main/server.js` 的**静态反查，没有真机抓包对照**。关闭时端点仍在但回 403（`tts_disabled` / `asr_disabled`，文案点名配置键），打开即热生效。排障提示：TTS 报 `tts stream truncated … no speech.audio.done` ⇒ 事件名与真机不一致；ASR 报 15053 ⇒ 那段音频上游解不出（裸 PCM 无容器头必现，改发 WAV/WebM）。这两族都已归**请求级**错误（`ErrBadParams`）——音色表是全局配置、坏音频换号也是同一句，落 `ErrServer` 会让网关为同一个请求轮转全池并给健康号各记一笔连败。本项目没有报告者 fork 的 `internal/proxypool`，代理失败在这里表现为传输层错误 → 502 `upstream_error`，可诊断性弱于 `proxy_unavailable`；取舍写在 `internal/server/audio.go` 文件头。
+
+**narration + toolonly（说半句就停的救援）**——两者都建立在续写管线上，因此连带移植了 `internal/server/continue.go`（928 行，报告者同文件 1063 行，保留约 87%）。
+
+- **narration**：上游以 `finish_reason=stop` 正常收尾、正文非空、零 `tool_calls`，但正文明显没写完（尾部是冒号/省略号/未闭合代码块/「我将开始…」这类承诺句），且这一轮声明过工具、历史里确实调过工具 ⇒ 把已输出正文当 assistant 前缀再要一段，接在同一条 SSE 里，客户端只看到一次连续输出。
+- **toolonly**：正文极短、最后一条消息是工具结果、本该动手却停了 ⇒ 只采纳「续写段以完整 `tool_calls` 收尾」的结果，其余整段丢弃。
+- 两者**每请求最多一次**（报告者是两次），面板/配置 `chat.narration_off` 可关，关掉后行为与移植前完全一致。
+- **代价要写清楚**：每次救援都要重发整段上下文（线上实测单条 0.2 → 8.58 credits），而且「有没有说完」终究是启发式判定。这也是把它做成可关开关的原因。
+
+移植时**裁掉**了依赖报告者独有特性的部分（本仓库没有对应上游特性，硬搬会编不过或语义错）：档位输出预算下限（`EnsureMinBudget`/`OutputBudgetFloor`）、starved 救援（`ThinkingSwitchSupported`）、HeadVeto 首帧否决 / 模型回显 / 头部保活、续写层自补截断终态（本 fork 的截断终态在 `upstream.StreamHint`，两层都补会出现两个 `finish_reason` 帧）。另有一处行为差异需知道：救援段的 error 帧原样透传，因此这次请求在统计上会记成流错误（`OutcomeStreamError`）。
+
+**为什么 campaign 与 updater 不并入**：campaign 的活动码硬编码在常量里（对应当期活动，过期即整块失效），且领奖是真实上游写操作，误判会动到账号；updater 与本项目「只本地自建、不发布预编译产物」的发布口径直接冲突（见 BUILD.md），并进来就是一个永远找不到可下载产物的自更新器。
 
 ### 2026-10 之后的修复集（本 fork 独有）
 
