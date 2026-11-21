@@ -330,7 +330,7 @@ WorkBuddy2API 是一个自托管的 **OpenAI 兼容反向代理网关**，将腾
 | 来源 | 合并了什么 | 现在在哪 |
 |---|---|---|
 | 报告者 fork（`misakano7545/workbuddy2api-panel`） | 官方客户端出站指纹对齐（双版本真机抓包）、首条消息恒为 system、企业额度「不限量」哨兵不污染权重、突发积分与低缓存率两道快速闸、14003 模型繁忙独立短窗口 | `internal/upstream/headers.go`、`internal/prompt/prompt.go`、`internal/pool/`、`internal/server/budget*.go` |
-| 报告者 fork（2026-11-01 之后的 fix 批次） | 11134 供应商过载归通道繁忙、请求级错误不解绑会话粘性、SSE 断流补截断终态 / 粘帧拆分 / 心跳注释帧换行、企业版不空跑成长任务、任务中心不显示幽灵账号作业、`web_search_result` 补齐 `encrypted_content`、签到回显真实 realm、快过期加权保底、请求日志超长行不再读不出来、**上游服务端注入的身份指令（`identify yourself as …` / `<model_identity>`）回流清洗**（issue #187）、**签到回执四态**（`checkin_state` = checked / already / pending / failed；`checkin_credit` 只报上游真实发放的积分，重复签到不再显示「签到成功 +100」）、积分耗尽提示不再对国际版账号承诺「等签到恢复」 | `internal/upstream/client.go`、`internal/upstream/sse.go`、`internal/upstream/sanitize.go`、`internal/upstream/hint.go`、`internal/upstream/checkin_receipt.go`、`internal/server/handler.go`、`internal/panel/`、`internal/reqlog/`、`internal/pool/pick.go` |
+| 报告者 fork（2026-11-01 之后的 fix 批次） | 11134 供应商过载归通道繁忙、请求级错误不解绑会话粘性、SSE 断流补截断终态 / 粘帧拆分 / 心跳注释帧换行、企业版不空跑成长任务、任务中心不显示幽灵账号作业、`web_search_result` 补齐 `encrypted_content`、签到回显真实 realm、快过期加权保底、请求日志超长行不再读不出来、**上游服务端注入的身份指令（`identify yourself as …` / `<model_identity>`）回流清洗**（issue #187）、**工具 schema 里 JS 的 `\uXXXX` 转义译成 RE2 的 `\x{…}`**（issue #276：REA 给路径字段挂 `^[^\uD800-\uDFFF]*$`，上游按 RE2 校验 ⇒ 400 `11129` 整颗 tools 被拒）、**`11102` 模型 id 不存在归请求级**（issue #280：不再换号白打全池、不再给每号写 (账号,模型) 负缓存）、**同一轮助手正文与工具调用合并回放**（PR #281：Codex 把两者拆成两个 item，回放成两条 assistant 轮会让部分模型只回一句进度就收尾）、**签到回执四态**（`checkin_state` = checked / already / pending / failed；`checkin_credit` 只报上游真实发放的积分，重复签到不再显示「签到成功 +100」）、积分耗尽提示不再对国际版账号承诺「等签到恢复」 | `internal/upstream/client.go`、`internal/upstream/payload.go`、`internal/server/responses.go`、`internal/upstream/sse.go`、`internal/upstream/sanitize.go`、`internal/upstream/hint.go`、`internal/upstream/checkin_receipt.go`、`internal/server/handler.go`、`internal/panel/`、`internal/reqlog/`、`internal/pool/pick.go` |
 | 本项目 `fix/all-known-issues-v1.13.0` 分支 | 早先基于上游 `main` 做的 200+ 项修复中的**自研部分**（错误分类、账号池、面板可观测性、Windows 落盘加固） | 已全部并入本分支；该分支不再单独维护 |
 | 本项目 `feat/rebase-on-main` 分支 | Codex Responses / Anthropic Messages 原生协议与官方检索透传 | `4db668d` → `internal/server/responses.go`、`messages.go` |
 | 本项目 `sweep/*` 分支（7 条） | #104 后台任务+计费、#213 搜索端点、#237/#238 优惠与试用熔断、#244 临期刷新 | 已全部并入；这些分支**零独有提交** |
@@ -358,6 +358,7 @@ WorkBuddy2API 是一个自托管的 **OpenAI 兼容反向代理网关**，将腾
 | 流式 SSE error 帧 | 丢业务码 → 健康账号被误降级 10 分钟 | error 帧分类**保留完整业务信封**（含 `displayMsg` / `displayTips`） |
 | `6021` / `queue.full` | 池级冷却 | 渠道级忙碌 + 透传上游 `Retry-After`（**不伪造**） |
 | `11134`「模型供应商过载」（上游回 5xx + 业务码 `11134`） | 归 `ErrServer` → 喂熔断计数 → **同一批健康账号被供应商抖动集体打进 30 分钟冷却** | 归**通道级繁忙**（不罚账号、不换号、不解绑粘性）；等待口径优先读响应头 `Retry-After`，缺失时回落到 body 里的 `retry_policy.retry_after` |
+| `11102`「model [X] service info not found」（模型 id 上游不存在） | 与 `11158`「无权使用该模型」共用一类 → **换遍全池每个号各打一次**、各写一笔 (账号,模型) 负缓存，末端还回「换个账号重试」这种反向建议（issue #280） | 拆成**模型级**：`ErrModelMissing` 请求级零动作、不轮转、不写负缓存、不解绑粘性，立即 400 透传原文；hint 指向 `/v1/models`（id 大小写敏感，display name 不算 id）。`11158` 仍保留换号 + (账号,模型) 负缓存——换到有权限的号真能成功 |
 | 内容拦截 / prompt 超长 / 图片无效 / 参数错（**请求级**错误） | 释放在途租约的同时**解绑会话粘性** ⇒ 客户端重试换号 ⇒ 账号级前缀缓存从零重算（首字延迟 3~4 秒 → 10~20 秒），观感是「报错一次缓存就永远不生效」 | 只释放在途租约，**保留粘性绑定**（同 body 换任何账号都会撞同样的上游判定，换号没有意义） |
 
 #### 模型目录与优惠

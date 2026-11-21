@@ -40,14 +40,16 @@ const (
 	ErrBadParams                     // 请求体解析失败（400 + Unmarshal chat params failed / 11101）→ 请求级错误：不罚号、不轮转，末端 400 透传原文
 	ErrAccountFault                  // 账号级授权/配额故障（11140 request illegal / 14017 trial not activated）→ 冷却轮换，不无限重试
 	ErrChannelRefused                // 11-128/11128 通道校验失败（请求形状没过官方渠道校验，账号本身健康）→ 不罚号、继续轮转
-	ErrModelBlocked                  // 11102「该后端无此模型」→ (账号,模型) 负缓存避让，切模型/切账号
-	ErrModelBusy                     // 14003「该模型此刻繁忙」→ **瞬时** (账号,模型) 级秒级避让（不罚号、10s 首档、封顶 1m），末端 503 model_busy + Retry-After
-	ErrWafBlock                      // 403 + 非业务信封体（APISIX WAF 拦截页/空体）→ 账号软冷却 + 抖动退避
-	ErrPromptTooLong                 // 11115「prompt is too long」→ 请求级错误（上下文超限是请求的问题非账号的问题）：不罚号、不轮转，末端透传原文
-	ErrImageInvalid                  // 图片请求格式/数据无效 → 请求级错误：不罚号、不轮转，末端透传原文
-	ErrUpstreamBusy                  // 6020「queue.waiting.title」/ 6021「queue.full.title」渠道级排队/队列满（非账号问题）、11134「模型供应商过载」（非账号问题）→ 不罚号、不轮转、不解绑粘性，末端 503 + upstream_busy
-	ErrEmptyContent                  // 11151「a message has empty content」→ 请求级空段（出站已补位，这里是兜底）：不罚号、不轮转、不解绑粘性，末端 400 透传原文
-	ErrClient                        // 其他 4xx / 业务错误
+	ErrModelBlocked                  // 11158「该账号类型无权使用该模型」→ (账号,模型) 负缓存避让，切账号有救
+	// （11102「模型 id 上游不存在」是模型级答复，见下方 ErrModelMissing）
+	ErrModelBusy     // 14003「该模型此刻繁忙」→ **瞬时** (账号,模型) 级秒级避让（不罚号、10s 首档、封顶 1m），末端 503 model_busy + Retry-After
+	ErrWafBlock      // 403 + 非业务信封体（APISIX WAF 拦截页/空体）→ 账号软冷却 + 抖动退避
+	ErrPromptTooLong // 11115「prompt is too long」→ 请求级错误（上下文超限是请求的问题非账号的问题）：不罚号、不轮转，末端透传原文
+	ErrImageInvalid  // 图片请求格式/数据无效 → 请求级错误：不罚号、不轮转，末端透传原文
+	ErrUpstreamBusy  // 6020「queue.waiting.title」/ 6021「queue.full.title」渠道级排队/队列满（非账号问题）、11134「模型供应商过载」（非账号问题）→ 不罚号、不轮转、不解绑粘性，末端 503 + upstream_busy
+	ErrEmptyContent  // 11151「a message has empty content」→ 请求级空段（出站已补位，这里是兜底）：不罚号、不轮转、不解绑粘性，末端 400 透传原文
+	ErrClient        // 其他 4xx / 业务错误
+	ErrModelMissing  // 11102「model [X] service info not found」模型 id 上游不存在 → **模型级**（换遍全池同一句）：请求级零动作、不轮转、不解绑粘性，末端 400 透传原文
 )
 
 func (k ErrKind) String() string {
@@ -68,6 +70,8 @@ func (k ErrKind) String() string {
 		return "bad_params"
 	case ErrModelBlocked:
 		return "model_blocked"
+	case ErrModelMissing:
+		return "model_missing"
 	case ErrModelBusy:
 		return "model_busy"
 	case ErrWafBlock:
@@ -579,6 +583,26 @@ func IsModelBlocked(status int, body string) bool {
 	return strings.Contains(lowerMsg, modelBlockMsgMarker) || strings.Contains(lowerMsg, modelForbiddenMsgMarker)
 }
 
+// IsModelMissing 报告该响应是否是「该模型 id 在上游不存在」（业务码 11102）。
+//
+// 与 IsModelBlocked 的分工：11102 是**模型级**——模型 id 在上游不存在时，换遍全池
+// 都是同一句（issue #280：三个号 4.1s 一字不差）；11158「该账号类型无权使用该模型」
+// 才是 (账号,模型) 级的权限问题。两者此前共用 ErrModelBlocked ⇒ 11102 会把整池白打
+// 一遍、给每个号写一笔无意义的 (账号,模型) 负缓存，末端还回「换个账号重试」这种
+// 反向建议。只认业务码，不按文案判（文案里带模型名，形状不可靠）。
+func IsModelMissing(status int, body string) bool {
+	if (status != http.StatusBadRequest && status != http.StatusNotFound) || body == "" {
+		return false
+	}
+	if hasBusinessCode(body, modelBlockCode) {
+		return true
+	}
+	// 少数形态只给文案不给业务码：官方固定短语「service info not found」同样只
+	// 出现在模型 id 不存在的答复里（与 11158 的「is not allowed for user type」可区分）。
+	_, msg := modelBlockFields(body)
+	return strings.Contains(strings.ToLower(msg), modelBlockMsgMarker)
+}
+
 // ModelBlockReasonFor 返回确定性模型拒绝对应的负缓存 reason。
 // 11158 是账号类型权限问题；其余已由 IsModelBlocked 确认的形态沿用 11102。
 func ModelBlockReasonFor(body string) string {
@@ -917,6 +941,10 @@ func Classify(status int, body string) ErrKind {
 	// 计费/限流都更具体——若不先判，msg 里的 "service info not found" 会被更宽的
 	// 4xx 兜底归为 ErrClient（只换号不避让），该坏号会留在池内反复被选中。
 	// 只认 400/404（见 IsModelBlocked），429+11102 落下方 status==429 层走限流语义。
+	// 11102 模型 id 不存在：模型级答复，先于 11158 的账号级权限判定。
+	if IsModelMissing(status, body) {
+		return ErrModelMissing
+	}
 	if IsModelBlocked(status, body) {
 		return ErrModelBlocked
 	}

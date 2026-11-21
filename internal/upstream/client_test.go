@@ -67,10 +67,12 @@ func TestClassify(t *testing.T) {
 		{500, `boom`, ErrServer},
 		{503, `unavailable`, ErrServer},
 		{200, ``, ErrNone},
-		// 11102「该后端无此模型」：确定性答复，归 ErrModelBlocked（(账号,模型) 负缓存避让）。
-		{404, `{"code":11102,"msg":"model [deepseek-v3-2-volc] service info not found"}`, ErrModelBlocked},
-		{400, `{"error":{"code":"11102","message":"model service info not found"}}`, ErrModelBlocked},
-		{400, `{"msg":"service info not found"}`, ErrModelBlocked},
+		// 11102「model [X] service info not found」是**模型级**答复（issue #280）：模型 id 在
+		// 上游不存在时换遍全池都是同一句，所以归 ErrModelMissing（请求级零动作、不轮转、
+		// 不写 (账号,模型) 负缓存），不再与 11158 的账号级权限共用 ErrModelBlocked。
+		{404, `{"code":11102,"msg":"model [deepseek-v3-2-volc] service info not found"}`, ErrModelMissing},
+		{400, `{"error":{"code":"11102","message":"model service info not found"}}`, ErrModelMissing},
+		{400, `{"msg":"service info not found"}`, ErrModelMissing},
 		// 11158 是账号类型级模型权限拒绝：同一模型换有权限的账号仍可能成功，
 		// 按 (账号, 模型) 避让；不能落入 ErrClient 轮转后误报 503。
 		{400, `{"code":11158,"msg":"model [gpt-5.6-sol] is not allowed for user type [personal_free_user]"}`, ErrModelBlocked},

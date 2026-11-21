@@ -73,6 +73,10 @@ func GatewayHint(kind ErrKind, msg string, ctx HintContext) string {
 		// 11151 空段：上游对「某条消息的 text 段是空串」判硬 400。出站前网关已补位，
 		// 客户端能做的是把那条空消息删掉或换新会话——重试必然复现。
 		return "request history contains an empty text block; upstream rejects it as-is — drop that message or start a new conversation"
+	case ErrModelMissing:
+		// 11102：模型 id 在上游不存在，换号无用（模型级）。id 大小写敏感，display name
+		// 不算 id——让客户端去 /v1/models 抄准确 id。
+		return "upstream does not have this model id; check /v1/models for the exact (case-sensitive) id — switching accounts will not help"
 	case ErrModelBlocked:
 		return "upstream has no such model on this backend; switch model or retry on another account"
 	case ErrModelBusy:

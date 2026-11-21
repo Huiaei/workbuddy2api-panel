@@ -1391,6 +1391,40 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				st.outcome = reqlog.OutcomeHTTPError
 				return
 			}
+			// 11102「model [X] service info not found」：模型 id 在上游不存在（大小写敏感，
+			// display name 不算 id）。这是**模型级**答复——换遍全池都是同一句（issue #280
+			// 实测三个号 4.1s 一字不差），轮转只会白打号、给每号写一笔 (账号,模型) 负缓存，
+			// 末端还回「model_unavailable + 换个账号重试」这种反向建议。立即 400 透传原文。
+			if kind == upstream.ErrModelMissing && crossRealm {
+				// 裸模型名 + 已开启跨域回退（issue #135）：11102 可能只是「本域目录里没有
+				// 这个模型」，另一域的账号也许有。先按模型级不可用让出这个号，让选号侧的
+				// ServableForModelRealm 归零后把裸名请求换到另一域再试一次；两域都没有时
+				// 才由末端错误如实回 400 model_unavailable。
+				//
+				// 这里**不**沿用请求级 fail-fast：那正是 issue #280 要修「换遍全池」的反面
+				// ——开关开着时换域是有效恢复路径，不是无效轮转。写负缓存只为驱动选号侧
+				// 的换域判定，账号本身不罚（failKeepBinding 只释放在途租约）。
+				h.cfg.Pool.BlockModelBackoff(acct.UID, bareModel, upstream.ModelBlockReasonFor(string(respBody)))
+				failKeepBinding(acct.UID)
+				if !rotateBackoff(i, r.Context()) {
+					break
+				}
+				rotateUsed++
+				continue
+			}
+			if kind == upstream.ErrModelMissing {
+				h.applyErrorPolicy(acct.UID, kind, string(respBody), bareModel, uerr)
+				failKeepBinding(acct.UID)
+				msg := string(respBody)
+				if strings.TrimSpace(msg) == "" {
+					msg = "upstream does not have this model id"
+				}
+				writeOpenAIErrorHint(w, http.StatusBadRequest, "model_unavailable", msg,
+					h.hintOf(upstream.ErrModelMissing, string(respBody), bareModel, reqHasImage, uerr))
+				st.status = http.StatusBadRequest
+				st.outcome = reqlog.OutcomeHTTPError
+				return
+			}
 			// 请求体解析失败（11101）：与 11115 / 图片无效同一哲学——同一 body 换任何
 			// 账号都是同样的解析结果，轮转只会放大无效请求（每号一次上游调用 +
 			// rotateBackoff 占用在途名额）。更要紧的是：继续轮转后末端会落到
@@ -1783,8 +1817,8 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			code = "channel_refused"
 			status = http.StatusBadRequest
 			msg = "upstream rejected the request channel (it may not look like the official client); check user-agent/headers or an intercepting proxy"
-		case upstream.ErrModelBlocked:
-			// 11102「该后端无此模型」：上游原文（下方统一透传）已经写清了原因，但
+		case upstream.ErrModelMissing, upstream.ErrModelBlocked:
+			// 11102「模型 id 上游不存在」/ 11158「该账号类型无权限」：上游原文（下方统一透传）已经写清了原因，但
 			// code 此前停在默认的 no_healthy_account —— 那是"服务端过载"的语义，
 			// 客户端据此会不断重试（#81 里就是 503 → 客户端自动重试 5 次），而真正
 			// 该做的是换个模型。用 400 + 明确的 code 把不可重试的性质讲清楚。
@@ -2014,7 +2048,9 @@ func isUpstreamTimeout(err error, clientGone bool) bool {
 //   - ErrImageInvalid → 图片格式/数据无效：请求的问题不是账号的问题（同一 body
 //     换任何号都会得到相同的解析错误）。零动作（不冷却/不熔断/不 NoteError、
 //     不喂连败），chatCompletions 已直接透传原文返回不轮转。
-//   - ErrModelBlocked → BlockModelBackoff：(账号, 模型) 11102/11158 负缓存避让。
+//   - ErrModelBlocked → BlockModelBackoff：(账号, 模型) 11158 负缓存避让。11102 走
+//     ErrModelMissing 的请求级分支（不写负缓存），唯一例外是裸名 + 跨域回退：那里
+//     写负缓存只为驱动选号侧换域，见 chatCompletions 的 crossRealm 分支。
 //   - ErrServer → NoteError：喂单一连续失败计数器 fails + 累计错误 errTotal，
 //     达到 breakerThreshold 触发熔断（指数退避）。
 //   - 其他（default：ErrClient/ErrNone）→ 只换号不罚（防雪崩），不喂熔断；ErrClient
@@ -2171,8 +2207,13 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 		// 账号余额健康、未限流、session 未死，换号也撞同一堵墙。零动作
 		// （不冷却/不熔断/不 NoteError/不喂连败，同 ErrContentBlocked 待遇）；
 		// chatCompletions 已 fail-fast 503 透传原文、终止轮转——该分支只为文档完备。
+	case upstream.ErrModelMissing:
+		// 11102「模型 id 在上游不存在」：**模型级**而非账号级——换遍全池同一句
+		// （issue #280 实测三号一字不差）。零动作（不冷却/不熔断/不 NoteError/不喂连败，
+		// 也不写 (账号,模型) 负缓存——那会把整池刷成「该模型不可用」），终止轮转与
+		// 400 透传原文由 chatCompletions 的请求级分支负责。
 	case upstream.ErrModelBlocked:
-		// 11102「该后端无此模型」/11158「该账号类型无此模型权限」：
+		// 11158「该账号类型无此模型权限」（11102 已在上面的请求级分支拦下）：
 		// (账号, 模型) 负缓存避让。复用 modelCooldowns 机制（与 6004 同域），
 		// 选号侧 healthyForModel 对该账号自动避开该模型。
 		// 立即换号（本轮 continue），该账号该模型冷却，下次选号避开。

@@ -7,6 +7,7 @@ package upstream
 import (
 	"encoding/json"
 	"log"
+	"regexp"
 	"strings"
 )
 
@@ -445,6 +446,31 @@ func normalizeToolChoice(obj map[string]any) {
 	}
 }
 
+// reuEscape JS 的 \uXXXX / \u{XXXX} 转义（RE2 没有 \u，只有 \x{...}）。
+var reuEscape = regexp.MustCompile(`\\u\{([0-9a-fA-F]{1,6})\}|\\u([0-9a-fA-F]{4})`)
+
+// re2Pattern 把 JS 正则里 RE2 不认的 \u 转义译成 \x{...}，并验证能编译。
+//
+// issue #276：REA 6.9.0 给本地路径字段挂 `^[^\uD800-\uDFFF]*$`，上游按 RE2 解析
+// ⇒ 400 code=11129「工具定义不合规」，整颗 tools 被拒，客户端所有工具都用不了。
+// 单层转义的（客户端写成 JSON 字符串里的 \ud800）经网关 JSON 往返已成 U+FFFD、本来
+// 就能编译；双层转义的（Go 侧拿到字面 \uD800）此前原样转发，这里译成 \x{D800}。
+// 译完仍编不过（混了别的 RE2 不认的语法）返回 false，由调用方丢掉这条 pattern：
+// 丢它只是放宽一条本地正则，留着等于让整包工具被上游否掉。
+// 不含 \u 时原样返回（正常 pattern 零额外开销，也不做编译验证）。
+func re2Pattern(p string) (string, bool) {
+	if !strings.Contains(p, `\u`) {
+		return p, true
+	}
+	q := reuEscape.ReplaceAllStringFunc(p, func(m string) string {
+		return `\x{` + strings.Trim(m[2:], "{}") + `}`
+	})
+	if _, err := regexp.Compile(q); err != nil {
+		return "", false
+	}
+	return q, true
+}
+
 // normalizeToolPatterns 归一化 tools 子树里 pattern 的非标准转义 `\_`（→ `_`）。
 //
 // 上游对 tools[].function.parameters 做严格 JSON Schema/正则文法校验，pattern 含
@@ -484,8 +510,17 @@ func normalizeToolPatterns(obj map[string]any) {
 func unescapePatternLiteralEscapes(node any) {
 	switch n := node.(type) {
 	case map[string]any:
-		if p, ok := n["pattern"].(string); ok && strings.Contains(p, `\_`) {
-			n["pattern"] = strings.ReplaceAll(p, `\_`, `_`)
+		//   - `\_`（JS 正则里非法的转义，上游 RE2 也不认）：去掉反斜杠；
+		//   - `\uXXXX` / `\u{XXXX}`（JS 合法、RE2 没有 \u 转义）：换成等价的 \x{XXXX}。
+		if p, ok := n["pattern"].(string); ok {
+			if strings.Contains(p, `\_`) {
+				p = strings.ReplaceAll(p, `\_`, `_`)
+			}
+			if fixed, compiled := re2Pattern(p); compiled {
+				n["pattern"] = fixed
+			} else {
+				delete(n, "pattern")
+			}
 		}
 		if props, ok := n["patternProperties"].(map[string]any); ok {
 			rebuilt := false

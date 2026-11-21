@@ -27,8 +27,10 @@ func TestClassifyModelBusy(t *testing.T) {
 	if got := Classify(http.StatusTooManyRequests, `{"msg":"too many requests"}`); got != ErrSoftRate {
 		t.Fatalf("普通 429 应为 ErrSoftRate，got=%v", got)
 	}
-	if got := Classify(http.StatusBadRequest, `{"code":11102,"msg":"not found"}`); got != ErrModelBlocked {
-		t.Fatalf("11102 应为 ErrModelBlocked，got=%v", got)
+	// 11102 已独立成 ErrModelMissing（模型 id 不存在 = 模型级答复，issue #280），
+	// 不再是 ErrModelBlocked——后者专指 11158 那种「该账号类型无权使用」。
+	if got := Classify(http.StatusBadRequest, `{"code":11102,"msg":"not found"}`); got != ErrModelMissing {
+		t.Fatalf("11102 应为 ErrModelMissing，got=%v", got)
 	}
 }
 

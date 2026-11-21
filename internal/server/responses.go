@@ -521,11 +521,23 @@ func convertInputItems(items []any, meta *responsesMeta) []any {
 		})
 		toolImgs = nil
 	}
+	// toolTurnText 指向「本轮刚落下的 assistant 正文消息」，供随后的 flush() 把
+	// tool_calls 挂回同一条消息。Codex 会把同一轮的助手正文与工具调用拆成两个 item
+	// （phase=commentary 的 message 项 + function_call 项）；若回放成两条 assistant
+	// 轮，部分模型（kimi/glm 系）只回一句进度就收尾、不再续做工具调用（reporter
+	// PR #281 实测）。跨轮必须复位：user / tool 结果 / 非 assistant 消息都是边界。
+	var toolTurnText map[string]any
 	flush := func() {
 		if len(pending) == 0 {
 			return
 		}
-		out = append(out, map[string]any{"role": "assistant", "content": "", "tool_calls": pending})
+		msg := toolTurnText
+		if msg == nil {
+			msg = map[string]any{"role": "assistant", "content": ""}
+			out = append(out, msg)
+		}
+		msg["tool_calls"] = pending
+		toolTurnText = nil
 		pending = nil
 	}
 	for _, it := range items {
@@ -551,6 +563,9 @@ func convertInputItems(items []any, meta *responsesMeta) []any {
 			continue
 		case "function_call_output", "custom_tool_call_output":
 			flush()
+			// 工具结果落地即本轮结束：后面的 function_call 属于新一轮，不能再并进
+			// 上一条 assistant 消息。
+			toolTurnText = nil
 			if id := asString(m["call_id"]); id != "" {
 				txt, imgs := splitToolImages(m["output"])
 				out = append(out, map[string]any{
@@ -592,7 +607,14 @@ func convertInputItems(items []any, meta *responsesMeta) []any {
 		if role == "" {
 			role = "user"
 		}
-		out = append(out, map[string]any{"role": role, "content": convertContent(m["content"])})
+		msg := map[string]any{"role": role, "content": convertContent(m["content"])}
+		out = append(out, msg)
+		// 只有 assistant 消息可能与本轮随后的工具调用合并；user 侧消息是边界。
+		if role == "assistant" {
+			toolTurnText = msg
+		} else {
+			toolTurnText = nil
+		}
 	}
 	flush()
 	flushImgs()
