@@ -747,7 +747,15 @@ func taskProgressReached(t *upstream.Task) bool {
 
 // executeAutoTask 统一执行任务：只在服务端确认进度达标后领奖，只有服务端确认已领
 // 或领奖接口成功才返回 done。已达标未领取时先领奖，避免重复执行真实对话动作。
-func (p *Panel) executeAutoTask(a *auth.Auth, act *autoAction) (out autoTaskOutcome) {
+// executeAutoTask 执行单个自动任务：内部每次自取任务列表（单任务入口用）。
+func (p *Panel) executeAutoTask(a *auth.Auth, act *autoAction) autoTaskOutcome {
+	return p.executeAutoTaskSeeded(a, act, nil)
+}
+
+// executeAutoTaskSeeded 同 executeAutoTask，但允许传入本轮已拉取的该任务快照，
+// 省掉一次列表请求。一批 25 个配置任务原来要打 25 次列表接口，既慢又容易撞上
+// 上游限流（2026-11-20 01:00 线上就是把一次系统性限流放大成「失败 18 项」）。
+func (p *Panel) executeAutoTaskSeeded(a *auth.Auth, act *autoAction, seed *upstream.Task) (out autoTaskOutcome) {
 	taskCode := "?"
 	uid := "?"
 	if act != nil {
@@ -777,11 +785,18 @@ func (p *Panel) executeAutoTask(a *auth.Auth, act *autoAction) (out autoTaskOutc
 		return autoTaskOutcome{Status: "skipped", Message: "未配置该任务的自动动作"}
 	}
 	out = autoTaskOutcome{Attempt: act.Attempt}
-	before, err := p.taskByCode(a, act.TaskCode)
-	if err != nil {
-		out.Status = "error"
-		out.Message = "查询任务失败: " + err.Error()
-		return out
+	var before *upstream.Task
+	if seed != nil && act != nil && seed.TaskCode == act.TaskCode {
+		snapshot := *seed
+		before = &snapshot
+	} else {
+		var err error
+		before, err = p.taskByCode(a, act.TaskCode)
+		if err != nil {
+			out.Status = "error"
+			out.Message = "查询任务失败: " + err.Error()
+			return out
+		}
 	}
 	if before == nil {
 		out.Status = "skipped"
@@ -1300,79 +1315,126 @@ func (p *Panel) runAutoAllObserved(ctx context.Context, a *auth.Auth, observe fu
 		return out
 	}
 
-	// 阶段 0：批量接受尚未接受的任务（失败不阻塞——行为事件才是进度唯一判据）。
-	emit(autoTaskRunEvent{Kind: "phase", TaskCode: "(批量接受)"})
-	if ctx.Err() == nil {
-		if tasks, err := p.cfg.Upstream.ListTasks(a); err == nil && ctx.Err() == nil {
-			var codes []string
-			for _, t := range tasks {
-				if !t.Claimed && !taskProgressReached(&t) && !t.Locked && t.AcceptStatus != "accepted" && t.AcceptStatus != "completed" {
-					codes = append(codes, t.TaskCode)
-				}
-			}
-			if len(codes) > 0 && ctx.Err() == nil {
-				emit(autoTaskRunEvent{Kind: "phase", TaskCode: "(批量接受)"})
-				if ctx.Err() != nil {
-					return out
-				}
-				if err := p.cfg.Upstream.AcceptTasks(a, codes); err != nil {
-					result := map[string]any{
-						"task_code": "(批量接受)", "status": "error",
-						"message": "接受任务失败（不阻塞后续）: " + err.Error(),
-					}
-					out = append(out, result)
-					emit(autoTaskRunEvent{Kind: "result", TaskCode: "(批量接受)", Result: result})
-				} else {
-					result := map[string]any{
-						"task_code": "(批量接受)", "status": "accepted",
-						"message": fmt.Sprintf("已接受 %d 个任务", len(codes)),
-					}
-					out = append(out, result)
-					emit(autoTaskRunEvent{Kind: "result", TaskCode: "(批量接受)", Result: result})
-					waitForContext(ctx, reportGap)
-				}
-			}
-		}
-	}
-
-	// 阶段 0b：小程序口径任务单独接受（默认列表不含 mp 码；失败不阻塞）。
-	if ctx.Err() == nil {
-		emit(autoTaskRunEvent{Kind: "phase", TaskCode: "(批量接受-mp)"})
+	// 阶段 0：拉一次任务清单，作为全流程的唯一事实来源。
+	//
+	// 2026-11-20 01:00 线上事故：旧实现给每个配置任务各查一次列表，那天上游对高频
+	// 调用瞬时限流，一轮 50 次调用里 35 次失败 ⇒ 界面把一次系统性故障逐项放大成
+	// 「失败 18 项」；而上游自 11-14 起已把任务从 ~25 个收缩到 4 个，配置表里那些
+	// 早已下架的任务只会白跑成「跳过」。现在：清单只拉一次（失败重试一次，仍失败
+	// 就只报 1 条错误并结束本轮），并且只跑**上游当前确实存在**的自动任务。
+	tasks, err := p.cfg.Upstream.ListTasks(a)
+	if err != nil {
+		log.Printf("panel: 任务清单拉取失败，1s 后重试一次 uid=%s: %v", a.UID, err)
+		waitForContext(ctx, time.Second)
 		if ctx.Err() == nil {
-			if mpTasks, err := p.cfg.Upstream.ListTasksMP(a); err == nil && ctx.Err() == nil {
-				var mpCodes []string
-				for _, t := range mpTasks {
-					if !t.Claimed && !taskProgressReached(&t) && !t.Locked && t.AcceptStatus != "accepted" && t.AcceptStatus != "completed" {
-						mpCodes = append(mpCodes, t.TaskCode)
-					}
-				}
-				if len(mpCodes) > 0 && ctx.Err() == nil {
-					emit(autoTaskRunEvent{Kind: "phase", TaskCode: "(批量接受-mp)"})
-					if ctx.Err() != nil {
-						return out
-					}
-					if err := p.cfg.Upstream.AcceptTasksMP(a, mpCodes); err != nil {
-						result := map[string]any{
-							"task_code": "(批量接受-mp)", "status": "error",
-							"message": "接受小程序任务失败（不阻塞后续）: " + err.Error(),
-						}
-						out = append(out, result)
-						emit(autoTaskRunEvent{Kind: "result", TaskCode: "(批量接受-mp)", Result: result})
-					} else {
-						result := map[string]any{
-							"task_code": "(批量接受-mp)", "status": "accepted",
-							"message": fmt.Sprintf("已接受 %d 个小程序任务", len(mpCodes)),
-						}
-						out = append(out, result)
-						emit(autoTaskRunEvent{Kind: "result", TaskCode: "(批量接受-mp)", Result: result})
-						waitForContext(ctx, reportGap)
-					}
-				}
-			}
+			tasks, err = p.cfg.Upstream.ListTasks(a)
+		}
+	}
+	if err != nil {
+		result := map[string]any{
+			"task_code": "(任务列表)",
+			"status":    "error",
+			"message":   "获取上游任务列表失败，本次未执行任何任务（与账号状态无关，多为上游瞬时不可用或限流，稍后重试即可）: " + err.Error(),
+		}
+		out = append(out, result)
+		emit(autoTaskRunEvent{Kind: "result", TaskCode: "(任务列表)", Result: result, Completed: true})
+		return out
+	}
+	// 两个列表请求之间先给观察者一次机会：后台任务在每条事件里检查账号是否还在、
+	// 凭证是否已更新，账号被移除/停用时就不必再发第二个请求。
+	emit(autoTaskRunEvent{Kind: "phase", TaskCode: "(任务列表)"})
+	// 小程序口径列表是默认口径的超集；拉失败只记日志，不阻塞主流程。
+	// 取消后不再发起新的上游调用（进程停机的「等在途请求结束」语义）。
+	var mpTasks []upstream.Task
+	if ctx.Err() == nil {
+		var mpErr error
+		mpTasks, mpErr = p.cfg.Upstream.ListTasksMP(a)
+		if mpErr != nil {
+			log.Printf("panel: 小程序口径任务清单拉取失败（不影响主流程）uid=%s: %v", a.UID, mpErr)
+		}
+	}
+	known := make(map[string]upstream.Task, len(tasks)+len(mpTasks))
+	for _, t := range tasks {
+		known[t.TaskCode] = t
+	}
+	for _, t := range mpTasks {
+		if _, ok := known[t.TaskCode]; !ok {
+			known[t.TaskCode] = t
 		}
 	}
 
+	// 阶段 0a：批量接受尚未接受的任务（失败不阻塞——行为事件才是进度唯一判据）。
+	emit(autoTaskRunEvent{Kind: "phase", TaskCode: "(批量接受)"})
+	pendingAccept := func(list []upstream.Task) []string {
+		var codes []string
+		for _, t := range list {
+			if !t.Claimed && !taskProgressReached(&t) && !t.Locked && t.AcceptStatus != "accepted" && t.AcceptStatus != "completed" {
+				codes = append(codes, t.TaskCode)
+			}
+		}
+		return codes
+	}
+	if ctx.Err() == nil {
+		if codes := pendingAccept(tasks); len(codes) > 0 {
+			var result map[string]any
+			if err := p.cfg.Upstream.AcceptTasks(a, codes); err != nil {
+				result = map[string]any{
+					"task_code": "(批量接受)", "status": "error",
+					"message": "接受任务失败（不阻塞后续）: " + err.Error(),
+				}
+			} else {
+				result = map[string]any{
+					"task_code": "(批量接受)", "status": "accepted",
+					"message": fmt.Sprintf("已接受 %d 个任务", len(codes)),
+				}
+				waitForContext(ctx, reportGap)
+			}
+			out = append(out, result)
+			emit(autoTaskRunEvent{Kind: "result", TaskCode: "(批量接受)", Result: result})
+		}
+	}
+	if ctx.Err() != nil {
+		return out
+	}
+	// 阶段 0b：小程序口径任务单独接受（默认列表不含 mp 码；失败不阻塞）。
+	if codes := pendingAccept(mpTasks); len(codes) > 0 {
+		var result map[string]any
+		if err := p.cfg.Upstream.AcceptTasksMP(a, codes); err != nil {
+			result = map[string]any{
+				"task_code": "(批量接受-mp)", "status": "error",
+				"message": "接受小程序任务失败（不阻塞后续）: " + err.Error(),
+			}
+		} else {
+			result = map[string]any{
+				"task_code": "(批量接受-mp)", "status": "accepted",
+				"message": fmt.Sprintf("已接受 %d 个小程序任务", len(codes)),
+			}
+			waitForContext(ctx, reportGap)
+		}
+		out = append(out, result)
+		emit(autoTaskRunEvent{Kind: "result", TaskCode: "(批量接受-mp)", Result: result})
+	}
+
+	// 只跑上游当前确实存在的自动任务：已下架的配置项不再逐项跑成「跳过」，
+	// 也不再为它们各发一次请求。
+	var todo []autoAction
 	for _, act := range autoActions {
+		if _, ok := known[act.TaskCode]; ok {
+			todo = append(todo, act)
+		}
+	}
+	if len(todo) == 0 {
+		result := map[string]any{
+			"task_code": "(可自动任务)",
+			"status":    "skipped",
+			"message":   fmt.Sprintf("上游当前没有可自动执行的任务（现有 %d 个任务都需要在官方客户端完成）", len(known)),
+		}
+		out = append(out, result)
+		emit(autoTaskRunEvent{Kind: "result", TaskCode: "(可自动任务)", Result: result, Completed: true})
+		return out
+	}
+
+	for _, act := range todo {
 		if ctx.Err() != nil {
 			break
 		}
@@ -1384,10 +1446,11 @@ func (p *Panel) runAutoAllObserved(ctx context.Context, a *auth.Auth, observe fu
 		// 已领或领奖接口成功才报 done（#104 修正「任务结果」）。
 		//
 		// 保留分支的 issue #174 语义：已达标未领的任务必须**补领**再跳过——
-		// executeAutoTask 内部走 claimAutoTask 恰好达成同一效果（达标未领 →
-		// 领奖 → done/claimed），比旧的 skipped+补领 更严格：领奖失败报
-		// claim_pending 而不是静默 skipped。
-		outcome := p.executeAutoTask(a, &act)
+		// executeAutoTask 内部走 claimAutoTask 恰好达成同一效果（达标未领 → 领奖
+		// → done/claimed），比旧的 skipped+补领 更严格：领奖失败报 claim_pending
+		// 而不是静默 skipped。
+		seed := known[act.TaskCode]
+		outcome := p.executeAutoTaskSeeded(a, &act, &seed)
 		result := outcome.resultMap(&act)
 		out = append(out, result)
 		emit(autoTaskRunEvent{Kind: "result", TaskCode: act.TaskCode, Result: result, Completed: true})

@@ -506,8 +506,50 @@ func (m *taskJobManager) run(uid, jobID string, a *auth.Auth) {
 	} else if jobCtx.Err() != nil {
 		m.finish(uid, jobID, "interrupted", "服务关闭，任务已中断")
 	} else {
-		m.finish(uid, jobID, "finished", "全部可自动任务已处理")
+		m.finish(uid, jobID, "finished", m.taskJobSummaryMessage(uid, "全部可自动任务已处理"))
 	}
+}
+
+// taskJobSummaryMessage 按本轮逐项结果生成收尾文案。
+//
+// 旧实现无论成败都写「全部可自动任务已处理」，于是 2026-11-20 那轮上游瞬时限流
+// （18 项失败）在界面上显示成「已结束 · 全部可自动任务已处理」，与事实矛盾。
+// 现在失败项如实计数，并为「上游已无这些任务」给出专门文案。
+func (m *taskJobManager) taskJobSummaryMessage(uid, allDone string) string {
+	m.mu.Lock()
+	job, ok := m.jobs[uid]
+	var results []map[string]any
+	if ok {
+		results = append(results, job.Results...)
+	}
+	m.mu.Unlock()
+	if !ok {
+		return allDone
+	}
+	failed, skipped, done := taskResultCounts(results)
+	if failed > 0 {
+		return fmt.Sprintf("处理完成，其中 %d 项失败（成功 %d 项、跳过 %d 项）", failed, done, skipped)
+	}
+	if done == 0 && skipped > 0 {
+		return "上游当前没有可自动执行的任务（已跳过全部配置项）"
+	}
+	return allDone
+}
+
+// taskResultCounts 统计逐项结果的状态分布。
+func taskResultCounts(results []map[string]any) (failed, skipped, done int) {
+	for _, r := range results {
+		status, _ := r["status"].(string)
+		switch status {
+		case "error":
+			failed++
+		case "skipped":
+			skipped++
+		case "done":
+			done++
+		}
+	}
+	return failed, skipped, done
 }
 
 func (m *taskJobManager) observe(uid, jobID string, event autoTaskRunEvent) {
