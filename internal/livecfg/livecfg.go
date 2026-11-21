@@ -20,6 +20,7 @@ type Snapshot struct {
 	SoftCooldown         time.Duration       // 429 软冷却基数（<=0 时调用方回退内置默认）
 	SanitizeFingerprints bool                // 出站请求体指纹脱敏
 	RecordClientInfo     bool                // 请求日志是否记录调用来源（客户端 IP / UA）
+	NarrationOff         bool                // 关闭「预告式收尾」的自动续写救援（continue.go/narration.go）
 	HiddenModels         map[string]struct{} // 精确隐藏的模型 id（已归一化为 "cn:x"/"global:x" 全量形式）；nil = 不隐藏
 
 	// TTSEnabled / ASREnabled 官方语音端点（/v1/audio/speech、

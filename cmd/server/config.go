@@ -244,6 +244,25 @@ type Config struct {
 		RestrictionWaveDiv int `json:"restriction_wave_div"`
 	} `json:"upstream"`
 
+	// Chat 对话链路的救援/续写行为开关（与 features 的「对外暴露面/指纹」无关，
+	// 单独一节，避免把行为开关混进安全开关）。
+	Chat struct {
+		// NarrationOff 关闭「预告式收尾」的自动续写救援（见 internal/server/narration.go）。
+		//
+		// 默认 false = 启用。启用时：模型输出一段正文、零 tool_calls、finish_reason=stop，
+		// 而尾部是「没说完」的形态（冒号/省略号/未闭合代码块/以「我将…」这类承诺句收尾），
+		// 且上下文里声明过 tools、历史里有工具结果 ⇒ 把已输出正文当 assistant 前缀，
+		// 再向上游要一段，接在同一条 SSE 里（客户端只看到一次连续输出）。
+		//
+		// 为什么要能关：这条救援每次都要重发整段上下文（线上实测单条 0.2 → 8.58 credits，
+		// issue #273），而「模型是不是真没说完」终究是启发式判定——关掉即完全回到
+		// 「上游说什么就透传什么」。面板保存后经 livecfg 热生效，无需重启。
+		//
+		// 只关 narration 一条：toolonly 救援（正文极短就停 + 上下文最后一条是工具结果）
+		// 与 finish_reason=length 的长度续写是另外两条闸门，不受本开关影响。
+		NarrationOff bool `json:"narration_off"`
+	} `json:"chat"`
+
 	Features struct {
 		// SanitizeBlacklistFingerprints 出站请求体黑名单指纹脱敏（默认 true；false 完全还原）。
 		SanitizeBlacklistFingerprints bool `json:"sanitize_blacklist_fingerprints"`

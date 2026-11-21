@@ -30,6 +30,14 @@ func looksLikeJSON(payload string) bool {
 	return t[0] == '{' || t[0] == '['
 }
 
+// SplitConcatenatedJSON 导出粘帧拆分（内部 splitConcatenatedJSON 的导出包装）。
+//
+// 为什么需要：续写层（internal/server/continue.go）要在帧级记 finish_reason /
+// tool_calls / usage 状态，粘在一行的多帧若不拆开，状态会漏记——那一层会把
+// 「finish 被粘在别的帧里」误判成「无 finish 断流」去续写。
+// 语义与 StreamHint 内部调用完全一致（同一实现），没有第二份规则。
+func SplitConcatenatedJSON(payload string) []string { return splitConcatenatedJSON(payload) }
+
 // splitConcatenatedJSON 把粘在一行的多段 JSON 拆成独立片段（每段都是完整 JSON）。
 //
 // 扫描规则：按字节推进，跟踪「是否在字符串内」「转义是否待处理」以及 {} / [] 的

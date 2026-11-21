@@ -871,6 +871,7 @@ curl -s http://127.0.0.1:7863/v1/chat/completions \
 | `upstream.cli_version` | 空 | 出站 UA 的 `CLI/<ver>` 段。空 = 内置默认 `2.161.0`（对齐 CN 5.8.3 / global 5.8.4 分发包内置 CLI）。官方 CLI 单独发版很快（已到 2.179.x），此值与实际分发包会漂移；若上游开始校验 CLI 段版本，把它配成当前版本即可，无需改代码。环境变量 `WB2A_CLI_VERSION` |
 | `upstream.tls_fingerprint` | `node` | **出站 ClientHello 指纹档位**：`node` = 复刻官方 Node/OpenSSL 形态（JA3 md5 `71dc8c533dd919ae9f4963224a4ba8fd`、JA4 `t13d0a1200_5d04281c6031_b76c5ee2507d`，与官方真机一致，CN 与 GL 同值）；`go` = crypto/tls 原生形态（排障/回滚用）。**为什么需要它**：请求头对齐只解决 HTTP 层，TLS 握手发生在更早，现代风控先看 JA3/JA4。非法值启动即报错（不静默回落）。**已知边界**：走 HTTP 代理时指纹不生效（代理隧道不经过本仓的 TLS 拨号钩子），此时退回 Go 原生形态。改动需重启 |
 | `features.sanitize_blacklist_fingerprints` | `true` | 出站请求体黑名单指纹脱敏 |
+| `chat.narration_off` | `false` | 关闭「预告式收尾」的自动续写救援。缺省启用：模型输出一段正文、零 tool_calls、`finish_reason=stop`，而尾部明显没说完（冒号/省略号/未闭合代码块/「我将开始…」承诺句）且上下文里声明过 tools、历史里确实调过工具时，把已输出正文当 assistant 前缀再向上游要一段，接在同一条 SSE 里，客户端只看到一次连续输出。**每次救援都要重发整段上下文**（线上实测单条 0.2 → 8.58 credits），且「有没有说完」终究是启发式判定——关掉即完全回到「上游说什么就透传什么」。只关这一条：toolonly 救援（正文极短就停且最后一条是工具结果）与 `finish_reason=length` 的长度续写不受影响。面板保存后热生效 |
 | `models.hidden` | `[]` | 模型黑名单：不对外暴露的模型。裸名=两域都藏；`"cn:xxx"`/`"global:xxx"`=只藏该域。`GET /v1/models` 列表过滤 + `POST /v1/chat/completions` 点名拒绝（400 `model_unavailable`）。面板保存后热生效 |
 | `prompt.mode` | `passthrough` | 系统提示词模式：`custom` = 网关用自有提示词替换客户端 system；`append` = 开头连续 system/developer 块后插网关提示词（既有消息逐字不动）；`passthrough` = 透传客户端原始 system（降级重试仍切中性提示词） |
 | `prompt.file` | 空 | 提示词文件路径；空 = 内置默认（约 2KB）；路径非空但不可读 → 启动报错 |
@@ -1231,7 +1232,7 @@ http://127.0.0.1:7863/panel/
 | **运行日志** | **请求记录表**（时间 / 结果 / 模型 / 账号 / **来源 IP** / **User-Agent** / 耗时 / Token / 积分 / 请求 ID），支持按 IP·UA·模型·账号·请求 ID 与结果筛选、读取条数、时间范围；下方 **运行日志** 按「任务 / 对话 / 系统」分频道，每频道各保留最近 500 行，任务结果独立落盘、可跨重启查询；新增 **积分历史**（每次真实查到余额与上次比对，变动即留痕） |
 
 **配置热生效**：保存配置后，`api_key`、`cooldown.soft_rate`、`features.sanitize_blacklist_fingerprints`、
-`models.hidden`、`logging.request_client_info`、`pool.*`（熔断/在途/权重）、`schedule.*`（时点/开关/余额刷新间隔）**立即生效，无需重启**；
+`chat.narration_off`、`models.hidden`、`logging.request_client_info`、`pool.*`（熔断/在途/权重）、`schedule.*`（时点/开关/余额刷新间隔）**立即生效，无需重启**；
 涉及进程装配期依赖的字段（`listen`、`auth_dir`、`state_file`、`upstream.*`、`upstash.*`、`session_sticky.ttl`）
 保存后会提示"需重启进程生效"。配置写入采用「深合并且原子替换」：只更新面板表单覆盖的键，
 用户手写的未知键与其余字段原样保留。

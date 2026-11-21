@@ -1568,7 +1568,20 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		if peek.Stream {
 			// 流式：透传结束后立即关闭上游 body，避免 defer 在轮转场景下堆积 fd。
 			st.status = http.StatusOK
-			stats := newChatStatsReaderSince(rc, st.start)
+			// 续写救援层（来自 reporter fork continue.go）：夹在上游 body 与统计/透传之间。
+			//
+			// 它读出上游帧、边读边原样交给下游，只在「模型说完一段就停、而上下文里
+			// 明明还有活要干」时向上游再要一段（narration/toolonly 两条救援）。对正常
+			// 流是纯透传：帧内容、顺序、[DONE] 都不变，唯一的差别是 narration 救援会
+			// 在等待下一段时补 `: keepalive` 注释帧（SSE 注释行，客户端按规范忽略）。
+			//
+			// 为什么接在 stats 之前：续写段的 usage 也要计入本次请求的记账（上游每段
+			// 各给一份 usage，末帧口径会少记前面几段）；cont.billedUsage() 就是合并后
+			// 的那份，见下方 recordAttempt。
+			cont := newContinueReader(r.Context(), h.cfg.Upstream, acct, body, clientIP, chatMeta, rc)
+			cont.narrationOff = h.loadLive().NarrationOff
+			defer cont.Close()
+			stats := newChatStatsReaderSince(cont, st.start)
 			// gateway_hint（SSE）：成功状态 200 已开流，中途 error 帧透传时附加
 			// hint 字段（hintFn 惰性求值——正常流零开销，只有真撞到 error 帧才
 			// 组装请求上下文做判定）。
@@ -1642,10 +1655,18 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			credit, hasCredit := stats.Credit()
 			total, hasTotal := stats.TotalTokens()
 			hasCredit = validUsageCost(credit, hasCredit, total, hasTotal)
+			bill := stats.Usage()
+			// 续写救援会把一次请求拆成多段上游调用，每段各给一份 usage；stats 只看末帧，
+			// 用它记账会漏掉前面几段（救援越多漏得越多）。cont.billedUsage() 给出各段
+			// 合并后的 usage，有就用它（token 明细、credit、total 一并取），没有则回落
+			// stats 口径——单段请求两者等价。
+			if u := cont.billedUsage(); u != nil {
+				bill, credit, total, hasCredit = billedDelta(u)
+			}
 			if hit, miss, ok := stats.CacheTokens(); ok {
 				st.cacheHit, st.cacheMiss, st.hasCache = hit, miss, true
 			}
-			recordAttempt(acct.UID, stats.Usage(), credit, hasCredit, attemptStarted, stats.TTFB())
+			recordAttempt(acct.UID, bill, credit, hasCredit, attemptStarted, stats.TTFB())
 			// WARN 信号放 recordAttempt 之后：st.promptTokens 此时才是本次的观测值。
 			if st.hasCache {
 				cacheMissWarn.noteCacheTokens(bareModel, st.promptTokens, st.cacheHit, st.cacheMiss)
@@ -1707,7 +1728,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 					h.cfg.Pool.NoteBurn(acct.UID, credit)
 				}
 			}
-			rc.Close()
+			// 收上游 body：cont.Close() 会取消在途续写段并收走迟到段的上游 body，
+			// 直接关 rc 会把那段 body 漏成 fd。
+			cont.Close()
 			return
 		}
 		resp, err := upstream.Aggregate(rc)

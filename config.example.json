@@ -74,6 +74,10 @@
     "_comment_restriction_wave_div": "restriction_wave_div: 连坐阈值的除数，阈值 = 该域可用号数 / 本值，下限 2（小池封两个就暂停，大池按比例放大：340 个健康号封到 34 个才暂停）。0 = 关闭连坐闸（只剩「命中即停手」）。缺省 10（需重启生效）。",
     "restriction_wave_div": 10
   },
+  "chat": {
+    "_comment_narration_off": "narration_off: 关闭「预告式收尾」的自动续写救援。缺省 false = 启用：模型输出一段正文、零 tool_calls、finish_reason=stop，而尾部没说完（冒号/省略号/未闭合代码块/「我将…」承诺句）且上下文里声明过 tools、历史里有工具结果时，把已输出正文当前缀再向上游要一段，接在同一条 SSE 里。救援要重发整段上下文（实测单条 0.2 → 8.58 credits），关掉即完全透传。面板保存后热生效。只关这一条：toolonly 救援与 finish=length 的长度续写不受影响。",
+    "narration_off": false
+  },
   "features": {
     "sanitize_blacklist_fingerprints": true
   },

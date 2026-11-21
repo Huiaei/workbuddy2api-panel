@@ -1,0 +1,95 @@
+// rescue_trace.go 救援判据的枚举化诊断（来自 reporter fork，issue #245 的补充诉求）。
+//
+// 「finish=stop + 声明了工具 + 零工具调用」在日志里一律表现为「没有续写」，
+// 但成因差得很远：正文本来就写完了、尾部判定认成写完、历史里没有工具轮、
+// 上游没给 usage 所以不敢救……排障时无法区分，复现的用户又不愿交出提示词与正文。
+//
+// 所以这里只记**枚举码与布尔量**，一个字节的请求内容都不落日志。
+// 默认关闭（WB2API_RESCUE_TRACE=1 打开）：判据在热路径上，留一个 if 就够。
+package server
+
+import (
+	"fmt"
+	"log"
+	"os"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/linguo2625469/workbuddy2api-panel/internal/logfmt"
+)
+
+// rescueTrace 是否记录救援被哪道闸门挡掉。
+var rescueTrace = os.Getenv("WB2API_RESCUE_TRACE") != ""
+
+// skip 记下「这条救援被哪道闸门挡掉」后返回 false。
+//
+// 所有判据出口都走这里，而不是在判据旁边再写一份记录：两份实现会漂移，
+// 而这条日志的唯一价值就是「它记的就是当时真正生效的那道闸门」。
+func (r *continueReader) skip(rule, code string) bool {
+	if rescueTrace {
+		r.rescueWhy = append(r.rescueWhy, rule+"="+code)
+	}
+	return false
+}
+
+// logRescueSkip 一轮结束、一条救援都没成时打一行原因码。
+//
+// prompt 同时给出「有没有 usage」与取值——toolonly 的救援要求 prompt 够长，
+// 「上游没给 usage」与「给了但太短」是两种完全不同的结论。
+//
+// 与 reporter 的差别（裁剪项）：reporter 还会打 budget_raised（本轮输出预算是否被
+// 网关抬到档位下限）。我方没有该特性（没有 upstream.OutputBudgetFloor/EnsureMinBudget），
+// 该字段一并去掉。
+func (r *continueReader) logRescueSkip() {
+	if !rescueTrace || len(r.rescueWhy) == 0 {
+		return
+	}
+	prompt := "unknown"
+	if p, ok := r.usage["prompt_tokens"].(float64); ok {
+		prompt = fmt.Sprintf("%d", int64(p))
+	}
+	log.Printf("[rescue] acct=%s model=%s finish=%q text=%dB prompt=%s limit_set=%v why=%s",
+		logfmt.Label(r.acct.UID, r.acct.Nickname), bareModelOf(r.body), r.finish, r.text.Len(),
+		prompt, r.limitSet, strings.Join(r.rescueWhy, " "))
+}
+
+// 今日各类救援的触发次数（面板概况「今日救援」卡片）。
+//
+// 为什么需要：这条救援会多打一次上游、多付一遍整段 prompt（issue #273 实测单条
+// 0.2 → 8.58 credits），触发频率只有网关日志里能看见，面板上看不出来。计数器让
+// 「今天怎么突然贵了」有个一眼能看到的出口。
+// 进程内计数、跨天归零：它是异常探测器，不是账（重启归零可以接受，真账在用量记录里）。
+var rescueToday struct {
+	mu  sync.Mutex
+	day string
+	n   map[string]int
+}
+
+func noteRescue(kind string) {
+	day := time.Now().Format("2006-01-02")
+	rescueToday.mu.Lock()
+	defer rescueToday.mu.Unlock()
+	if rescueToday.day != day || rescueToday.n == nil {
+		rescueToday.day, rescueToday.n = day, map[string]int{}
+	}
+	rescueToday.n[kind]++
+}
+
+// RescueToday 今日各类救援次数快照（narration/toolonly）；跨天自动归零。
+//
+// 与 reporter 的差别（裁剪项）：reporter 这里还有 starved 一类（未移植的 starved.go），
+// 面板侧的「今日救援」卡片也未接入。
+func RescueToday() map[string]int {
+	day := time.Now().Format("2006-01-02")
+	rescueToday.mu.Lock()
+	defer rescueToday.mu.Unlock()
+	if rescueToday.day != day || rescueToday.n == nil {
+		return map[string]int{}
+	}
+	out := make(map[string]int, len(rescueToday.n))
+	for k, v := range rescueToday.n {
+		out[k] = v
+	}
+	return out
+}
