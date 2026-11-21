@@ -99,6 +99,9 @@ type Panel struct {
 
 	// 持久化的账号后台任务（taskjobs.go），由 main 管理生命周期。
 	taskJobs *taskJobManager
+
+	// taskLive 实时任务快照与「同一时刻只跑一轮」的闸门（tasklive.go）。
+	taskLive liveCache
 }
 
 // tryLockAccount 尝试锁定账号的任务执行；已在执行返回 false。
@@ -190,6 +193,8 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("GET /panel/api/tasks/queue", p.withAuth(p.tasksQueueStatus))
 	p.mux.HandleFunc("GET /panel/api/tasks/jobs", p.withAuth(p.taskJobsHandler))
 	p.mux.HandleFunc("GET /panel/api/accounts/{uid}/tasks/job", p.withAuth(p.taskJobStatus))
+	// 实时任务（tasklive.go）：只读视图，逐账号查一次任务表 + TTL 缓存，供前端轮询。
+	p.mux.HandleFunc("GET /panel/api/tasks/live", p.withAuth(p.tasksLive))
 	p.mux.HandleFunc("GET /panel/api/school/vouchers", p.withAuth(p.schoolVouchers))
 	p.mux.HandleFunc("POST /panel/api/checkin_all", p.withAuth(p.checkinAll))
 	p.mux.HandleFunc("POST /panel/api/travel_all", p.withAuth(p.travelAll))
