@@ -546,6 +546,15 @@ func convertInputItems(items []any, meta *responsesMeta) []any {
 			continue
 		}
 		typ, _ := m["type"].(string)
+		// 托管工具调用项与 compaction 状态项（web_search_call / image_generation_call /
+		// mcp_call / compaction …）既没有 role 也没有 content。必须在 flushImgs /
+		// flush 之前就判掉：晚一步它会先把上一批工具调用落成一条消息（拆批，上游按
+		// 11148 判配对失败），或把工具结果的图片插到两条 tool 消息之间。
+		// 判据取「没 role 且没内容」而不是按 type 枚举，上游将来加新类型也不必改这里。
+		if role0, _ := m["role"].(string); role0 == "" && !responsesItemHandled(typ) &&
+			isEmptyContent(convertContent(m["content"])) {
+			continue
+		}
 		// 图片的落点是「这一轮工具到此为止」的那个项，**不能挂在 flush() 里**：
 		// flush() 在每条 function_call_output 开头都会跑，于是并行工具调用
 		// （assistant 一条带多个 tool_calls）处理第二条结果时，会先把第一条结果的图
@@ -604,12 +613,42 @@ func convertInputItems(items []any, meta *responsesMeta) []any {
 		}
 		flush()
 		role, _ := m["role"].(string)
+		content := convertContent(m["content"])
+		// 托管工具与状态项（web_search_call / image_generation_call / mcp_call /
+		// compaction 等）既没有 role 也没有 content：落到默认分支会变成一条**空的
+		// user 消息**。它插进并行工具调用之间就把同一批 tool_calls 拆成两批（上游按
+		// 11148 判配对失败），还会把 image_generation_call 的 base64 成品整段送出站。
+		// 判据取「没 role 且没内容」而不是按 type 枚举：上游将来加新类型也不必改这里。
+		if role == "" && isEmptyContent(content) {
+			continue
+		}
 		if role == "" {
 			role = "user"
 		}
-		msg := map[string]any{"role": role, "content": convertContent(m["content"])}
+		msg := map[string]any{"role": role, "content": content}
+		if role == "assistant" {
+			// 客户端按 Chat 形状回放的历史里，工具调用挂在 assistant 的 tool_calls
+			// 字段上（不是独立的 function_call 项）。只拷 role/content 会把它丢掉，
+			// 随后那条 tool 消息就成了无主孤儿，被 cleanupOrphanToolCalls 连结果一起删。
+			if tcs, ok := m["tool_calls"].([]any); ok && len(tcs) > 0 {
+				msg["tool_calls"] = tcs
+			}
+		}
+		if role == "tool" {
+			// 客户端按 Chat 形状回放的 tool 消息必须带 tool_call_id：丢了它，
+			// cleanupOrphanToolCalls 会把它当孤儿消息，连同真正的那条 tool_call 一起
+			// 删掉，历史里这轮工具调用就此凭空消失。call_id 是 Responses 形状的别名。
+			if id := asString(m["tool_call_id"]); id != "" {
+				msg["tool_call_id"] = id
+			} else if id := asString(m["call_id"]); id != "" {
+				msg["tool_call_id"] = id
+			}
+			if n := asString(m["name"]); n != "" {
+				msg["name"] = n
+			}
+		}
 		out = append(out, msg)
-		// 只有 assistant 消息可能与本轮随后的工具调用合并；user 侧消息是边界。
+		// 只有 assistant 消息可能与本轮随后的工具调用合并；user / tool 消息是边界。
 		if role == "assistant" {
 			toolTurnText = msg
 		} else {
@@ -619,6 +658,32 @@ func convertInputItems(items []any, meta *responsesMeta) []any {
 	flush()
 	flushImgs()
 	return out
+}
+
+// responsesItemHandled 列出 convertInputItems 里有专门分支的项类型。其余类型若既没有
+// role 也没有内容（托管工具调用、compaction 状态项），一律不参与回放。
+func responsesItemHandled(typ string) bool {
+	switch typ {
+	case "reasoning", "item_reference", "function_call", "custom_tool_call",
+		"function_call_output", "custom_tool_call_output", "agent_message":
+		return true
+	}
+	return false
+}
+
+// isEmptyContent 判断 convertContent 的结果是否「什么都没带」：托管工具调用项与
+// compaction 状态项都长这样（没有 role、没有 content），它们不该在回放历史里留下
+// 一条空消息。带内容的未知项照旧送达（future_note 之类），所以只看内容不看 type。
+func isEmptyContent(v any) bool {
+	switch c := v.(type) {
+	case nil:
+		return true
+	case string:
+		return strings.TrimSpace(c) == ""
+	case []any:
+		return len(c) == 0
+	}
+	return false
 }
 
 // splitToolImages 拆开工具输出的正文与图片：Chat 的 tool 消息不许带图（OpenAI 直接
