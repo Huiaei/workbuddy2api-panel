@@ -1004,6 +1004,13 @@ func Classify(status int, body string) ErrKind {
 	if IsUncodedRequestIllegal(body) {
 		return ErrChannelRefused
 	}
+	// 11140 的第二种形态（账号风控「限制文书」：账号存在异常行为 / unusual
+	// activity）必须先于 accountFaultMarkers 判：它不带 "request illegal" 字样，
+	// 落到下面的通用 4xx 兜底就是 ErrClient（只换号、不罚号），于是同一个请求
+	// 顺着轮转把整池账号挨个送进风控。见 restrict.go 与 server/restrict.go。
+	if IsRestricted(body) {
+		return ErrAccountFault
+	}
 	for _, m := range accountFaultMarkers {
 		if strings.Contains(lower, strings.ToLower(m)) || strings.Contains(body, m) {
 			return ErrAccountFault

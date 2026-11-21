@@ -102,6 +102,15 @@ type Config struct {
 	// 路径用本字段。
 	TTSEnabled bool
 	ASREnabled bool
+	// RestrictionHold 11140 风控连坐的全域派发暂停时长
+	// （upstream.restriction_hold_seconds，缺省 1800s；0 = 只保留「命中即停手」
+	// 这道闸，不暂停派发）。见 restrict.go。启动时读取。
+	RestrictionHold time.Duration
+
+	// RestrictionWaveDiv 连坐阈值的除数（upstream.restriction_wave_div，缺省 10；
+	// 0 = 关闭连坐闸，只保留「命中即停手」）。阈值 = 该域可用号数 / div，下限 2。
+	// 见 restrict.go。启动时读取。
+	RestrictionWaveDiv int
 }
 
 // loadLive 返回当前运行期快照；Live 为 nil 时用静态字段合成。
@@ -149,6 +158,10 @@ type Handler struct {
 	// wafIP WAF IP 级拦截状态机（fail-fast，wafip.go）：短窗多号 WAF 403 →
 	// 激活期轮转遇 WAF 403 直接终止（不放大请求量）。进程内状态、重启清零。
 	wafIP wafIPGate
+	// restrict 11140 连坐闸门（restrict.go）：命中即停手（本请求不换号）+ 同域
+	// 短窗被封号数达阈值时暂停该域派发（避免一次请求屠掉整池）。进程内状态、
+	// 重启清零。
+	restrict restrictionGate
 }
 
 // NewHandler 构建 handler。
@@ -829,6 +842,24 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// 11140 连坐闸（restrict.go 的第二道闸，跨请求生效）：同一域在短窗内被封的
+	// 号数已达阈值 ⇒ 这个域正在被上游风控扫，**暂停派发**，而不是继续拿号去撞。
+	// 503 + Retry-After 让客户端退避，同时把「换号/循环重试就能绕过」这条错路
+	// 堵死（客户端在暂停期内的重试不消耗任何账号）。
+	//
+	// 只按域统计：cn 与 global 是两套独立上游（不同域名/风控名单/出口），cn 被
+	// 连坐时 global 往往还健康，一起暂停等于人为放大故障面。
+	if d := h.restrict.remaining(realm); d > 0 {
+		secs := int(d.Seconds() + 0.999)
+		w.Header().Set("Retry-After", strconv.Itoa(secs))
+		writeOpenAIErrorHint(w, http.StatusServiceUnavailable, "account_restricted_hold",
+			fmt.Sprintf("upstream restricted several accounts recently (403 / code 11140); dispatch paused for %ds to avoid further bans — do not rotate accounts or retry in a loop", secs),
+			"wait for the restriction hold to expire or appeal to WorkBuddy; rotating accounts during a restriction wave gets more of them banned")
+		st.status = http.StatusServiceUnavailable
+		st.outcome = reqlog.OutcomeHTTPError
+		return
+	}
+
 	tried := map[string]bool{}
 	var lastErr error
 	// stallRetry 记录本次请求已因「零 tool_calls 停摆」重试了几次（issue #149）。
@@ -1494,6 +1525,29 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			lastErr = &upstream.Error{Kind: kind, Status: status, Msg: string(respBody), RetryAfter: uerr.RetryAfter}
 			h.applyErrorPolicy(acct.UID, kind, string(respBody), bareModel, uerr)
 			fail(acct.UID)
+			// 11140 连坐保护的第一道闸（restrict.go）：账号级限制命中即**停手**——
+			// 本请求不再换号。换号在上游看来就是「同一个请求挨个号去撞」，只会把
+			// 更多健康号送进风控名单（实测一次请求能把 5 个健康号打成 11140）。
+			// 第二道闸（同域连坐）已在 noteRestriction 内部记账，下一个请求在入口
+			// 就被 503 拦下，不必在这里等。
+			//
+			// 503 + account_restricted_hold（而不是笼统的 no_healthy_account）：
+			// 「号被上游限制」与「服务端没号可用」是两件事，客户端按前者去等/申诉，
+			// 按后者会无脑重试。原文照透（含 requestId，申诉要用）。
+			if h.noteRestriction(acct, kind, string(respBody)) {
+				msg := strings.TrimSpace(string(respBody))
+				if msg == "" {
+					msg = "upstream rejected this account as restricted (code 11140, unusual activity)"
+				}
+				if d := h.restrict.remaining(acct.Realm()); d > 0 {
+					w.Header().Set("Retry-After", strconv.Itoa(int(d.Seconds()+0.999)))
+				}
+				writeOpenAIErrorHint(w, http.StatusServiceUnavailable, "account_restricted_hold", msg,
+					"stop rotating accounts: this account was flagged as restricted (code 11140). Wait for the hold to expire, or appeal to WorkBuddy (submit feedback) to lift the restriction")
+				st.status = http.StatusServiceUnavailable
+				st.outcome = reqlog.OutcomeHTTPError
+				return
+			}
 			// WAF IP 级 fail-fast（优先于 rotateBackoff 退避——IP 级拦截时退避无意义）：
 			// 该次 WAF 403 喂入 IP 级状态机，若激活（短窗多号命中，IP 被拦而非账号）
 			// 则立即终止轮转——继续换号只会把请求放大 MaxRotate 倍打同一出口 IP，
@@ -1554,6 +1608,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				// 整个会话钉在它身上，后续每轮都失败。
 				kind := upstream.FrameKind(errFrame)
 				h.applyErrorPolicy(acct.UID, kind, errFrame, bareModel, nil)
+				// 11140 连坐保护（restrict.go）：流式这一跳**无法再换号**（头已写出、
+				// 错误帧也已透传给客户端），所以这里不 break，只把这次命中记进同域
+				// 连坐计数——短窗内被封号数到阈值时，后续请求在入口就被 503 拦下，
+				// 不再挨个号去撞同一波风控。账号本身已由 applyErrorPolicy 处置。
+				h.noteRestriction(acct, kind, errFrame)
 				st.status = http.StatusServiceUnavailable
 				st.outcome = reqlog.OutcomeStreamError
 				log.Printf("WARN: [server] stream acct=%s model=%s: upstream error frame kind=%s payload=%s",
@@ -2152,7 +2211,15 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 		//     **保持软冷却**（禁用会让用户补完 register 后仍无法用）。
 		// 注意 11-128/11128 的 msg 同为 "request illegal"，但那是通道校验失败，已在
 		// Classify 分流到 ErrChannelRefused，走不到这里。
-		if upstream.IsAccountRestricted(body) {
+		// 11140 的两条账号级形态（判据见 upstream/restrict.go）：
+		//   - "request illegal" 家族（IsAccountRestricted）：账号授权风控；
+		//   - 「账号存在异常行为 / unusual activity」限制文书（IsRestricted）：
+		//     不带 "request illegal" 字样，历史口径滑到通用 4xx 兜底 → 只换号不
+		//     罚号 → 同一请求顺着轮转把整池号送进风控（restrict.go 的连坐闸就是
+		//     为这件事兜底）。
+		// 两者的**惩罚**一致（硬禁用，解除只能申诉），差异只在理由文案；下面对
+		// 429 的惩罚分级（瞬时限流只软冷却）对两者同样适用。
+		if upstream.IsAccountRestricted(body) || upstream.IsRestricted(body) {
 			// **惩罚强度按上游状态码分级**：
 			//   - 429（瞬时限流）⇒ 只软冷却，**不永久禁用**。上游既然给了 429，
 			//     语义就是「限流、几分钟自愈」；把它解释成「账号封禁」⇒ 一次
@@ -2166,6 +2233,12 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 			// 误禁不可自愈。两者不对称，故取软冷却。
 			if uerr != nil && uerr.Status == http.StatusTooManyRequests {
 				h.cfg.Pool.CooldownSoftRate(uid, h.softCooldown(), time.Time{}, "upstream 429 with account-restricted code (11140): soft cooldown, not a permanent ban")
+				return
+			}
+			if upstream.IsRestricted(body) {
+				// 限制文书形态：理由里点出「unusual activity」——用户按这个说法去
+				// 申诉才对得上上游给出的事实（"request illegal" 是另一条形态）。
+				h.cfg.Pool.Disable(uid, "account restricted by upstream (11140 unusual activity); appeal in WorkBuddy (submit feedback) to lift the restriction")
 				return
 			}
 			h.cfg.Pool.Disable(uid, "account restricted by upstream (11140 request illegal); appeal in WorkBuddy (submit feedback) to lift the restriction")

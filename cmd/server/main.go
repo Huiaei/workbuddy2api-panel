@@ -508,6 +508,11 @@ func run() error {
 		// 静态回退；运行期以 livecfg 快照为准。
 		TTSEnabled: cfg.Upstream.TTSEnabled,
 		ASREnabled: cfg.Upstream.ASREnabled,
+		// 11140 连坐保护（internal/server/restrict.go）：命中即停手（本请求不换号）
+		// + 同域短窗被封号数达阈值时暂停该域派发。两个值都是**装配期**读进
+		// server.Config 的，运行期不再读配置——改动需重启（见 restartRequiredFields）。
+		RestrictionHold:    time.Duration(cfg.Upstream.RestrictionHoldSeconds) * time.Second,
+		RestrictionWaveDiv: cfg.Upstream.RestrictionWaveDiv,
 	})
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -806,6 +811,10 @@ func restartRequiredFields(current, next *Config) []string {
 	// 零 tool_calls 停摆重试（issue #149）：装配期读进 server.Config，进程内不再
 	// 读取——改了必须重启才生效（漏列会让面板显示「已保存」却不生效）。
 	changed("upstream.tool_stall_retry", current.Upstream.ToolStallRetry, next.Upstream.ToolStallRetry)
+	// 11140 连坐保护：装配期换算成 server.Config.RestrictionHold/RestrictionWaveDiv，
+	// 进程内不再读配置——改了必须重启才生效（漏列会让面板显示「已保存」却不生效）。
+	changed("upstream.restriction_hold_seconds", current.Upstream.RestrictionHoldSeconds, next.Upstream.RestrictionHoldSeconds)
+	changed("upstream.restriction_wave_div", current.Upstream.RestrictionWaveDiv, next.Upstream.RestrictionWaveDiv)
 	changed("global.enabled", current.Global.Enabled, next.Global.Enabled)
 	changed("global.chat_base", current.Global.ChatBase, next.Global.ChatBase)
 	changed("global.billing_base", current.Global.BillingBase, next.Global.BillingBase)

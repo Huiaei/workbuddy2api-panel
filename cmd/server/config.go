@@ -224,6 +224,24 @@ type Config struct {
 		// 让调用方看得出「功能存在、只是没开」），打开开关即热生效。
 		TTSEnabled bool `json:"tts_enabled"`
 		ASREnabled bool `json:"asr_enabled"`
+		// RestrictionHoldSeconds 11140 风控连坐的全域派发暂停时长（秒），缺省 1800。
+		//
+		// 上游在短时间内把多个号判成「账号存在异常行为 / unusual activity」（业务码
+		// 11140 的限制文书）时，说明这一域正在被风控扫；此时继续轮转只会把更多号
+		// 送进名单。达到连坐阈值后**暂停该域派发**这么久（见 internal/server/
+		// restrict.go）：30s 起按 2 倍退避、封顶 600s，平静 30 分钟后清零。
+		//
+		// 0 = 只保留「命中即停手」（本请求不换号 + 禁用该号），不做全域暂停。
+		// 负值无意义，normalize() 直接报错（静默钳 0 等于把保护悄悄关掉）。
+		RestrictionHoldSeconds int `json:"restriction_hold_seconds"`
+		// RestrictionWaveDiv 连坐阈值的除数，缺省 10（0 = 关闭连坐闸）。
+		//
+		// 阈值 = 该域此刻可用号数 / 本值，下限 2：小池封两个就暂停，大池按比例
+		// 放大（340 个健康号封 2 个不暂停、封到 34 个才暂停——否则大池会在「封了
+		// 两个」时整域躺 30 分钟，误伤面比连坐本身还大）。
+		//
+		// 0 = 关闭连坐闸（只剩「命中即停手」）；负值无意义，normalize() 报错。
+		RestrictionWaveDiv int `json:"restriction_wave_div"`
 	} `json:"upstream"`
 
 	Features struct {
@@ -389,6 +407,12 @@ func Default() *Config {
 	// ToolStallRetry 缺省 1（issue #149）：非流式请求声明了 tools 却收到「只回正文
 	// + stop 收尾」时换号再问一次（不罚账号）。0 = 关闭重试（仍记录观测）。
 	c.Upstream.ToolStallRetry = 1
+	// RestrictionHoldSeconds 缺省 1800（30 分钟）：11140 连坐触发后暂停该域派发的
+	// 时长。0 = 只保留「命中即停手」，不暂停派发。
+	c.Upstream.RestrictionHoldSeconds = 1800
+	// RestrictionWaveDiv 缺省 10：连坐阈值 = 该域可用号数 / 10，下限 2。
+	// 0 = 关闭连坐闸（只剩「命中即停手」）。
+	c.Upstream.RestrictionWaveDiv = 10
 	// Global.Enabled 缺省 true（纯 CN 行为不变：CN 账号恒判 cn，global base 不被使用）；
 	// ChatBase/BillingBase 缺省空（回落内置默认）。
 	c.Global.Enabled = true
@@ -776,6 +800,14 @@ func (c *Config) normalize() error {
 	}
 	if c.Upstream.ToolStallRetry > 3 {
 		c.Upstream.ToolStallRetry = 3
+	}
+	// 11140 连坐保护（internal/server/restrict.go）：两个开关都**不静默钳 0**——
+	// 0 是合法取值（关掉对应那道闸），负值没有语义，直接报错。
+	if c.Upstream.RestrictionHoldSeconds < 0 {
+		return fmt.Errorf("upstream.restriction_hold_seconds: 负值 %d 无意义（0 = 只保留「命中即停手」）", c.Upstream.RestrictionHoldSeconds)
+	}
+	if c.Upstream.RestrictionWaveDiv < 0 {
+		return fmt.Errorf("upstream.restriction_wave_div: 负值 %d 无意义（0 = 关闭连坐闸）", c.Upstream.RestrictionWaveDiv)
 	}
 	// 出站 TLS 指纹档位（node/go）。空 = 缺省 node（复刻官方）。
 	// 非法取值直接报错而不是回落——静默回落等于用户以为复刻生效了。

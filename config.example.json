@@ -68,7 +68,11 @@
     "tool_stall_retry": 1,
     "_comment_audio": "tts_enabled / asr_enabled: 官方语音端点 POST /v1/audio/speech（文本转语音，返 WAV）与 POST /v1/audio/transcriptions（语音转文本）的总开关。协议来自官方桌面端包的静态反查（/v2/audio/speech 的 SSE+PCM、/agenttool/v1/asr 的 multipart），尚未真机抓包对照，故默认关闭。关着时两个端点仍在、但回 403；打开后热生效（面板保存即可）。",
     "tts_enabled": false,
-    "asr_enabled": false
+    "asr_enabled": false,
+    "_comment_restriction_hold": "restriction_hold_seconds: 11140 连坐保护的全域派发暂停时长（秒）。上游在短窗内把多个号判成「账号存在异常行为 / unusual activity」（11140 限制文书）时，说明该域正在被风控扫；达到连坐阈值后暂停该域派发，避免继续轮转把更多号送进名单。30s 起按 2 倍退避、封顶 600s，平静 30 分钟后清零。0 = 只保留「命中即停手」（本请求不换号 + 禁用该号）。缺省 1800（需重启生效）。",
+    "restriction_hold_seconds": 1800,
+    "_comment_restriction_wave_div": "restriction_wave_div: 连坐阈值的除数，阈值 = 该域可用号数 / 本值，下限 2（小池封两个就暂停，大池按比例放大：340 个健康号封到 34 个才暂停）。0 = 关闭连坐闸（只剩「命中即停手」）。缺省 10（需重启生效）。",
+    "restriction_wave_div": 10
   },
   "features": {
     "sanitize_blacklist_fingerprints": true
