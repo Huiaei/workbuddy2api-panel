@@ -29,6 +29,15 @@ import (
 // ErrBadParams 皆有可能（Classify 词表不含 11133），hint 层自带判定（hint 是补充
 // 说明非权威分类，误判代价只是多一条中性补充说明）；其余走 Kind 一对一映射。
 func GatewayHint(kind ErrKind, msg string, ctx HintContext) string {
+	// 音色未配置（TTS）：上游 500 + code 10000，与账号无关。必须排在 ErrBadParams
+	// 的通用文案之前，否则客户端只会看到「参数被拒」而不知道该省掉 voice。
+	if strings.Contains(strings.ToLower(msg), "get voice config failed") {
+		return `voice is not configured upstream (not an account problem); omit "voice" to use the default ` + TTSDefaultVoice
+	}
+	// 15053 ASR recognition failed：上游解不出这段音频（裸 PCM 无容器头必现，实测）。
+	if codeMarker(strings.ToLower(msg), "15053") {
+		return "upstream could not recognise this audio (15053); send a WAV or WebM container — bare PCM has no header to sniff"
+	}
 	// 11133 model_param_invalid 家族（图片回归实测：不支持图片的模型传图，或任意
 	// 参数被模型供应商拒绝）。只有请求确实带图、且目录能对该模型做出「不支持图片」
 	// 的判定时才给「换模型」指向，否则退中性参数形态（可能是任意参数问题，不点名图片）。

@@ -65,7 +65,10 @@
     "_comment_tls_fingerprint": "tls_fingerprint: 出站 ClientHello 指纹档位。node = 复刻官方 Node/OpenSSL 形态（JA3/JA4 与真机一致，缺省）；go = crypto/tls 原生形态（排障/回滚用）。请求头对齐只解决 HTTP 层，TLS 握手发生在更早，现代风控先看 JA3/JA4。非法值启动即报错。",
     "tls_fingerprint": "node",
     "_comment_tool_stall": "tool_stall_retry: 非流式请求声明了 tools 却收到「只回正文 + stop 收尾」时的自动重试次数（issue #149）。0 = 关闭重试（仍记录观测）。重试换号进行，不罚账号（上游行为缺陷，不是账号问题）。缺省 1。",
-    "tool_stall_retry": 1
+    "tool_stall_retry": 1,
+    "_comment_audio": "tts_enabled / asr_enabled: 官方语音端点 POST /v1/audio/speech（文本转语音，返 WAV）与 POST /v1/audio/transcriptions（语音转文本）的总开关。协议来自官方桌面端包的静态反查（/v2/audio/speech 的 SSE+PCM、/agenttool/v1/asr 的 multipart），尚未真机抓包对照，故默认关闭。关着时两个端点仍在、但回 403；打开后热生效（面板保存即可）。",
+    "tts_enabled": false,
+    "asr_enabled": false
   },
   "features": {
     "sanitize_blacklist_fingerprints": true

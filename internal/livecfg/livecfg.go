@@ -21,6 +21,13 @@ type Snapshot struct {
 	SanitizeFingerprints bool                // 出站请求体指纹脱敏
 	RecordClientInfo     bool                // 请求日志是否记录调用来源（客户端 IP / UA）
 	HiddenModels         map[string]struct{} // 精确隐藏的模型 id（已归一化为 "cn:x"/"global:x" 全量形式）；nil = 不隐藏
+
+	// TTSEnabled / ASREnabled 官方语音端点（/v1/audio/speech、
+	// /v1/audio/transcriptions）的总开关。来自 upstream.tts_enabled / asr_enabled，
+	// 缺省 false（协议来自官方桌面端包静态反查，未真机抓包对照）；关着时端点仍存在
+	// 但回 403，打开即热生效。
+	TTSEnabled bool
+	ASREnabled bool
 }
 
 // Holder 原子持有当前快照。

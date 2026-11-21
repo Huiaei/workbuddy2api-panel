@@ -95,6 +95,13 @@ type Config struct {
 	// 来自 upstream.tool_stall_retry（缺省 1）。**重试不罚账号**（上游行为缺陷，
 	// 不是账号问题）——只换号再问一次。
 	ToolStallRetry int
+
+	// TTSEnabled / ASREnabled 官方语音端点（/v1/audio/speech、
+	// /v1/audio/transcriptions）开关的静态回退（upstream.tts_enabled /
+	// upstream.asr_enabled，默认 false）。Live 非 nil 时以热快照为准；裸用/单测
+	// 路径用本字段。
+	TTSEnabled bool
+	ASREnabled bool
 }
 
 // loadLive 返回当前运行期快照；Live 为 nil 时用静态字段合成。
@@ -107,6 +114,8 @@ func (h *Handler) loadLive() livecfg.Snapshot {
 		SoftCooldown:     h.cfg.SoftCooldown,
 		RecordClientInfo: h.cfg.RecordClientInfo,
 		HiddenModels:     livecfg.NormalizeHiddenModels(h.cfg.ModelsHidden),
+		TTSEnabled:       h.cfg.TTSEnabled,
+		ASREnabled:       h.cfg.ASREnabled,
 	}
 }
 
@@ -175,6 +184,10 @@ func NewHandler(cfg Config) *Handler {
 	h.mux.HandleFunc("POST /v1/search/messages", h.withAuth(h.searchMessages))
 	// 官方 agenttool 联网检索透传（见 search.go）：回程原样透出上游 JSON。
 	h.mux.HandleFunc("POST /v1/search", h.withAuth(h.search))
+	// 官方语音端点（upstream.tts_enabled / asr_enabled，默认关闭；关着时回 403）。
+	// 协议来自官方桌面端包的静态反查（见 upstream/speech.go 文件头）。
+	h.mux.HandleFunc("POST /v1/audio/speech", h.withAuth(h.speech))
+	h.mux.HandleFunc("POST /v1/audio/transcriptions", h.withAuth(h.transcriptions))
 	h.mux.HandleFunc("GET /v1/models", h.withAuth(h.models))
 	h.mux.HandleFunc("GET /status", h.withAuth(h.status))
 	h.mux.HandleFunc("GET /healthz", h.healthz)
@@ -191,6 +204,11 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			// 搜索不是模型调用，但面板「模型」列空着无法区分这类流量；
 			// 用产品名标注（与 chat 的 model 字段并列展示）。
 			trace.model = searchToolLabel
+		}
+		if isAudioPath(r.URL.Path) {
+			// 语音同理：成功路径由 chatStat.model（hunyuan-tts-2.5 / asr）覆盖，
+			// 这里只给「没选号就返回」的请求（开关关闭 403、坏 JSON 400）一个可读标识。
+			trace.model = audioToolLabel
 		}
 		if h.loadLive().RecordClientInfo {
 			trace.captureClientInfo(r)
@@ -226,7 +244,7 @@ func (h *Handler) tracedRequest(r *http.Request) bool {
 	if r.Method != http.MethodPost {
 		return false
 	}
-	return isChatEntry(r.URL.Path) || isSearchPath(r.URL.Path)
+	return isChatEntry(r.URL.Path) || isSearchPath(r.URL.Path) || isAudioPath(r.URL.Path)
 }
 
 // isChatEntry 四条入站协议路径：/v1/responses 与 /v1/messages（含 /messages 别名）
